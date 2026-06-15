@@ -674,7 +674,8 @@ pub const Evm = struct {
     fn copyToMemory(self: *Evm, src: []const u8, src_start: u256, mem_start: usize, size: usize) void {
         var i: usize = 0;
         while (i < size) : (i += 1) {
-            const si: u256 = src_start + i;
+            // u512 so a near-2²⁵⁶ source offset can't wrap into a valid index.
+            const si: u512 = @as(u512, src_start) + i;
             self.memory.data[mem_start + i] = if (si < src.len) src[@intCast(si)] else 0;
         }
     }
