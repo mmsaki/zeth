@@ -1,7 +1,8 @@
-//! Precompiled contracts at addresses 0x01–0x0a. Implemented: ecrecover (0x01),
-//! sha256 (0x02), ripemd160 (0x03), identity (0x04), modexp (0x05), bn254
-//! blake2f (0x09), KZG point-eval (0x0a), and BLS12-381 G1ADD/G1MSM/G2ADD/G2MSM/
-//! (0x0a) and the BLS12-381 set (0x0b–0x12), which report failure.
+//! Precompiled contracts. Implemented: ecrecover (0x01), sha256 (0x02),
+//! ripemd160 (0x03), identity (0x04), modexp (0x05), bn254 ecadd/ecmul/ecpairing
+//! (0x06–0x08), blake2f (0x09), KZG point-eval (0x0a), and BLS12-381
+//! G1ADD/G1MSM/G2ADD/G2MSM/PAIRING/MAP_FP_TO_G1 (0x0b–0x10). Not yet:
+//! MAP_FP2_TO_G2).
 
 const std = @import("std");
 const crypto = @import("crypto.zig");
@@ -21,7 +22,7 @@ pub fn idOf(addr: Address) ?u8 {
     if (id >= 1 and id <= 0x09) return id;
     if (id == 0x0a) return id; // KZG point evaluation (EIP-4844)
     // BLS12-381: G1ADD, G1MSM, G2ADD, G2MSM, PAIRING.
-    if (id >= 0x0b and id <= 0x10) return id;
+    if (id >= 0x0b and id <= 0x11) return id;
     return null;
 }
 
@@ -36,8 +37,8 @@ pub fn run(allocator: std.mem.Allocator, id: u8, input: []const u8, gas_availabl
     return switch (id) {
         0x01 => ecrecover(allocator, input, gas_available),
         0x02 => sha256(allocator, input, gas_available),
-        0x04 => identity(allocator, input, gas_available),
         0x03 => ripemd160(allocator, input, gas_available),
+        0x04 => identity(allocator, input, gas_available),
         0x05 => modexp(allocator, input, gas_available),
         0x06 => bnAdd(allocator, input, gas_available),
         0x07 => bnMul(allocator, input, gas_available),
@@ -50,6 +51,7 @@ pub fn run(allocator: std.mem.Allocator, id: u8, input: []const u8, gas_availabl
         0x0e => blsG2Msm(allocator, input, gas_available),
         0x0f => blsPairing(allocator, input, gas_available),
         0x10 => blsMapFpToG1(allocator, input, gas_available),
+        0x11 => blsMapFp2ToG2(allocator, input, gas_available),
         else => null, // unimplemented precompile (kzg / map)
     };
 }
@@ -597,6 +599,14 @@ fn blsMapFpToG1(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Outp
     if (cost > gas) return null;
     const x = blsFp(input, 0) orelse return null;
     return .{ .data = encodeBlsG1(allocator, bls.mapToG1(x)), .gas = cost };
+}
+
+fn blsMapFp2ToG2(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len != 128) return null;
+    const cost: u64 = 23800;
+    if (cost > gas) return null;
+    const x = blsFp2(input, 0) orelse return null;
+    return .{ .data = encodeBlsG2(allocator, bls.mapToG2(x)), .gas = cost };
 }
 
 fn blsPairing(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {

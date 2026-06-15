@@ -126,6 +126,21 @@ pub const Fp2 = struct {
         const d = a.c0.mul(a.c0).add(a.c1.mul(a.c1)).inv();
         return .{ .c0 = a.c0.mul(d), .c1 = a.c1.neg().mul(d) };
     }
+    pub fn pow(a: Fp2, comptime W: type, e: W) Fp2 {
+        var result = Fp2.one();
+        var base = a;
+        var exp = e;
+        while (exp != 0) : (exp >>= 1) {
+            if (exp & 1 == 1) result = result.mul(base);
+            base = base.mul(base);
+        }
+        return result;
+    }
+    pub fn sgn0(a: Fp2) u1 {
+        const s0: u1 = @intCast(a.c0.v & 1);
+        if (!a.c0.isZero()) return s0;
+        return @intCast(a.c1.v & 1);
+    }
 };
 
 pub const G2 = Point(Fp2);
@@ -424,6 +439,106 @@ pub fn mapToG1(t: Fp) G1 {
     return isoMapG1(optimizedSwuG1(t)).mul(H_EFF_G1);
 }
 
+const ISO_3_A = Fp2{ .c0 = Fp{ .v = 0x0 }, .c1 = Fp{ .v = 0xf0 } };
+const ISO_3_B = Fp2{ .c0 = Fp{ .v = 0x3f4 }, .c1 = Fp{ .v = 0x3f4 } };
+const ISO_3_Z = Fp2{ .c0 = Fp{ .v = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaa9 }, .c1 = Fp{ .v = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaaa } };
+const P_MINUS_9_DIV_16: u768 = 0x2a437a4b8c35fc74bd278eaa22f25e9e2dc90e50e7046b466e59e49349e8bd050a62cfd16ddca6ef53149330978ef011d68619c86185c7b292e85a87091a04966bf91ed3e71b743162c338362113cfd7ced6b1d76382eab26aa00001c718e3;
+const H_EFF_G2: u640 = 0xbc69f08f2ee75b3584c6a0ea91b352888e2a8e9145ad7689986ff031508ffe1329c2f178731db956d82bf015d1212b02ec0ec69d7477c1ae954cbc06689f6a359894c0adebbf6b4e8020005aaa95551;
+const ETAS = [_]Fp2{ Fp2{ .c0 = Fp{ .v = 0x699be3b8c6870965e5bf892ad5d2cc7b0e85a117402dfd83b7f4a947e02d978498255a2aaec0ac627b5afbdf1bf1c90 }, .c1 = Fp{ .v = 0x8157cd83046453f5dd0972b6e3949e4288020b5b8a9cc99ca07e27089a2ce2436d965026adad3ef7baba37f2183e9b5 } }, Fp2{ .c0 = Fp{ .v = 0x11eb95120939a15aed4b108ad51262f33bf72acf3adb46259d28f0306d0e27ffe7d29afc46792c103e535c80de7bc0f6 }, .c1 = Fp{ .v = 0x699be3b8c6870965e5bf892ad5d2cc7b0e85a117402dfd83b7f4a947e02d978498255a2aaec0ac627b5afbdf1bf1c90 } }, Fp2{ .c0 = Fp{ .v = 0xab1c2ffdd6c253ca155231eb3e71ba044fd562f6f72bc5bad5ec46a0b7a3b0247cf08ce6c6317f40edbc653a72dee17 }, .c1 = Fp{ .v = 0xaa404866706722864480885d68ad0ccac1967c7544b447873cc37e0181271e006df72162a3d3e0287bf597fbf7f8fc1 } }, Fp2{ .c0 = Fp{ .v = 0xf5d0d63d2797471e6d39f306cc0dc0ab85de3bd9f39ce46f3649ac0de9e844417cc8de88716c1fd323fa68040801aea }, .c1 = Fp{ .v = 0xab1c2ffdd6c253ca155231eb3e71ba044fd562f6f72bc5bad5ec46a0b7a3b0247cf08ce6c6317f40edbc653a72dee17 } } };
+const EIGHTH_ROOTS = [_]Fp2{ Fp2{ .c0 = Fp{ .v = 0x1 }, .c1 = Fp{ .v = 0x0 } }, Fp2{ .c0 = Fp{ .v = 0x0 }, .c1 = Fp{ .v = 0x1 } }, Fp2{ .c0 = Fp{ .v = 0x6af0e0437ff400b6831e36d6bd17ffe48395dabc2d3435e77f76e17009241c5ee67992f72ec05f4c81084fbede3cc09 }, .c1 = Fp{ .v = 0x6af0e0437ff400b6831e36d6bd17ffe48395dabc2d3435e77f76e17009241c5ee67992f72ec05f4c81084fbede3cc09 } }, Fp2{ .c0 = Fp{ .v = 0x6af0e0437ff400b6831e36d6bd17ffe48395dabc2d3435e77f76e17009241c5ee67992f72ec05f4c81084fbede3cc09 }, .c1 = Fp{ .v = 0x135203e60180a68ee2e9c448d77a2cd91c3dedd930b1cf60ef396489f61eb45e304466cf3e67fa0af1ee7b04121bdea2 } } };
+const ISO_3_X_NUM = [_]Fp2{ Fp2{ .c0 = Fp{ .v = 0x5c759507e8e333ebb5b7a9a47d7ed8532c52d39fd3a042a88b58423c50ae15d5c2638e343d9c71c6238aaaaaaaa97d6 }, .c1 = Fp{ .v = 0x5c759507e8e333ebb5b7a9a47d7ed8532c52d39fd3a042a88b58423c50ae15d5c2638e343d9c71c6238aaaaaaaa97d6 } }, Fp2{ .c0 = Fp{ .v = 0x0 }, .c1 = Fp{ .v = 0x11560bf17baa99bc32126fced787c88f984f87adf7ae0c7f9a208c6b4f20a4181472aaa9cb8d555526a9ffffffffc71a } }, Fp2{ .c0 = Fp{ .v = 0x11560bf17baa99bc32126fced787c88f984f87adf7ae0c7f9a208c6b4f20a4181472aaa9cb8d555526a9ffffffffc71e }, .c1 = Fp{ .v = 0x8ab05f8bdd54cde190937e76bc3e447cc27c3d6fbd7063fcd104635a790520c0a395554e5c6aaaa9354ffffffffe38d } }, Fp2{ .c0 = Fp{ .v = 0x171d6541fa38ccfaed6dea691f5fb614cb14b4e7f4e810aa22d6108f142b85757098e38d0f671c7188e2aaaaaaaa5ed1 }, .c1 = Fp{ .v = 0x0 } } };
+const ISO_3_X_DEN = [_]Fp2{ Fp2{ .c0 = Fp{ .v = 0x0 }, .c1 = Fp{ .v = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaa63 } }, Fp2{ .c0 = Fp{ .v = 0xc }, .c1 = Fp{ .v = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaa9f } }, Fp2{ .c0 = Fp{ .v = 0x1 }, .c1 = Fp{ .v = 0x0 } }, Fp2{ .c0 = Fp{ .v = 0x0 }, .c1 = Fp{ .v = 0x0 } } };
+const ISO_3_Y_NUM = [_]Fp2{ Fp2{ .c0 = Fp{ .v = 0x1530477c7ab4113b59a4c18b076d11930f7da5d4a07f649bf54439d87d27e500fc8c25ebf8c92f6812cfc71c71c6d706 }, .c1 = Fp{ .v = 0x1530477c7ab4113b59a4c18b076d11930f7da5d4a07f649bf54439d87d27e500fc8c25ebf8c92f6812cfc71c71c6d706 } }, Fp2{ .c0 = Fp{ .v = 0x0 }, .c1 = Fp{ .v = 0x5c759507e8e333ebb5b7a9a47d7ed8532c52d39fd3a042a88b58423c50ae15d5c2638e343d9c71c6238aaaaaaaa97be } }, Fp2{ .c0 = Fp{ .v = 0x11560bf17baa99bc32126fced787c88f984f87adf7ae0c7f9a208c6b4f20a4181472aaa9cb8d555526a9ffffffffc71c }, .c1 = Fp{ .v = 0x8ab05f8bdd54cde190937e76bc3e447cc27c3d6fbd7063fcd104635a790520c0a395554e5c6aaaa9354ffffffffe38f } }, Fp2{ .c0 = Fp{ .v = 0x124c9ad43b6cf79bfbf7043de3811ad0761b0f37a1e26286b0e977c69aa274524e79097a56dc4bd9e1b371c71c718b10 }, .c1 = Fp{ .v = 0x0 } } };
+const ISO_3_Y_DEN = [_]Fp2{ Fp2{ .c0 = Fp{ .v = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa8fb }, .c1 = Fp{ .v = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa8fb } }, Fp2{ .c0 = Fp{ .v = 0x0 }, .c1 = Fp{ .v = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffa9d3 } }, Fp2{ .c0 = Fp{ .v = 0x12 }, .c1 = Fp{ .v = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaa99 } }, Fp2{ .c0 = Fp{ .v = 0x1 }, .c1 = Fp{ .v = 0x0 } } };
+
+const SqrtDiv2 = struct { ok: bool, result: Fp2 };
+fn sqrtDivisionFp2(u: Fp2, v: Fp2) SqrtDiv2 {
+    const v2 = v.mul(v);
+    const v4 = v2.mul(v2);
+    const v7 = v4.mul(v2).mul(v);
+    const v8 = v4.mul(v4);
+    const temp1 = u.mul(v7);
+    const gamma = temp1.mul(v8).pow(u768, P_MINUS_9_DIV_16).mul(temp1);
+    var res = SqrtDiv2{ .ok = false, .result = gamma };
+    for (EIGHTH_ROOTS) |root| {
+        const cand = root.mul(gamma);
+        if (cand.mul(cand).mul(v).sub(u).isZero() and !res.ok) {
+            res = .{ .ok = true, .result = cand };
+        }
+    }
+    return res;
+}
+
+fn optimizedSwuG2(t: Fp2) G2 {
+    const t2 = t.mul(t);
+    const zt2 = ISO_3_Z.mul(t2);
+    const temp = zt2.add(zt2.mul(zt2));
+    var den = ISO_3_A.mul(temp).neg();
+    var num = ISO_3_B.mul(temp.add(Fp2.one()));
+    if (den.isZero()) den = ISO_3_Z.mul(ISO_3_A);
+    const v = den.mul(den).mul(den);
+    const u = num.mul(num).mul(num)
+        .add(ISO_3_A.mul(num).mul(den.mul(den)))
+        .add(ISO_3_B.mul(v));
+    const sd = sqrtDivisionFp2(u, v);
+    var y = sd.result;
+    // x1 branch: y(x1) = eta * sqrt_candidate * t^3.
+    const sqrtc = sd.result.mul(t.mul(t).mul(t));
+    const u_x1 = zt2.mul(zt2).mul(zt2).mul(u);
+    var success2 = false;
+    for (ETAS) |eta| {
+        const cand = eta.mul(sqrtc);
+        if (cand.mul(cand).mul(v).sub(u_x1).isZero() and !sd.ok and !success2) {
+            y = cand;
+            success2 = true;
+        }
+    }
+    if (!sd.ok) num = num.mul(zt2);
+    if (t.sgn0() != y.sgn0()) y = y.neg();
+    y = y.mul(den);
+    return .{ .x = num, .y = y, .z = den };
+}
+
+fn horner2(k: []const Fp2, x: Fp2, zpow: []const Fp2) Fp2 {
+    var acc = k[k.len - 1];
+    var j: usize = 0;
+    while (j < k.len - 1) : (j += 1) {
+        acc = acc.mul(x).add(zpow[j].mul(k[k.len - 2 - j]));
+    }
+    return acc;
+}
+
+fn isoMapG2(p: G2) G2 {
+    var zpow: [3]Fp2 = undefined;
+    zpow[0] = p.z;
+    zpow[1] = p.z.mul(p.z);
+    zpow[2] = zpow[1].mul(p.z);
+    const x_num = horner2(&ISO_3_X_NUM, p.x, &zpow);
+    const x_den = horner2(&ISO_3_X_DEN, p.x, &zpow);
+    var y_num = horner2(&ISO_3_Y_NUM, p.x, &zpow);
+    var y_den = horner2(&ISO_3_Y_DEN, p.x, &zpow);
+    y_num = y_num.mul(p.y);
+    y_den = y_den.mul(p.z);
+    return .{ .x = x_num.mul(y_den), .y = x_den.mul(y_num), .z = x_den.mul(y_den) };
+}
+
+/// Wide (>u256) scalar multiplication for G2 cofactor clearing.
+fn mulG2Wide(p: G2, n: u640) G2 {
+    var result = G2.infinity();
+    var base = p;
+    var k = n;
+    while (k != 0) : (k >>= 1) {
+        if (k & 1 == 1) result = result.add(base);
+        base = base.double();
+    }
+    return result;
+}
+
+/// EIP-2537 map_fp2_to_G2: SSWU + 3-isogeny + cofactor clearing.
+pub fn mapToG2(t: Fp2) G2 {
+    return mulG2Wide(isoMapG2(optimizedSwuG2(t)), H_EFF_G2);
+}
+
 // --- tests ----------------------------------------------------------------
 
 const testing = std.testing;
@@ -497,4 +612,10 @@ test "mapToG1 matches py_ecc vector" {
     const r = normalizeG1(mapToG1(Fp.init(12345)));
     try testing.expect(r.x.v == 0x122fe5e9fb6cf588ceacaeabf401519fd29d494b336ca9d7a10361705bbee88ba1993c83f728a32e3b2ad4907230c71a);
     try testing.expect(r.y.v == 0x0e63a1ea3d4680e2c4a31e9217aa1a513458a96cf68a3dc956f3dd8ee56385435e535fb83d567a998b7656dad037f75d);
+}
+
+test "mapToG2 matches py_ecc vector" {
+    const r = normalizeG2(mapToG2(.{ .c0 = Fp.init(12345), .c1 = Fp.init(67890) }));
+    try testing.expect(r.x.c0.v == 0x146f396bca6c47451cf3171c692c1ede118f9044ccd678cb79b56581011fd283946eaac4f8fa3b20c4ccd4bc3136049c);
+    try testing.expect(r.y.c1.v == 0x1638889ea9edaf7c5a5fd881ec7564c4772656dccf60e5c7f1f053a750442fe13b8a947b6352b4697f2b9b43a6b28eaf);
 }
