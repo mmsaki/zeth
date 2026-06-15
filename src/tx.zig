@@ -96,7 +96,9 @@ pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: 
     for (tx.access_list) |e| intrinsic += ACCESS_LIST_ADDRESS + ACCESS_LIST_KEY * e.keys.len;
     if (tx.gas_limit < intrinsic) return false;
 
-    // Nonce must match exactly.
+    // Nonce must match exactly, and must leave room to increment (EELS rejects
+    // a nonce of U64.MAX_VALUE so sender.nonce + 1 cannot overflow).
+    if (tx.nonce >= std.math.maxInt(u64)) return false;
     if (state.nonceOf(tx.sender) != tx.nonce) return false;
 
     // The sender must be able to cover the worst-case fee plus value. Compute in
