@@ -27,9 +27,9 @@ pub const Reporter = struct {
         return if (self.color) code else "";
     }
 
-    /// Emit one ✓/✗ mark, wrapping the row at the terminal width.
+    /// Emit one ✔/☒ mark, wrapping the row at the terminal width.
     fn mark(self: *Reporter, ok: bool) void {
-        const glyph = if (ok) "✓" else "✗";
+        const glyph = if (ok) "✔" else "☒";
         std.debug.print("{s}{s}{s}", .{ if (ok) self.c(GREEN) else self.c(RED), glyph, self.c(RESET) });
         self.col += 1;
         if (self.col % (self.width -| 2) == 0) std.debug.print("\n  ", .{});
@@ -63,12 +63,13 @@ pub const Reporter = struct {
             std.debug.print("\n\n{s}── failures ──{s}\n{s}", .{ self.c(BOLD), self.c(RESET), self.fails.items });
         }
         const ok = self.fail == 0;
+        // The passed count is always green; only the failed count goes red.
         std.debug.print("\n{s}{s} {s}{d} passed{s}, {s}{d} failed{s}, {s}{d} skipped{s}\n", .{
-            self.c(BOLD),                           label,
-            if (ok) self.c(GREEN) else self.c(RED), self.pass,
-            self.c(RESET),                          if (self.fail == 0) self.c(DIM) else self.c(RED),
-            self.fail,                              self.c(RESET),
-            self.c(YELLOW),                         self.skip,
+            self.c(BOLD),   label,
+            self.c(GREEN),  self.pass,
+            self.c(RESET),  if (self.fail == 0) self.c(DIM) else self.c(RED),
+            self.fail,      self.c(RESET),
+            self.c(YELLOW), self.skip,
             self.c(RESET),
         });
         return ok;
