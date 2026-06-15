@@ -1,7 +1,7 @@
 //! Precompiled contracts at addresses 0x01–0x0a. Implemented: ecrecover (0x01),
-//! sha256 (0x02), identity (0x04). Not yet: ripemd160 (no std impl), modexp,
-//! bn254 (ecadd/ecmul/ecpairing), blake2f, KZG point-eval — these need bigint
-//! modexp and pairing crypto (the long pole), so calls to them report failure.
+//! sha256 (0x02), ripemd160 (0x03), identity (0x04), modexp (0x05), bn254
+//! ecadd/ecmul/ecpairing (0x06–0x08), blake2f (0x09). Not yet: KZG point-eval
+//! (0x0a) and the BLS12-381 set (0x0b–0x12), which report failure.
 
 const std = @import("std");
 const crypto = @import("crypto.zig");
@@ -30,6 +30,7 @@ pub fn run(allocator: std.mem.Allocator, id: u8, input: []const u8, gas_availabl
         0x01 => ecrecover(allocator, input, gas_available),
         0x02 => sha256(allocator, input, gas_available),
         0x04 => identity(allocator, input, gas_available),
+        0x03 => ripemd160(allocator, input, gas_available),
         0x05 => modexp(allocator, input, gas_available),
         0x06 => bnAdd(allocator, input, gas_available),
         0x07 => bnMul(allocator, input, gas_available),
@@ -163,6 +164,122 @@ fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?
         }
     }
     writeBigBe(result, out);
+    return .{ .data = out, .gas = cost };
+}
+
+// --- RIPEMD-160 (0x03) ---  std.crypto has no ripemd, so implement it here.
+
+const RIPEMD_R = [80]u5{
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    7, 4, 13, 1, 10, 6, 15, 3, 12, 0, 9, 5, 2, 14, 11, 8,
+    3, 10, 14, 4, 9, 15, 8, 1, 2, 7, 0, 6, 13, 11, 5, 12,
+    1, 9, 11, 10, 0, 8, 12, 4, 13, 3, 7, 15, 14, 5, 6, 2,
+    4, 0, 5, 9, 7, 12, 2, 10, 14, 1, 3, 8, 11, 6, 15, 13,
+};
+const RIPEMD_RR = [80]u5{
+    5, 14, 7, 0, 9, 2, 11, 4, 13, 6, 15, 8, 1, 10, 3, 12,
+    6, 11, 3, 7, 0, 13, 5, 10, 14, 15, 8, 12, 4, 9, 1, 2,
+    15, 5, 1, 3, 7, 14, 6, 9, 11, 8, 12, 2, 10, 0, 4, 13,
+    8, 6, 4, 1, 3, 11, 15, 0, 5, 12, 2, 13, 9, 7, 10, 14,
+    12, 15, 10, 4, 1, 5, 8, 7, 6, 2, 13, 14, 0, 3, 9, 11,
+};
+const RIPEMD_S = [80]u5{
+    11, 14, 15, 12, 5, 8, 7, 9, 11, 13, 14, 15, 6, 7, 9, 8,
+    7, 6, 8, 13, 11, 9, 7, 15, 7, 12, 15, 9, 11, 7, 13, 12,
+    11, 13, 6, 7, 14, 9, 13, 15, 14, 8, 13, 6, 5, 12, 7, 5,
+    11, 12, 14, 15, 14, 15, 9, 8, 9, 14, 5, 6, 8, 6, 5, 12,
+    9, 15, 5, 11, 6, 8, 13, 12, 5, 12, 13, 14, 11, 8, 5, 6,
+};
+const RIPEMD_SS = [80]u5{
+    8, 9, 9, 11, 13, 15, 15, 5, 7, 7, 8, 11, 14, 14, 12, 6,
+    9, 13, 15, 7, 12, 8, 9, 11, 7, 7, 12, 7, 6, 15, 13, 11,
+    9, 7, 15, 11, 8, 6, 6, 14, 12, 13, 5, 14, 13, 13, 7, 5,
+    15, 5, 8, 11, 14, 14, 6, 14, 6, 9, 12, 9, 12, 5, 15, 8,
+    8, 5, 12, 9, 12, 5, 14, 6, 8, 13, 6, 5, 15, 13, 11, 11,
+};
+const RIPEMD_K = [5]u32{ 0x00000000, 0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xA953FD4E };
+const RIPEMD_KK = [5]u32{ 0x50A28BE6, 0x5C4DD124, 0x6D703EF3, 0x7A6D76E9, 0x00000000 };
+
+inline fn ripemdF(j: usize, x: u32, y: u32, z: u32) u32 {
+    return switch (j / 16) {
+        0 => x ^ y ^ z,
+        1 => (x & y) | (~x & z),
+        2 => (x | ~y) ^ z,
+        3 => (x & z) | (y & ~z),
+        else => x ^ (y | ~z),
+    };
+}
+
+fn ripemd160Hash(msg: []const u8, out: *[20]u8) void {
+    var h = [5]u32{ 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };
+    // Build padded message (append 0x80, pad to 56 mod 64, 64-bit LE length).
+    const bitlen = @as(u64, msg.len) * 8;
+    var pad_len: usize = msg.len + 1;
+    while (pad_len % 64 != 56) pad_len += 1;
+    var total = pad_len + 8;
+    // Process block by block over a small scratch (one block at a time).
+    var processed: usize = 0;
+    while (processed < total) : (processed += 64) {
+        var block: [64]u8 = undefined;
+        for (0..64) |i| {
+            const idx = processed + i;
+            block[i] = if (idx < msg.len)
+                msg[idx]
+            else if (idx == msg.len)
+                0x80
+            else if (idx >= total - 8)
+                @truncate(bitlen >> @intCast(8 * (idx - (total - 8))))
+            else
+                0;
+        }
+        var x: [16]u32 = undefined;
+        for (0..16) |i| x[i] = std.mem.readInt(u32, block[4 * i ..][0..4], .little);
+
+        var al = h[0];
+        var bl = h[1];
+        var cl = h[2];
+        var dl = h[3];
+        var el = h[4];
+        var ar = h[0];
+        var br = h[1];
+        var cr = h[2];
+        var dr = h[3];
+        var er = h[4];
+        for (0..80) |j| {
+            var t = al +% ripemdF(j, bl, cl, dl) +% x[RIPEMD_R[j]] +% RIPEMD_K[j / 16];
+            t = std.math.rotl(u32, t, RIPEMD_S[j]) +% el;
+            al = el;
+            el = dl;
+            dl = std.math.rotl(u32, cl, @as(u5, 10));
+            cl = bl;
+            bl = t;
+            var tr = ar +% ripemdF(79 - j, br, cr, dr) +% x[RIPEMD_RR[j]] +% RIPEMD_KK[j / 16];
+            tr = std.math.rotl(u32, tr, RIPEMD_SS[j]) +% er;
+            ar = er;
+            er = dr;
+            dr = std.math.rotl(u32, cr, @as(u5, 10));
+            cr = br;
+            br = tr;
+        }
+        const t = h[1] +% cl +% dr;
+        h[1] = h[2] +% dl +% er;
+        h[2] = h[3] +% el +% ar;
+        h[3] = h[4] +% al +% br;
+        h[4] = h[0] +% bl +% cr;
+        h[0] = t;
+    }
+    for (0..5) |i| std.mem.writeInt(u32, out[4 * i ..][0..4], h[i], .little);
+    _ = &total;
+}
+
+fn ripemd160(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    const cost = 600 + 120 * words(input.len);
+    if (cost > gas) return null;
+    var digest: [20]u8 = undefined;
+    ripemd160Hash(input, &digest);
+    const out = allocator.alloc(u8, 32) catch @panic("oom");
+    @memset(out, 0);
+    @memcpy(out[12..32], &digest); // left-pad to 32 bytes
     return .{ .data = out, .gas = cost };
 }
 
@@ -447,4 +564,12 @@ test "sha256 of empty" {
     var hex: [64]u8 = undefined;
     _ = std.fmt.bufPrint(&hex, "{x}", .{out.data}) catch unreachable;
     try testing.expectEqualStrings("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &hex);
+}
+
+test "ripemd160 known vectors" {
+    var d: [20]u8 = undefined;
+    ripemd160Hash("", &d);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x9c, 0x11, 0x85, 0xa5, 0xc5, 0xe9, 0xfc, 0x54, 0x61, 0x28, 0x08, 0x97, 0x7e, 0xe8, 0xf5, 0x48, 0xb2, 0x25, 0x8d, 0x31 }, &d);
+    ripemd160Hash("abc", &d);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x8e, 0xb2, 0x08, 0xf7, 0xe0, 0x5d, 0x98, 0x7a, 0x9b, 0x04, 0x4a, 0x8e, 0x98, 0xc6, 0xb0, 0x87, 0xf1, 0x5a, 0x0b, 0xfc }, &d);
 }
