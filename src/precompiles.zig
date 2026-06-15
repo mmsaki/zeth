@@ -620,7 +620,7 @@ fn blake2f(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
 
 const Secp = std.crypto.ecc.Secp256k1;
 
-fn recoverAddress(msg: [32]u8, recid: u8, r_be: [32]u8, s_be: [32]u8) ?[20]u8 {
+pub fn recoverAddress(msg: [32]u8, recid: u8, r_be: [32]u8, s_be: [32]u8) ?[20]u8 {
     const Scalar = Secp.scalar.Scalar;
     // r, s must be in [1, n).
     const r = Scalar.fromBytes(r_be, .big) catch return null;
