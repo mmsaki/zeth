@@ -1,6 +1,6 @@
 //! Precompiled contracts at addresses 0x01–0x0a. Implemented: ecrecover (0x01),
 //! sha256 (0x02), ripemd160 (0x03), identity (0x04), modexp (0x05), bn254
-//! ecadd/ecmul/ecpairing (0x06–0x08), blake2f (0x09). Not yet: KZG point-eval
+//! blake2f (0x09), KZG point-eval (0x0a), and BLS12-381 G1ADD/G1MSM/G2ADD/G2MSM/
 //! (0x0a) and the BLS12-381 set (0x0b–0x12), which report failure.
 
 const std = @import("std");
@@ -21,7 +21,7 @@ pub fn idOf(addr: Address) ?u8 {
     if (id >= 1 and id <= 0x09) return id;
     if (id == 0x0a) return id; // KZG point evaluation (EIP-4844)
     // BLS12-381: G1ADD, G1MSM, G2ADD, G2MSM, PAIRING.
-    if (id == 0x0b or id == 0x0c or id == 0x0d or id == 0x0e or id == 0x0f) return id;
+    if (id >= 0x0b and id <= 0x10) return id;
     return null;
 }
 
@@ -49,6 +49,7 @@ pub fn run(allocator: std.mem.Allocator, id: u8, input: []const u8, gas_availabl
         0x0d => blsG2Add(allocator, input, gas_available),
         0x0e => blsG2Msm(allocator, input, gas_available),
         0x0f => blsPairing(allocator, input, gas_available),
+        0x10 => blsMapFpToG1(allocator, input, gas_available),
         else => null, // unimplemented precompile (kzg / map)
     };
 }
@@ -588,6 +589,14 @@ fn blsG2Msm(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
         acc = acc.add(p.mul(m));
     }
     return .{ .data = encodeBlsG2(allocator, acc), .gas = cost };
+}
+
+fn blsMapFpToG1(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len != 64) return null;
+    const cost: u64 = 5500;
+    if (cost > gas) return null;
+    const x = blsFp(input, 0) orelse return null;
+    return .{ .data = encodeBlsG1(allocator, bls.mapToG1(x)), .gas = cost };
 }
 
 fn blsPairing(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
