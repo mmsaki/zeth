@@ -64,6 +64,21 @@ pub const Fp = struct {
 
 pub const G1 = Point(Fp);
 
+/// Fp square root (P ≡ 3 mod 4, so √a = a^((P+1)/4)); null if `a` is a non-residue.
+pub fn fpSqrt(a: Fp) ?Fp {
+    const r = a.pow((P + 1) / 4);
+    return if (r.mul(r).eql(a)) r else null;
+}
+
+/// Curve generators (EIP-2537 / BLS12-381 standard).
+pub fn g1Generator() G1 {
+    return .{
+        .x = Fp.init(0x17f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb),
+        .y = Fp.init(0x08b3f481e3aaa0f1a09e30ed741d8ae4fcf5e095d5d00af600db18cb2c04b3edd03cc744a2888ae40caa232946c5e7e1),
+        .z = Fp.one(),
+    };
+}
+
 /// G1 affine (x, y); infinity maps to (0, 0) as the precompile encodes it.
 pub fn normalizeG1(p: G1) struct { x: Fp, y: Fp } {
     if (p.isInf()) return .{ .x = Fp.zero(), .y = Fp.zero() };
@@ -124,6 +139,35 @@ pub fn normalizeG2(p: G2) struct { x: Fp2, y: Fp2 } {
     if (p.isInf()) return .{ .x = Fp2.zero(), .y = Fp2.zero() };
     const zi = p.z.inv();
     return .{ .x = p.x.mul(zi), .y = p.y.mul(zi) };
+}
+
+pub fn g2Generator() G2 {
+    return .{
+        .x = .{
+            .c0 = Fp.init(0x024aa2b2f08f0a91260805272dc51051c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb8),
+            .c1 = Fp.init(0x13e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049334cf11213945d57e5ac7d055d042b7e),
+        },
+        .y = .{
+            .c0 = Fp.init(0x0ce5d527727d6e118cc9cdc6da2e351aadfd9baa8cbdd3a76d429a695160d12c923ac9cc3baca289e193548608b82801),
+            .c1 = Fp.init(0x0606c4a02ea734cc32acd2b02bc28b99cb3e287e85a763af267492ab572e99ab3f370d275cec1da1aaa9075ff05f79be),
+        },
+        .z = Fp2.one(),
+    };
+}
+
+/// EIP-4844 trusted-setup point [τ]₂ = KZG_SETUP_G2_MONOMIAL[1], decompressed.
+pub fn kzgSetupG2() G2 {
+    return .{
+        .x = .{
+            .c0 = Fp.init(0x185cbfee53492714734429b7b38608e23926c911cceceac9a36851477ba4c60b087041de621000edc98edada20c1def2),
+            .c1 = Fp.init(0x15bfd7dd8cdeb128843bc287230af38926187075cbfbefa81009a2ce615ac53d2914e5870cb452d2afaaab24f3499f72),
+        },
+        .y = .{
+            .c0 = Fp.init(0x014353bdb96b626dd7d5ee8599d1fca2131569490e28de18e82451a496a9c9794ce26d105941f383ee689bfbbb832a99),
+            .c1 = Fp.init(0x1666c54b0a32529503432fcae0181b4bef79de09fc63671fda5ed1ba9bfa07899495346f3d7ac9cd23048ef30d0a154f),
+        },
+        .z = Fp2.one(),
+    };
 }
 
 // --- Fp12: degree-12 over Fp, modulus x¹² − 2x⁶ + 2 (py_ecc bls12_381) -----
