@@ -39,6 +39,18 @@ pub fn main(init: std.process.Init) !void {
     while (i < evm.stack.len) : (i += 1) {
         std.debug.print("  [{d}] 0x{x}\n", .{ i, evm.stack.items[evm.stack.len - 1 - i] });
     }
+
+    // Memory, printed as 32-byte words (the EVM's natural granularity).
+    const mem = evm.memory.data;
+    std.debug.print("memory ({d} bytes):\n", .{mem.len});
+    var off: usize = 0;
+    while (off < mem.len) : (off += 32) {
+        const end = @min(off + 32, mem.len);
+        std.debug.print("  0x{x:0>4}: ", .{off});
+        for (mem[off..end]) |b| std.debug.print("{x:0>2}", .{b});
+        std.debug.print("\n", .{});
+    }
+
     if (evm.output.len > 0) {
         std.debug.print("return: 0x{x}\n", .{evm.output});
     }
