@@ -27,9 +27,9 @@ pub const Reporter = struct {
         return if (self.color) code else "";
     }
 
-    /// Emit one ✔/☒ mark, wrapping the row at the terminal width.
+    /// Emit one ✔/✘ mark, wrapping the row at the terminal width.
     fn mark(self: *Reporter, ok: bool) void {
-        const glyph = if (ok) "✔" else "☒";
+        const glyph = if (ok) "✔" else "✘";
         std.debug.print("{s}{s}{s}", .{ if (ok) self.c(GREEN) else self.c(RED), glyph, self.c(RESET) });
         self.col += 1;
         if (self.col % (self.width -| 2) == 0) std.debug.print("\n  ", .{});
