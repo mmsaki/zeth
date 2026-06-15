@@ -83,6 +83,9 @@ pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: 
     if (max_fee_cap < env.base_fee) return false;
     if (max_fee_cap < max_prio) return false;
 
+    // The transaction's gas limit may not exceed the block gas limit.
+    if (tx.gas_limit > env.gas_limit) return false;
+
     // Intrinsic gas must fit within the gas limit.
     const ig = intrinsicGas(tx.data, tx.to == null);
     var intrinsic = ig.standard;
@@ -92,9 +95,10 @@ pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: 
     // Nonce must match exactly.
     if (state.nonceOf(tx.sender) != tx.nonce) return false;
 
-    // The sender must be able to cover the worst-case fee plus value.
-    const max_gas_fee = @as(u256, tx.gas_limit) * max_fee_cap + tx.blob_data_fee;
-    if (state.balanceOf(tx.sender) < max_gas_fee + tx.value) return false;
+    // The sender must be able to cover the worst-case fee plus value. Compute in
+    // u512 since gas_limit * max_fee_cap can exceed u256 for adversarial prices.
+    const max_gas_fee: u512 = @as(u512, tx.gas_limit) * max_fee_cap + tx.blob_data_fee + tx.value;
+    if (@as(u512, state.balanceOf(tx.sender)) < max_gas_fee) return false;
 
     // EIP-3607: the sender must be an EOA (no code), unless it carries a valid
     // EIP-7702 delegation.
