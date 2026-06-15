@@ -69,6 +69,41 @@ fn intrinsicGas(data: []const u8, is_create: bool) Intrinsic {
 }
 
 /// Run a transaction against `state`, mutating it, and return gas used.
+/// EIP-7702 delegation indicator: exactly `0xef0100 ‖ address` (23 bytes).
+fn isValidDelegation(code: []const u8) bool {
+    return code.len == 23 and code[0] == 0xef and code[1] == 0x01 and code[2] == 0x00;
+}
+
+/// Pre-execution transaction validity (EELS `check_transaction`). A failing
+/// transaction is rejected outright and leaves the state untouched, so callers
+/// must run this before `process`. `max_fee_cap`/`max_prio` are the raw 1559
+/// fields (for a legacy tx pass gas_price as the cap and 0 as the priority).
+pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: u256, max_prio: u256) bool {
+    // EIP-1559 fee-cap sanity.
+    if (max_fee_cap < env.base_fee) return false;
+    if (max_fee_cap < max_prio) return false;
+
+    // Intrinsic gas must fit within the gas limit.
+    const ig = intrinsicGas(tx.data, tx.to == null);
+    var intrinsic = ig.standard;
+    for (tx.access_list) |e| intrinsic += ACCESS_LIST_ADDRESS + ACCESS_LIST_KEY * e.keys.len;
+    if (tx.gas_limit < intrinsic) return false;
+
+    // Nonce must match exactly.
+    if (state.nonceOf(tx.sender) != tx.nonce) return false;
+
+    // The sender must be able to cover the worst-case fee plus value.
+    const max_gas_fee = @as(u256, tx.gas_limit) * max_fee_cap + tx.blob_data_fee;
+    if (state.balanceOf(tx.sender) < max_gas_fee + tx.value) return false;
+
+    // EIP-3607: the sender must be an EOA (no code), unless it carries a valid
+    // EIP-7702 delegation.
+    const code = state.codeOf(tx.sender);
+    if (code.len != 0 and !isValidDelegation(code)) return false;
+
+    return true;
+}
+
 pub fn process(allocator: std.mem.Allocator, state: *State, env: *const vm.Environment, tx: Tx) Result {
     state.beginTx(); // reset access lists / transient / originals / created set
     const ig = intrinsicGas(tx.data, tx.to == null);
