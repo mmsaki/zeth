@@ -182,6 +182,24 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap) 
             env.gas_price = gas_price;
             env.origin = addrH(sender);
 
+            // EIP-4844 blob transaction: charge the (burned) blob data fee and
+            // expose the versioned hashes + blob base fee to the EVM.
+            var blob_data_fee: u256 = 0;
+            if (jarr(tx_o, "blobVersionedHashes")) |bh| {
+                const excess = u256H(jstr(header, "excessBlobGas") orelse "0x0");
+                const price = zeth.tx.blobGasPrice(excess);
+                env.blob_base_fee = price;
+                blob_data_fee = @as(u256, zeth.tx.GAS_PER_BLOB) * bh.len * price;
+                var hashes = std.ArrayList([32]u8).empty;
+                for (bh) |h| if (h == .string) {
+                    var hh: [32]u8 = undefined;
+                    const hs = if (std.mem.startsWith(u8, h.string, "0x")) h.string[2..] else h.string;
+                    _ = std.fmt.hexToBytes(&hh, hs) catch {};
+                    hashes.append(a, hh) catch @panic("oom");
+                };
+                env.blob_versioned_hashes = hashes.items;
+            }
+
             const to_s = jstr(tx_o, "to") orelse "";
             const tx = zeth.tx.Tx{
                 .sender = addrH(sender),
@@ -192,6 +210,7 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap) 
                 .value = u256H(jstr(tx_o, "value") orelse "0x0"),
                 .data = bytesH(a, jstr(tx_o, "data") orelse "0x"),
                 .access_list = parseAccessList(a, tx_o),
+                .blob_data_fee = blob_data_fee,
             };
             _ = zeth.tx.process(a, st, &env, tx);
         }
