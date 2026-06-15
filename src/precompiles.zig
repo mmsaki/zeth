@@ -19,8 +19,8 @@ pub fn idOf(addr: Address) ?u8 {
     for (addr[0..19]) |b| if (b != 0) return null;
     const id = addr[19];
     if (id >= 1 and id <= 0x09) return id;
-    // BLS12-381: G1ADD, G1MSM, G2ADD, G2MSM.
-    if (id == 0x0b or id == 0x0c or id == 0x0d or id == 0x0e) return id;
+    // BLS12-381: G1ADD, G1MSM, G2ADD, G2MSM, PAIRING.
+    if (id == 0x0b or id == 0x0c or id == 0x0d or id == 0x0e or id == 0x0f) return id;
     return null;
 }
 
@@ -46,7 +46,8 @@ pub fn run(allocator: std.mem.Allocator, id: u8, input: []const u8, gas_availabl
         0x0c => blsG1Msm(allocator, input, gas_available),
         0x0d => blsG2Add(allocator, input, gas_available),
         0x0e => blsG2Msm(allocator, input, gas_available),
-        else => null, // unimplemented precompile (kzg / map / pairing)
+        0x0f => blsPairing(allocator, input, gas_available),
+        else => null, // unimplemented precompile (kzg / map)
     };
 }
 
@@ -528,6 +529,27 @@ fn blsG2Msm(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
         acc = acc.add(p.mul(m));
     }
     return .{ .data = encodeBlsG2(allocator, acc), .gas = cost };
+}
+
+fn blsPairing(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len == 0 or input.len % 384 != 0) return null;
+    const k = input.len / 384;
+    const cost: u64 = 32600 * @as(u64, @intCast(k)) + 37700;
+    if (cost > gas) return null;
+    const pts = allocator.alloc(bls.PairPoint, k) catch @panic("oom");
+    defer allocator.free(pts);
+    var i: usize = 0;
+    while (i < k) : (i += 1) {
+        const p = decodeBlsG1(input, 384 * i) orelse return null;
+        const q = decodeBlsG2(input, 384 * i + 128) orelse return null;
+        if (!p.mul(bls.R).isInf()) return null; // G1 subgroup check
+        if (!q.mul(bls.R).isInf()) return null; // G2 subgroup check
+        pts[i] = .{ .q = q, .p = p };
+    }
+    const out = allocator.alloc(u8, 32) catch @panic("oom");
+    @memset(out, 0);
+    out[31] = if (bls.pairingProductIsOne(pts)) 1 else 0;
+    return .{ .data = out, .gas = cost };
 }
 
 /// Write `m` as big-endian into `out` (left-zero-padded; high bytes dropped).
