@@ -1,0 +1,25 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Rust (revm-runner) build artifacts
+bench/revm-runner/target/
+
+# Reference clones (large; not part of this repo)
+go-ethereum/
+execution-specs/
+reth
+zevm
+gevm
+evmone
+hive
+
+# Python
+__pycache__/
+
+# Ethereum test fixtures (large clone)
+ethereum-tests/
+.eels-cache/
+
+# Hive integration test framework (large clone)
+hive/
