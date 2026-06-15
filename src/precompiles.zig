@@ -19,7 +19,7 @@ pub fn idOf(addr: Address) ?u8 {
     for (addr[0..19]) |b| if (b != 0) return null;
     const id = addr[19];
     if (id >= 1 and id <= 0x09) return id;
-    if (id == 0x0b) return id;
+    if (id == 0x0b or id == 0x0d) return id; // BLS G1ADD / G2ADD
     return null;
 }
 
@@ -42,6 +42,7 @@ pub fn run(allocator: std.mem.Allocator, id: u8, input: []const u8, gas_availabl
         0x08 => bnPairing(allocator, input, gas_available),
         0x09 => blake2f(allocator, input, gas_available),
         0x0b => blsG1Add(allocator, input, gas_available),
+        0x0d => blsG2Add(allocator, input, gas_available),
         else => null, // unimplemented precompile (kzg / rest of bls)
     };
 }
@@ -443,6 +444,43 @@ fn blsG1Add(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
     const p1 = decodeBlsG1(input, 0) orelse return null;
     const p2 = decodeBlsG1(input, 128) orelse return null;
     return .{ .data = encodeBlsG1(allocator, p1.add(p2)), .gas = cost };
+}
+
+/// Decode a 128-byte Fp2 element (c0 ‖ c1, 64 bytes each).
+fn blsFp2(input: []const u8, off: usize) ?bls.Fp2 {
+    const c0 = blsFp(input, off) orelse return null;
+    const c1 = blsFp(input, off + 64) orelse return null;
+    return bls.Fp2{ .c0 = c0, .c1 = c1 };
+}
+
+/// Decode a 256-byte G2 point (x ‖ y, 128-byte Fp2 each). (0, 0) is infinity.
+fn decodeBlsG2(input: []const u8, off: usize) ?bls.G2 {
+    const x = blsFp2(input, off) orelse return null;
+    const y = blsFp2(input, off + 128) orelse return null;
+    const z: bls.Fp2 = if (x.isZero() and y.isZero()) bls.Fp2.zero() else bls.Fp2.one();
+    const p = bls.G2{ .x = x, .y = y, .z = z };
+    if (!p.isOnCurve(bls.b2())) return null;
+    return p;
+}
+
+fn encodeBlsG2(allocator: std.mem.Allocator, p: bls.G2) []u8 {
+    const aff = bls.normalizeG2(p);
+    const out = allocator.alloc(u8, 256) catch @panic("oom");
+    @memset(out, 0);
+    std.mem.writeInt(u512, out[0..64], @as(u512, aff.x.c0.v), .big);
+    std.mem.writeInt(u512, out[64..128], @as(u512, aff.x.c1.v), .big);
+    std.mem.writeInt(u512, out[128..192], @as(u512, aff.y.c0.v), .big);
+    std.mem.writeInt(u512, out[192..256], @as(u512, aff.y.c1.v), .big);
+    return out;
+}
+
+fn blsG2Add(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len != 512) return null; // EIP-2537: fixed 512-byte input
+    const cost: u64 = 600;
+    if (cost > gas) return null;
+    const p1 = decodeBlsG2(input, 0) orelse return null;
+    const p2 = decodeBlsG2(input, 256) orelse return null;
+    return .{ .data = encodeBlsG2(allocator, p1.add(p2)), .gas = cost };
 }
 
 /// Write `m` as big-endian into `out` (left-zero-padded; high bytes dropped).

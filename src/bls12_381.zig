@@ -71,6 +71,61 @@ pub fn normalizeG1(p: G1) struct { x: Fp, y: Fp } {
     return .{ .x = p.x.mul(zi), .y = p.y.mul(zi) };
 }
 
+// --- Fp2 = Fp[u]/(u² + 1):  c0 + c1·u -------------------------------------
+
+pub const Fp2 = struct {
+    c0: Fp,
+    c1: Fp,
+
+    pub inline fn scalar(x: u256) Fp2 {
+        return .{ .c0 = Fp.scalar(x), .c1 = Fp.zero() };
+    }
+    pub inline fn zero() Fp2 {
+        return .{ .c0 = Fp.zero(), .c1 = Fp.zero() };
+    }
+    pub inline fn one() Fp2 {
+        return .{ .c0 = Fp.one(), .c1 = Fp.zero() };
+    }
+    pub inline fn eql(a: Fp2, b: Fp2) bool {
+        return a.c0.eql(b.c0) and a.c1.eql(b.c1);
+    }
+    pub inline fn isZero(a: Fp2) bool {
+        return a.c0.isZero() and a.c1.isZero();
+    }
+    pub inline fn add(a: Fp2, b: Fp2) Fp2 {
+        return .{ .c0 = a.c0.add(b.c0), .c1 = a.c1.add(b.c1) };
+    }
+    pub inline fn sub(a: Fp2, b: Fp2) Fp2 {
+        return .{ .c0 = a.c0.sub(b.c0), .c1 = a.c1.sub(b.c1) };
+    }
+    pub inline fn neg(a: Fp2) Fp2 {
+        return .{ .c0 = a.c0.neg(), .c1 = a.c1.neg() };
+    }
+    pub fn mul(a: Fp2, b: Fp2) Fp2 {
+        return .{
+            .c0 = a.c0.mul(b.c0).sub(a.c1.mul(b.c1)),
+            .c1 = a.c0.mul(b.c1).add(a.c1.mul(b.c0)),
+        };
+    }
+    pub fn inv(a: Fp2) Fp2 {
+        const d = a.c0.mul(a.c0).add(a.c1.mul(a.c1)).inv();
+        return .{ .c0 = a.c0.mul(d), .c1 = a.c1.neg().mul(d) };
+    }
+};
+
+pub const G2 = Point(Fp2);
+
+/// G2 curve constant b₂ = 4·(1 + u).
+pub fn b2() Fp2 {
+    return .{ .c0 = Fp.scalar(4), .c1 = Fp.scalar(4) };
+}
+
+pub fn normalizeG2(p: G2) struct { x: Fp2, y: Fp2 } {
+    if (p.isInf()) return .{ .x = Fp2.zero(), .y = Fp2.zero() };
+    const zi = p.z.inv();
+    return .{ .x = p.x.mul(zi), .y = p.y.mul(zi) };
+}
+
 // --- tests ----------------------------------------------------------------
 
 const testing = std.testing;
@@ -91,4 +146,20 @@ test "G1 generator on curve, order R" {
     const a = normalizeG1(g.add(g));
     const b = normalizeG1(g.mul(2));
     try testing.expect(a.x.eql(b.x) and a.y.eql(b.y));
+}
+
+test "G2 generator on curve, order R" {
+    const g2 = G2{
+        .x = .{
+            .c0 = Fp.init(0x024aa2b2f08f0a91260805272dc51051c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb8),
+            .c1 = Fp.init(0x13e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049334cf11213945d57e5ac7d055d042b7e),
+        },
+        .y = .{
+            .c0 = Fp.init(0x0ce5d527727d6e118cc9cdc6da2e351aadfd9baa8cbdd3a76d429a695160d12c923ac9cc3baca289e193548608b82801),
+            .c1 = Fp.init(0x0606c4a02ea734cc32acd2b02bc28b99cb3e287e85a763af267492ab572e99ab3f370d275cec1da1aaa9075ff05f79be),
+        },
+        .z = Fp2.one(),
+    };
+    try testing.expect(g2.isOnCurve(b2()));
+    try testing.expect(g2.mul(R).isInf());
 }
