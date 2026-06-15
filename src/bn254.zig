@@ -280,9 +280,15 @@ pub fn normalizeG1(p: G1) struct { x: Fp, y: Fp } {
 }
 
 /// G2 curve constant b₂ = 3/(9 + u) = (27 − 3u)/82.
-pub fn b2() Fp2 {
+/// G2 curve constant b₂ = 3/(9 + u) = (27 − 3u)/82, folded at compile time
+/// (the inverse is a 254-bit exponentiation we don't want to repeat per call).
+const B2: Fp2 = blk: {
+    @setEvalBranchQuota(20000);
     const inv82 = Fp.init(82).inv();
-    return .{ .c0 = Fp.init(27).mul(inv82), .c1 = Fp.init(3).neg().mul(inv82) };
+    break :blk .{ .c0 = Fp.init(27).mul(inv82), .c1 = Fp.init(3).neg().mul(inv82) };
+};
+pub fn b2() Fp2 {
+    return B2;
 }
 
 // --- Pairing --------------------------------------------------------------
