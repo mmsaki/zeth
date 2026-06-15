@@ -1053,6 +1053,7 @@ pub const Evm = struct {
             try self.stack.push(0);
         } else {
             self.incorporateSuccess(&child);
+            self.setReturnData(&.{}); // a successful create exposes no return data
             try self.stack.push(state_mod.addressToWord(contract));
         }
     }
