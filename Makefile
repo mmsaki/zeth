@@ -33,20 +33,21 @@ eels:
 	bash scripts/eels.sh
 
 ## GeneralStateTests: stop at the first failure (default). ALL=1 for full sweep.
+## The runner walks the directory itself and renders a ✓/✗ graph + failures.
 conformance:
 	$(ZIG) build -Doptimize=ReleaseFast
-	python3 scripts/conformance.py statetest GeneralStateTests
+	$(if $(ALL),ZETH_ALL=1 )./zig-out/bin/statetest ethereum-tests/GeneralStateTests
 
 ## BlockchainTests (the hive on-ramp): stop at first failure. ALL=1 for full sweep.
 hive-tests:
 	$(ZIG) build -Doptimize=ReleaseFast
-	python3 scripts/conformance.py blocktest BlockchainTests
+	$(if $(ALL),ZETH_ALL=1 )./zig-out/bin/blocktest ethereum-tests/BlockchainTests
 
-## Full report: run EVERYTHING (both suites), per-category breakdown + % pass.
+## Full report: run EVERYTHING (both suites) with the ✓/✗ graph + % pass.
 report:
 	$(ZIG) build -Doptimize=ReleaseFast
-	ALL=1 python3 scripts/conformance.py statetest GeneralStateTests
-	ALL=1 python3 scripts/conformance.py blocktest BlockchainTests
+	ZETH_ALL=1 ./zig-out/bin/statetest ethereum-tests/GeneralStateTests
+	ZETH_ALL=1 ./zig-out/bin/blocktest ethereum-tests/BlockchainTests
 
 ## Execute hex bytecode: `make run ARGS="0x6006600701"`.
 run:
