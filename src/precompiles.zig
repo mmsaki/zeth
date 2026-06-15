@@ -109,6 +109,23 @@ fn mulmod(allocator: std.mem.Allocator, r: *Managed, a: *const Managed, b: *cons
     q.divFloor(r, &prod, m) catch @panic("oom");
 }
 
+/// First min(32, exp_len) bytes of the exponent, as a big-endian integer (the
+/// "exponent head" the EIP-2565 iteration count is based on). Zero-padded.
+fn modexpExpHead(input: []const u8, base_len: u256, exp_len: u256) u256 {
+    if (exp_len == 0) return 0;
+    const off_u: u256 = 96 + base_len;
+    if (off_u >= input.len) return 0; // exponent lies entirely past the input
+    const off: usize = @intCast(off_u);
+    const n: usize = @intCast(@min(exp_len, 32));
+    var head: u256 = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const b: u8 = if (off + i < input.len) input[off + i] else 0;
+        head = (head << 8) | b;
+    }
+    return head;
+}
+
 /// EIP-2565 modexp. Input: base_len(32) ‖ exp_len(32) ‖ mod_len(32) ‖ base ‖ exp ‖ mod.
 fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?Output {
     var hdr: [96]u8 = std.mem.zeroes([96]u8);
@@ -116,12 +133,33 @@ fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?
     const base_len = read32(hdr[0..32]);
     const exp_len = read32(hdr[32..64]);
     const mod_len = read32(hdr[64..96]);
-    if (base_len > 4096 or exp_len > 4096 or mod_len > 4096) return null; // DoS guard
+
+    // Gas (EIP-2565), computed without materializing huge operands. Work in u512
+    // so adversarial multi-thousand-bit lengths cannot overflow the arithmetic.
+    const max_len: u512 = @max(base_len, mod_len);
+    const w: u512 = (max_len + 7) / 8;
+    const mult_complexity: u512 = w * w;
+    // If the multiplication term alone can't be afforded, reject before the
+    // (potentially enormous) iteration-count multiply.
+    if (mult_complexity > @as(u512, gas_available) * 3) return null;
+    const iters: u512 = blk: {
+        const head = modexpExpHead(input, base_len, exp_len);
+        const head_bits: u512 = if (head == 0) 0 else 256 - @clz(head);
+        const adj: u512 = if (head_bits == 0) 0 else head_bits - 1;
+        break :blk if (exp_len <= 32) adj else 8 * (@as(u512, exp_len) - 32) + adj;
+    };
+    const dyn: u512 = mult_complexity * @max(iters, 1) / 3;
+    const cost_u: u512 = @max(@as(u512, 200), dyn);
+    if (cost_u > gas_available) return null;
+    const cost: u64 = @intCast(cost_u);
+
+    // A zero-length modulus yields an empty result regardless of base/exponent.
+    if (mod_len == 0) return .{ .data = allocator.alloc(u8, 0) catch @panic("oom"), .gas = cost };
+
+    // The lengths are now bounded by affordability, so materialization is safe.
     const bl: usize = @intCast(base_len);
     const el: usize = @intCast(exp_len);
     const ml: usize = @intCast(mod_len);
-
-    // Zero-padded reads of the three operands.
     const padded = allocator.alloc(u8, @max(96 + bl + el + ml, input.len)) catch @panic("oom");
     defer allocator.free(padded);
     @memset(padded, 0);
@@ -130,18 +168,8 @@ fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?
     const exp_b = padded[96 + bl .. 96 + bl + el];
     const mod_b = padded[96 + bl + el .. 96 + bl + el + ml];
 
-    // Gas (EIP-2565).
-    const max_len = @max(bl, ml);
-    const w: u64 = @intCast((max_len + 7) / 8);
-    const mult_complexity: u128 = @as(u128, w) * w;
-    const iters = iterCount(exp_b);
-    const dyn: u128 = mult_complexity * @max(iters, 1) / 3;
-    const cost: u64 = @intCast(@max(@as(u128, 200), dyn));
-    if (cost > gas_available) return null;
-
     const out = allocator.alloc(u8, ml) catch @panic("oom");
     @memset(out, 0);
-    if (ml == 0) return .{ .data = out, .gas = cost };
 
     var mod = bigFromBe(allocator, mod_b);
     defer mod.deinit();
@@ -170,32 +198,32 @@ fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?
 // --- RIPEMD-160 (0x03) ---  std.crypto has no ripemd, so implement it here.
 
 const RIPEMD_R = [80]u5{
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-    7, 4, 13, 1, 10, 6, 15, 3, 12, 0, 9, 5, 2, 14, 11, 8,
-    3, 10, 14, 4, 9, 15, 8, 1, 2, 7, 0, 6, 13, 11, 5, 12,
-    1, 9, 11, 10, 0, 8, 12, 4, 13, 3, 7, 15, 14, 5, 6, 2,
-    4, 0, 5, 9, 7, 12, 2, 10, 14, 1, 3, 8, 11, 6, 15, 13,
+    0, 1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+    7, 4,  13, 1,  10, 6,  15, 3,  12, 0, 9,  5,  2,  14, 11, 8,
+    3, 10, 14, 4,  9,  15, 8,  1,  2,  7, 0,  6,  13, 11, 5,  12,
+    1, 9,  11, 10, 0,  8,  12, 4,  13, 3, 7,  15, 14, 5,  6,  2,
+    4, 0,  5,  9,  7,  12, 2,  10, 14, 1, 3,  8,  11, 6,  15, 13,
 };
 const RIPEMD_RR = [80]u5{
-    5, 14, 7, 0, 9, 2, 11, 4, 13, 6, 15, 8, 1, 10, 3, 12,
-    6, 11, 3, 7, 0, 13, 5, 10, 14, 15, 8, 12, 4, 9, 1, 2,
-    15, 5, 1, 3, 7, 14, 6, 9, 11, 8, 12, 2, 10, 0, 4, 13,
-    8, 6, 4, 1, 3, 11, 15, 0, 5, 12, 2, 13, 9, 7, 10, 14,
-    12, 15, 10, 4, 1, 5, 8, 7, 6, 2, 13, 14, 0, 3, 9, 11,
+    5,  14, 7,  0, 9, 2,  11, 4,  13, 6,  15, 8,  1,  10, 3,  12,
+    6,  11, 3,  7, 0, 13, 5,  10, 14, 15, 8,  12, 4,  9,  1,  2,
+    15, 5,  1,  3, 7, 14, 6,  9,  11, 8,  12, 2,  10, 0,  4,  13,
+    8,  6,  4,  1, 3, 11, 15, 0,  5,  12, 2,  13, 9,  7,  10, 14,
+    12, 15, 10, 4, 1, 5,  8,  7,  6,  2,  13, 14, 0,  3,  9,  11,
 };
 const RIPEMD_S = [80]u5{
-    11, 14, 15, 12, 5, 8, 7, 9, 11, 13, 14, 15, 6, 7, 9, 8,
-    7, 6, 8, 13, 11, 9, 7, 15, 7, 12, 15, 9, 11, 7, 13, 12,
-    11, 13, 6, 7, 14, 9, 13, 15, 14, 8, 13, 6, 5, 12, 7, 5,
-    11, 12, 14, 15, 14, 15, 9, 8, 9, 14, 5, 6, 8, 6, 5, 12,
-    9, 15, 5, 11, 6, 8, 13, 12, 5, 12, 13, 14, 11, 8, 5, 6,
+    11, 14, 15, 12, 5,  8,  7,  9,  11, 13, 14, 15, 6,  7,  9,  8,
+    7,  6,  8,  13, 11, 9,  7,  15, 7,  12, 15, 9,  11, 7,  13, 12,
+    11, 13, 6,  7,  14, 9,  13, 15, 14, 8,  13, 6,  5,  12, 7,  5,
+    11, 12, 14, 15, 14, 15, 9,  8,  9,  14, 5,  6,  8,  6,  5,  12,
+    9,  15, 5,  11, 6,  8,  13, 12, 5,  12, 13, 14, 11, 8,  5,  6,
 };
 const RIPEMD_SS = [80]u5{
-    8, 9, 9, 11, 13, 15, 15, 5, 7, 7, 8, 11, 14, 14, 12, 6,
-    9, 13, 15, 7, 12, 8, 9, 11, 7, 7, 12, 7, 6, 15, 13, 11,
-    9, 7, 15, 11, 8, 6, 6, 14, 12, 13, 5, 14, 13, 13, 7, 5,
-    15, 5, 8, 11, 14, 14, 6, 14, 6, 9, 12, 9, 12, 5, 15, 8,
-    8, 5, 12, 9, 12, 5, 14, 6, 8, 13, 6, 5, 15, 13, 11, 11,
+    8,  9,  9,  11, 13, 15, 15, 5,  7,  7,  8,  11, 14, 14, 12, 6,
+    9,  13, 15, 7,  12, 8,  9,  11, 7,  7,  12, 7,  6,  15, 13, 11,
+    9,  7,  15, 11, 8,  6,  6,  14, 12, 13, 5,  14, 13, 13, 7,  5,
+    15, 5,  8,  11, 14, 14, 6,  14, 6,  9,  12, 9,  12, 5,  15, 8,
+    8,  5,  12, 9,  12, 5,  14, 6,  8,  13, 6,  5,  15, 13, 11, 11,
 };
 const RIPEMD_K = [5]u32{ 0x00000000, 0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xA953FD4E };
 const RIPEMD_KK = [5]u32{ 0x50A28BE6, 0x5C4DD124, 0x6D703EF3, 0x7A6D76E9, 0x00000000 };
@@ -368,17 +396,6 @@ fn bnPairing(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output 
     @memset(out, 0);
     out[31] = if (bn254.pairingProductIsOne(pts)) 1 else 0;
     return .{ .data = out, .gas = cost };
-}
-
-fn iterCount(exp_b: []const u8) u64 {
-    const head_len = @min(exp_b.len, 32);
-    var head: u256 = 0;
-    for (exp_b[0..head_len]) |b| head = (head << 8) | b;
-    const head_bits: u64 = if (head == 0) 0 else 256 - @clz(head);
-    if (exp_b.len <= 32) {
-        return if (head_bits == 0) 0 else head_bits - 1;
-    }
-    return 8 * @as(u64, @intCast(exp_b.len - 32)) + (if (head_bits == 0) 0 else head_bits - 1);
 }
 
 /// Write `m` as big-endian into `out` (left-zero-padded; high bytes dropped).
