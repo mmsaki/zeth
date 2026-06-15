@@ -145,7 +145,7 @@ fn systemCall(a: std.mem.Allocator, st: *zeth.State, env: *const zeth.Environmen
 
 /// Process one block's transactions and withdrawals against `st`. Returns false
 /// if the block's resulting state root disagrees with its header.
-fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap) bool {
+fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap, block_hashes: []const [32]u8) bool {
     const header = jobj(block, "blockHeader") orelse return false;
     const base_fee = u256H(jstr(header, "baseFeePerGas") orelse "0x0");
 
@@ -157,6 +157,7 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap) 
         .base_fee = base_fee,
         .prev_randao = u256H(jstr(header, "mixHash") orelse "0x0"),
         .chain_id = 1,
+        .block_hashes = block_hashes, // [genesis, block1, …] for the BLOCKHASH opcode
     };
 
     // Block-start system calls (EIP-4788 beacon roots, EIP-2935 history) write
@@ -249,8 +250,23 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
     defer st.deinit();
     loadPre(a, &st, pre);
 
+    // Block hashes for the BLOCKHASH opcode, indexed by block number:
+    // block_hashes[i] = hash of block i, starting with the genesis block.
+    var block_hashes: std.ArrayList([32]u8) = .empty;
+    const appendHash = struct {
+        fn f(al: *std.ArrayList([32]u8), alloc: std.mem.Allocator, hdr: std.json.ObjectMap) void {
+            if (jstr(hdr, "hash")) |h| {
+                var hh: [32]u8 = undefined;
+                const s = if (std.mem.startsWith(u8, h, "0x")) h[2..] else h;
+                _ = std.fmt.hexToBytes(&hh, s) catch return;
+                al.append(alloc, hh) catch {};
+            }
+        }
+    }.f;
+
     // Sanity: our pre-state root must match the genesis header before any block.
     if (jobj(obj, "genesisBlockHeader")) |gh| {
+        appendHash(&block_hashes, a, gh);
         if (jstr(gh, "stateRoot")) |sr| {
             const got = zeth.trie.stateRoot(a, &st);
             var want: [32]u8 = undefined;
@@ -268,11 +284,12 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
         // Blocks expected to be rejected are skipped (state unchanged).
         if (block.get("expectException") != null) continue;
         if (block.get("blockHeader") == null) continue;
-        if (!applyBlock(a, &st, block)) {
+        if (!applyBlock(a, &st, block, block_hashes.items)) {
             rep.failLine("  {s}{s}{s} {s}{s}{s} block {d} post-state root differs:\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET), bn });
             if (jobj(obj, "postState")) |ps| diffState(rep, &st, ps);
             return .fail;
         }
+        if (jobj(block, "blockHeader")) |bh| appendHash(&block_hashes, a, bh);
     }
     return .pass;
 }
