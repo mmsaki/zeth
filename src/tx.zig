@@ -27,6 +27,7 @@ pub const Tx = struct {
 };
 
 pub const GAS_PER_BLOB: u64 = 1 << 17; // 131072
+pub const MAX_BLOB_GAS_PER_BLOCK: u64 = 1179648; // Prague: 9 blobs
 const BLOB_BASE_FEE_UPDATE_FRACTION: u256 = 5007716;
 
 /// `taylor_exponential(1, excess_blob_gas, fraction)` — the EIP-4844 blob gas
