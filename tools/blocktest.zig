@@ -124,6 +124,50 @@ fn parseAccessList(a: std.mem.Allocator, tx_o: std.json.ObjectMap) []const zeth.
     return list.items;
 }
 
+/// RLP-encode a u256 as its minimal big-endian byte string (0 → empty/0x80).
+fn rlpQ(a: std.mem.Allocator, v: u256) []const u8 {
+    var buf: [32]u8 = undefined;
+    std.mem.writeInt(u256, &buf, v, .big);
+    var s: usize = 0;
+    while (s < 32 and buf[s] == 0) s += 1;
+    return zeth.rlp.encodeBytes(a, buf[s..]) catch @panic("oom");
+}
+
+/// Recover the sender of a legacy transaction from its (v, r, s) signature when
+/// the fixture doesn't give `sender` directly. Builds the EIP-155/pre-155
+/// signing hash by RLP-encoding the tx fields and runs secp256k1 recovery.
+fn recoverSender(a: std.mem.Allocator, tx_o: std.json.ObjectMap) ?Address {
+    const v = u64H(jstr(tx_o, "v") orelse return null);
+    const to_s = jstr(tx_o, "to") orelse "";
+    const to_bytes: []const u8 = if (to_s.len == 0 or std.mem.eql(u8, to_s, "0x")) &.{} else bytesH(a, to_s);
+
+    var items: std.ArrayList([]const u8) = .empty;
+    items.append(a, rlpQ(a, u256H(jstr(tx_o, "nonce") orelse "0x0"))) catch @panic("oom");
+    items.append(a, rlpQ(a, u256H(jstr(tx_o, "gasPrice") orelse "0x0"))) catch @panic("oom");
+    items.append(a, rlpQ(a, u256H(jstr(tx_o, "gasLimit") orelse "0x0"))) catch @panic("oom");
+    items.append(a, zeth.rlp.encodeBytes(a, to_bytes) catch @panic("oom")) catch @panic("oom");
+    items.append(a, rlpQ(a, u256H(jstr(tx_o, "value") orelse "0x0"))) catch @panic("oom");
+    items.append(a, zeth.rlp.encodeBytes(a, bytesH(a, jstr(tx_o, "data") orelse "0x")) catch @panic("oom")) catch @panic("oom");
+
+    var recid: u8 = undefined;
+    if (v == 27 or v == 28) {
+        recid = @intCast(v - 27);
+    } else {
+        const chain_id = (v - 35) / 2;
+        recid = @intCast((v - 35) % 2);
+        items.append(a, rlpQ(a, chain_id)) catch @panic("oom"); // EIP-155: chainId, 0, 0
+        items.append(a, zeth.rlp.encodeBytes(a, &.{}) catch @panic("oom")) catch @panic("oom");
+        items.append(a, zeth.rlp.encodeBytes(a, &.{}) catch @panic("oom")) catch @panic("oom");
+    }
+    const payload = zeth.rlp.encodeList(a, items.items) catch @panic("oom");
+    const hash = zeth.crypto.keccak256(payload);
+    var r: [32]u8 = undefined;
+    var s: [32]u8 = undefined;
+    std.mem.writeInt(u256, &r, u256H(jstr(tx_o, "r") orelse "0x0"), .big);
+    std.mem.writeInt(u256, &s, u256H(jstr(tx_o, "s") orelse "0x0"), .big);
+    return zeth.precompiles.recoverAddress(hash, recid, r, s);
+}
+
 const SYSTEM_ADDRESS = "0xfffffffffffffffffffffffffffffffffffffffe";
 
 /// Run a block-start system call (EIP-4788 / EIP-2935): invoke the system
@@ -171,7 +215,11 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap, 
         for (txs) |tx_v| {
             if (tx_v != .object) continue;
             const tx_o = tx_v.object;
-            const sender = jstr(tx_o, "sender") orelse continue;
+            // Use the fixture's sender, or recover it from the signature.
+            const sender_addr: Address = if (jstr(tx_o, "sender")) |s|
+                addrH(s)
+            else
+                (recoverSender(a, tx_o) orelse continue);
 
             var gas_price: u256 = undefined;
             if (jstr(tx_o, "gasPrice")) |gp| {
@@ -182,7 +230,7 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap, 
                 gas_price = @min(mf, base_fee + mp);
             }
             env.gas_price = gas_price;
-            env.origin = addrH(sender);
+            env.origin = sender_addr;
 
             // EIP-4844 blob transaction: charge the (burned) blob data fee and
             // expose the versioned hashes + blob base fee to the EVM.
@@ -204,7 +252,7 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap, 
 
             const to_s = jstr(tx_o, "to") orelse "";
             const tx = zeth.tx.Tx{
-                .sender = addrH(sender),
+                .sender = sender_addr,
                 .to = if (to_s.len == 0 or std.mem.eql(u8, to_s, "0x")) null else addrH(to_s),
                 .nonce = u64H(jstr(tx_o, "nonce") orelse "0x0"),
                 .gas_limit = u64H(jstr(tx_o, "gasLimit") orelse "0x0"),
