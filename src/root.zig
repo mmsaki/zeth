@@ -1,4 +1,4 @@
-//! Zetherum — a Zig implementation of the Ethereum execution layer.
+//! Zeth — a Zig implementation of the Ethereum execution layer.
 //!
 //! Current surface: the Frontier-fork EVM interpreter core (state-independent
 //! opcodes). See `vm.zig` for the interpreter and `word.zig` for 256-bit math.

@@ -33,9 +33,19 @@ STOP = not ALL
 ENV = dict(os.environ, ZETH_ALL="1") if ALL else dict(os.environ)
 
 
-def status(text):
-    """Overwrite the current terminal line with a one-line progress string."""
-    sys.stdout.write("\r\x1b[K  \x1b[2m" + text[: WIDTH - 4] + "\x1b[0m")
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_spin = [0]
+
+
+def status(name, npass, nfail, current):
+    """Overwrite the current line with a spinner, live counts and the current
+    test name. Passing tests stream through here; failures are printed above."""
+    _spin[0] = (_spin[0] + 1) % len(SPINNER)
+    frame = SPINNER[_spin[0]]
+    head = f"  \x1b[36m{frame}\x1b[0m {name}  \x1b[32m✓{npass}\x1b[0m \x1b[31m✗{nfail}\x1b[0m  \x1b[2m"
+    # Budget the remaining width for the (dim) current-test name.
+    room = max(0, WIDTH - 12 - len(name) - len(str(npass)) - len(str(nfail)))
+    sys.stdout.write("\r\x1b[K" + head + current[:room] + "\x1b[0m")
     sys.stdout.flush()
 
 
@@ -44,13 +54,15 @@ def clear():
     sys.stdout.flush()
 
 
-def run(files, live):
-    """Run the binary on `files`; show a single updating progress line when
-    `live`, keeping failures permanent. Returns (pass, fail, skip, crashed)."""
+def run(files, live, name=""):
+    """Run the binary on `files`; show a single updating spinner line with live
+    pass/fail counts when `live`, keeping failures permanent. Returns
+    (pass, fail, skip, crashed)."""
     try:
         p = subprocess.Popen([BIN, *files], stdout=subprocess.DEVNULL,
                              stderr=subprocess.PIPE, text=True, bufsize=1, env=ENV)
         res = None
+        seen_pass = seen_fail = 0
         for raw in (p.stderr or []):
             clean = ANSI.sub("", raw).rstrip("\n")
             m = SUMMARY.search(clean)
@@ -60,12 +72,18 @@ def run(files, live):
             if not live:
                 continue
             if "FAIL" in clean:
+                seen_fail += 1
                 clear()
                 print("  " + raw.rstrip())          # keep failures (with color)
             elif any(k in clean for k in ("got ", "want ", "balance", "nonce", "slot", "mismatch")):
                 print("    " + clean.strip())        # diff detail under a failure
+            elif "...OK" in clean or "...ok" in clean.lower():
+                seen_pass += 1
+                # Show the passing test name, replaced in place, with the spinner.
+                nm = clean.split("...")[0].strip().lstrip("0123456789/ ")
+                status(name, seen_pass, seen_fail, nm)
             elif "..." in clean:
-                status(clean.strip())                # passing test — overwrite
+                status(name, seen_pass, seen_fail, clean.strip())
         p.wait()
         if res:
             if live:
@@ -99,7 +117,7 @@ def main():
             continue
         name = os.path.basename(cat)
         print(f"\x1b[36m▶ {name}\x1b[0m \x1b[2m({len(files)} files)\x1b[0m")
-        p, f, s, x = run(files, True)
+        p, f, s, x = run(files, True, name)
         for i, v in enumerate((p, f, s, x)):
             tot[i] += v
         mark = "\x1b[32m✓\x1b[0m" if (f == 0 and x == 0 and p > 0) else ""

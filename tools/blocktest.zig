@@ -7,7 +7,7 @@
 //!   blocktest <fixture.json> [more.json ...]
 
 const std = @import("std");
-const zeth = @import("zetherum");
+const zeth = @import("zeth");
 const Address = zeth.state.Address;
 
 var g_color = true;

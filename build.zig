@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // The reusable library module: the EVM core.
-    const mod = b.addModule("zetherum", .{
+    const mod = b.addModule("zeth", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -13,12 +13,12 @@ pub fn build(b: *std.Build) void {
 
     // CLI: `zig build run -- <hex-bytecode> [gas]`
     const exe = b.addExecutable(.{
-        .name = "zetherum",
+        .name = "zeth",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zetherum", .module = mod }},
+            .imports = &.{.{ .name = "zeth", .module = mod }},
         }),
     });
     b.installArtifact(exe);
@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("bench/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zetherum", .module = mod }},
+            .imports = &.{.{ .name = "zeth", .module = mod }},
         }),
     });
     const run_bench = b.addRunArtifact(bench);
@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("bench/runner.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zetherum", .module = mod }},
+            .imports = &.{.{ .name = "zeth", .module = mod }},
         }),
     });
     b.installArtifact(runner);
@@ -68,7 +68,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/eels.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zetherum", .module = mod }},
+            .imports = &.{.{ .name = "zeth", .module = mod }},
         }),
     });
     b.installArtifact(eels);
@@ -80,7 +80,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/statetest.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zetherum", .module = mod }},
+            .imports = &.{.{ .name = "zeth", .module = mod }},
         }),
     });
     b.installArtifact(statetest);
@@ -92,7 +92,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/blocktest.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zetherum", .module = mod }},
+            .imports = &.{.{ .name = "zeth", .module = mod }},
         }),
     });
     b.installArtifact(blocktest);
