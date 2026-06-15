@@ -60,6 +60,7 @@ pub const VmError = error{
     InvalidOpcode,
     StaticStateChange,
     OutOfBounds,
+    AddressCollision,
 };
 
 /// Static gas costs, ported from `prague/vm/gas.py` (the latest mainnet fork).
@@ -1334,6 +1335,17 @@ pub fn processCreateMessage(
     message: Message,
     parent: ?*Evm,
 ) Evm {
+    // EIP-684 address collision: if the target already holds code, a non-zero
+    // nonce, or storage, creation aborts and consumes all gas. (The CREATE/
+    // CREATE2 opcode path pre-checks this; this guards the transaction-level
+    // create that calls in directly.)
+    if (state.hasCodeOrNonce(message.current_target) or state.hasStorage(message.current_target)) {
+        var frame = newFrame(allocator, state, env, message, 0, parent);
+        frame.halt_error = error.AddressCollision;
+        frame.running = false;
+        return frame;
+    }
+
     // Snapshot so the nonce bump (and all creation effects) revert on failure.
     var snapshot = state.clone() catch @panic("out of memory");
     // EIP-6780: record the address as created this tx (shared, not rolled back)
