@@ -1,6 +1,6 @@
 //! A faithful Zig port of the Prague-fork EVM (latest mainnet) from the
-//! Ethereum execution-specs, plus Osaka's CLZ. It implements the complete
-//! opcode set — arithmetic, comparison, bitwise (incl. SHL/SHR/SAR/CLZ),
+//! Ethereum execution-specs It implements the complete
+//! opcode set — arithmetic, comparison, bitwise (incl. SHL/SHR/SAR),
 //! KECCAK, environment & block context (incl. RETURNDATA*, CHAINID,
 //! SELFBALANCE, BASEFEE, BLOBHASH/BLOBBASEFEE, PUSH0), account storage with the
 //! EIP-2929 access-list and EIP-2200/3529 SSTORE accounting, EIP-1153 transient
@@ -138,7 +138,6 @@ pub const Op = enum(u8) {
     SHL = 0x1B,
     SHR = 0x1C,
     SAR = 0x1D,
-    CLZ = 0x1E, // Osaka
 
     KECCAK = 0x20,
 
@@ -432,7 +431,6 @@ pub const Evm = struct {
             .SHL => try self.binOp(Gas.VERY_LOW, word.shl),
             .SHR => try self.binOp(Gas.VERY_LOW, word.shr),
             .SAR => try self.binOp(Gas.VERY_LOW, word.sar),
-            .CLZ => try self.unOp(Gas.LOW, word.clz),
 
             .KECCAK => try self.keccak(),
 
