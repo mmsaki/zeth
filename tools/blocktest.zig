@@ -272,7 +272,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
             var want: [32]u8 = undefined;
             _ = std.fmt.hexToBytes(&want, sr[2..]) catch {};
             if (!std.mem.eql(u8, &got, &want)) {
-                rep.failLine("  {s}{s}{s} {s}{s}{s} genesis state root differs (pre-state load)\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET) });
+                rep.failLine("  {s}{s}{s}\n    {s}{s}{s} genesis state root differs (pre-state load)\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET) });
                 return .fail;
             }
         }
@@ -285,7 +285,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
         if (block.get("expectException") != null) continue;
         if (block.get("blockHeader") == null) continue;
         if (!applyBlock(a, &st, block, block_hashes.items)) {
-            rep.failLine("  {s}{s}{s} {s}{s}{s} block {d} post-state root differs:\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET), bn });
+            rep.failLine("  {s}{s}{s}\n    {s}{s}{s} block {d} post-state root differs:\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET), bn });
             if (jobj(obj, "postState")) |ps| diffState(rep, &st, ps);
             return .fail;
         }
