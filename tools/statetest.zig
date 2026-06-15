@@ -190,19 +190,34 @@ fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap, id
         }
         env.gas_price = gas_price;
 
-        // EIP-4844 blob transaction: compute the (burned) blob data fee and
-        // expose the versioned hashes + blob base fee to the EVM.
+        // EIP-4844 blob transaction: compute the (burned) blob data fee, expose
+        // the versioned hashes + blob base fee, and validate the blob fields.
         var blob_data_fee: u256 = 0;
-        if (jarr(tx_o, "blobVersionedHashes")) |bh| {
+        var blob_ok = true;
+        if (tx_o.get("maxFeePerBlobGas") != null or tx_o.get("blobVersionedHashes") != null) {
             const excess = u256FromHex(jstr(env_o, "currentExcessBlobGas") orelse "0x0");
             const price = zeth.tx.blobGasPrice(excess);
+            const max_fee_per_blob_gas = u256FromHex(jstr(tx_o, "maxFeePerBlobGas") orelse "0x0");
             env.blob_base_fee = price;
-            blob_data_fee = @as(u256, zeth.tx.GAS_PER_BLOB) * bh.len * price;
+            const bh = jarr(tx_o, "blobVersionedHashes");
+            const blob_count: usize = if (bh) |x| x.len else 0;
+            blob_data_fee = @as(u256, zeth.tx.GAS_PER_BLOB) * blob_count * price;
+
+            // EIP-4844 validity: non-empty, version 0x01, fee cap, blob-gas limit,
+            // and blob txs may not be contract creations.
+            if (blob_count == 0) blob_ok = false;
+            if (max_fee_per_blob_gas < price) blob_ok = false;
+            if (@as(u256, zeth.tx.GAS_PER_BLOB) * blob_count > zeth.tx.MAX_BLOB_GAS_PER_BLOCK) blob_ok = false;
+            if (jstr(tx_o, "to")) |t| {
+                if (t.len == 0 or std.mem.eql(u8, t, "0x")) blob_ok = false;
+            } else blob_ok = false;
+
             var hashes = std.ArrayList([32]u8).empty;
-            for (bh) |h| if (h == .string) {
+            if (bh) |hs| for (hs) |h| if (h == .string) {
                 var hh: [32]u8 = undefined;
-                const hs = if (std.mem.startsWith(u8, h.string, "0x")) h.string[2..] else h.string;
-                _ = std.fmt.hexToBytes(&hh, hs) catch {};
+                const s = if (std.mem.startsWith(u8, h.string, "0x")) h.string[2..] else h.string;
+                _ = std.fmt.hexToBytes(&hh, s) catch {};
+                if (hh[0] != 0x01) blob_ok = false; // VERSIONED_HASH_VERSION_KZG
                 hashes.append(a, hh) catch @panic("oom");
             };
             env.blob_versioned_hashes = hashes.items;
@@ -240,7 +255,7 @@ fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap, id
         };
 
         // Reject invalid transactions outright (state stays at the pre-state).
-        if (zeth.tx.validate(&st, &env, tx, max_fee_cap, max_prio)) {
+        if (blob_ok and zeth.tx.validate(&st, &env, tx, max_fee_cap, max_prio)) {
             _ = zeth.tx.process(a, &st, &env, tx);
         }
         const got = zeth.trie.stateRoot(a, &st);
