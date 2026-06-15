@@ -174,6 +174,9 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
             .chain_id = 1,
         };
         if (jstr(env_o, "currentRandom")) |r| env.prev_randao = u256FromHex(r);
+        // BLOBBASEFEE is the blob gas price for the current excess blob gas,
+        // regardless of whether this is a blob transaction.
+        env.blob_base_fee = zeth.tx.blobGasPrice(u256FromHex(jstr(env_o, "currentExcessBlobGas") orelse "0x0"));
 
         // Effective gas price (legacy gasPrice or 1559 fee market), plus the raw
         // fee cap / priority used for pre-execution validation.
