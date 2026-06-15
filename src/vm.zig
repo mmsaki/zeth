@@ -1025,6 +1025,7 @@ pub const Evm = struct {
         }
         if (self.state.hasCodeOrNonce(contract) or self.state.hasStorage(contract)) {
             self.state.incrementNonce(sender) catch @panic("out of memory");
+            self.setReturnData(&.{}); // an address collision exposes no return data
             try self.stack.push(0);
             return;
         }
