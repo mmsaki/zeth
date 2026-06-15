@@ -132,7 +132,7 @@ pub fn process(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
     _ = state.accessAddress(tx.sender);
     _ = state.accessAddress(env.coinbase);
     var p: u8 = 1;
-    while (p <= 0x12) : (p += 1) {
+    while (p <= 0x11) : (p += 1) { // EIP-2929 warms the precompiles 0x01–0x11
         var a = state_mod.zero_address;
         a[19] = p;
         _ = state.accessAddress(a);
