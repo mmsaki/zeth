@@ -19,6 +19,7 @@ pub fn idOf(addr: Address) ?u8 {
     for (addr[0..19]) |b| if (b != 0) return null;
     const id = addr[19];
     if (id >= 1 and id <= 0x09) return id;
+    if (id == 0x0a) return id; // KZG point evaluation (EIP-4844)
     // BLS12-381: G1ADD, G1MSM, G2ADD, G2MSM, PAIRING.
     if (id == 0x0b or id == 0x0c or id == 0x0d or id == 0x0e or id == 0x0f) return id;
     return null;
@@ -42,6 +43,7 @@ pub fn run(allocator: std.mem.Allocator, id: u8, input: []const u8, gas_availabl
         0x07 => bnMul(allocator, input, gas_available),
         0x08 => bnPairing(allocator, input, gas_available),
         0x09 => blake2f(allocator, input, gas_available),
+        0x0a => kzgPointEval(allocator, input, gas_available),
         0x0b => blsG1Add(allocator, input, gas_available),
         0x0c => blsG1Msm(allocator, input, gas_available),
         0x0d => blsG2Add(allocator, input, gas_available),
@@ -406,6 +408,63 @@ fn bnPairing(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output 
     const out = allocator.alloc(u8, 32) catch @panic("oom");
     @memset(out, 0);
     out[31] = if (bn254.pairingProductIsOne(pts)) 1 else 0;
+    return .{ .data = out, .gas = cost };
+}
+
+// --- KZG point evaluation (0x0a, EIP-4844) ---
+
+/// Decode a 48-byte compressed BLS12-381 G1 point (zcash flag format).
+fn decodeG1Compressed(b: []const u8) ?bls.G1 {
+    const z = std.mem.readInt(u384, b[0..48], .big);
+    const c_flag = (z >> 383) & 1;
+    const b_flag = (z >> 382) & 1;
+    const a_flag = (z >> 381) & 1;
+    if (c_flag == 0) return null; // must be compressed form
+    const x: u384 = z % (@as(u384, 1) << 381);
+    const is_inf = (x == 0);
+    if ((b_flag == 1) != is_inf) return null;
+    if (is_inf) return if (a_flag == 1) null else bls.G1.infinity();
+    if (x >= bls.P) return null;
+    const fx = bls.Fp{ .v = x };
+    const rhs = fx.mul(fx).mul(fx).add(bls.Fp.scalar(4)); // x³ + 4
+    const y = bls.fpSqrt(rhs) orelse return null; // also confirms on-curve
+    var yv = y.v;
+    if ((@as(u512, yv) * 2) / bls.P != a_flag) yv = bls.P - yv; // pick sign per a_flag
+    return bls.G1{ .x = fx, .y = bls.Fp{ .v = yv }, .z = bls.Fp.one() };
+}
+
+fn kzgPointEval(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len != 192) return null;
+    const cost: u64 = 50000;
+    if (cost > gas) return null;
+    // versioned_hash == 0x01 ‖ sha256(commitment)[1..32].
+    var ch: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(input[96..144], &ch, .{});
+    ch[0] = 0x01;
+    if (!std.mem.eql(u8, input[0..32], &ch)) return null;
+
+    const z = std.mem.readInt(u256, input[32..64], .big);
+    const y = std.mem.readInt(u256, input[64..96], .big);
+    if (z >= bls.R or y >= bls.R) return null; // field elements must be < r
+    const commitment = decodeG1Compressed(input[96..144]) orelse return null;
+    const proof = decodeG1Compressed(input[144..192]) orelse return null;
+
+    // Verify P − y = Q·(X − z) via pairings:
+    //   e(commitment − [y]₁, −G₂) · e(proof, [τ]₂ − [z]₂) == 1.
+    const x_minus_z = bls.kzgSetupG2().add(bls.g2Generator().mul(bls.R - z));
+    const p_minus_y = commitment.add(bls.g1Generator().mul(bls.R - y));
+    const g2 = bls.g2Generator();
+    const neg_g2 = bls.G2{ .x = g2.x, .y = g2.y.neg(), .z = g2.z };
+    if (!bls.pairingProductIsOne(&.{
+        .{ .q = neg_g2, .p = p_minus_y },
+        .{ .q = x_minus_z, .p = proof },
+    })) return null;
+
+    // Output: FIELD_ELEMENTS_PER_BLOB (4096) ‖ BLS_MODULUS, each 32-byte BE.
+    const out = allocator.alloc(u8, 64) catch @panic("oom");
+    @memset(out, 0);
+    std.mem.writeInt(u256, out[0..32], 4096, .big);
+    std.mem.writeInt(u256, out[32..64], bls.R, .big);
     return .{ .data = out, .gas = cost };
 }
 
