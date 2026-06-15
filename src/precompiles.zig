@@ -7,15 +7,20 @@ const std = @import("std");
 const crypto = @import("crypto.zig");
 const state_mod = @import("state.zig");
 const bn254 = @import("bn254.zig");
+const bls = @import("bls12_381.zig");
 const Address = state_mod.Address;
 
 pub const Output = struct { data: []u8, gas: u64 };
 
-/// Return the precompile id (1..0x0a) if `addr` is a precompile, else null.
+/// Return the precompile id if `addr` is an implemented precompile, else null.
+/// 0x01–0x09 (classic), 0x0b (BLS12-381 G1ADD). 0x0a (KZG) and the rest of the
+/// BLS set are not yet implemented, so they are not treated as precompiles.
 pub fn idOf(addr: Address) ?u8 {
     for (addr[0..19]) |b| if (b != 0) return null;
     const id = addr[19];
-    return if (id >= 1 and id <= 0x0a) id else null;
+    if (id >= 1 and id <= 0x09) return id;
+    if (id == 0x0b) return id;
+    return null;
 }
 
 fn words(len: usize) u64 {
@@ -36,7 +41,8 @@ pub fn run(allocator: std.mem.Allocator, id: u8, input: []const u8, gas_availabl
         0x07 => bnMul(allocator, input, gas_available),
         0x08 => bnPairing(allocator, input, gas_available),
         0x09 => blake2f(allocator, input, gas_available),
-        else => null, // unimplemented precompile (kzg/bls)
+        0x0b => blsG1Add(allocator, input, gas_available),
+        else => null, // unimplemented precompile (kzg / rest of bls)
     };
 }
 
@@ -396,6 +402,47 @@ fn bnPairing(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output 
     @memset(out, 0);
     out[31] = if (bn254.pairingProductIsOne(pts)) 1 else 0;
     return .{ .data = out, .gas = cost };
+}
+
+// --- BLS12-381 (EIP-2537) precompiles ---
+
+/// Decode a 64-byte big-endian field element, validating it is < P (which also
+/// rejects non-zero high padding, since P < 2^384 < 2^512).
+fn blsFp(input: []const u8, off: usize) ?bls.Fp {
+    var buf: [64]u8 = std.mem.zeroes([64]u8);
+    @memcpy(&buf, input[off .. off + 64]);
+    const v = std.mem.readInt(u512, &buf, .big);
+    if (v >= bls.P) return null;
+    return bls.Fp{ .v = @intCast(v) };
+}
+
+/// Decode a 128-byte G1 point (x ‖ y, 64 bytes each), validating the field and
+/// the curve. (0, 0) is the point at infinity.
+fn decodeBlsG1(input: []const u8, off: usize) ?bls.G1 {
+    const x = blsFp(input, off) orelse return null;
+    const y = blsFp(input, off + 64) orelse return null;
+    const z: bls.Fp = if (x.isZero() and y.isZero()) bls.Fp.zero() else bls.Fp.one();
+    const p = bls.G1{ .x = x, .y = y, .z = z };
+    if (!p.isOnCurve(bls.Fp.scalar(4))) return null;
+    return p;
+}
+
+fn encodeBlsG1(allocator: std.mem.Allocator, p: bls.G1) []u8 {
+    const aff = bls.normalizeG1(p);
+    const out = allocator.alloc(u8, 128) catch @panic("oom");
+    @memset(out, 0);
+    std.mem.writeInt(u512, out[0..64], @as(u512, aff.x.v), .big);
+    std.mem.writeInt(u512, out[64..128], @as(u512, aff.y.v), .big);
+    return out;
+}
+
+fn blsG1Add(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len != 256) return null; // EIP-2537: fixed 256-byte input
+    const cost: u64 = 375;
+    if (cost > gas) return null;
+    const p1 = decodeBlsG1(input, 0) orelse return null;
+    const p2 = decodeBlsG1(input, 128) orelse return null;
+    return .{ .data = encodeBlsG1(allocator, p1.add(p2)), .gas = cost };
 }
 
 /// Write `m` as big-endian into `out` (left-zero-padded; high bytes dropped).
