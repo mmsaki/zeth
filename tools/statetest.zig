@@ -267,7 +267,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
 
         if (!std.mem.eql(u8, &got, &want)) {
             result = .fail;
-            rep.failLine("  {s}{s}{s} {s}{s}{s} (d{d}g{d}v{d})\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET), di, gi, vi });
+            rep.failLine("  {s}{s}{s}\n    {s}{s}{s} (d{d}g{d}v{d})\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET), di, gi, vi });
             // Diff against the fixture's expected post accounts to localize the bug.
             if (jobj(entry, "state")) |post_state| diffState(rep, &st, post_state);
             break;
