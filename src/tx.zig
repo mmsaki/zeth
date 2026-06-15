@@ -63,8 +63,9 @@ fn intrinsicGas(data: []const u8, is_create: bool) Intrinsic {
     const create_extra: u64 = if (is_create) TX_CREATE + INIT_WORD * ((data.len + 31) / 32) else 0;
     const standard: u64 = TX_BASE + zero * 4 + nonzero * 16 + create_extra;
     // EIP-7623 calldata floor — a minimum on the *final* gas used, not intrinsic.
+    // The floor is a pure calldata price: no create or EVM costs are included.
     const tokens = zero + 4 * nonzero;
-    const floor: u64 = TX_BASE + FLOOR_PER_TOKEN * tokens + create_extra;
+    const floor: u64 = TX_BASE + FLOOR_PER_TOKEN * tokens;
     return .{ .standard = standard, .floor = floor };
 }
 
@@ -85,6 +86,9 @@ pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: 
 
     // The transaction's gas limit may not exceed the block gas limit.
     if (tx.gas_limit > env.gas_limit) return false;
+
+    // EIP-3860: a creation transaction's init code is bounded.
+    if (tx.to == null and tx.data.len > vm.MAX_INIT_CODE_SIZE) return false;
 
     // Intrinsic gas must fit within the gas limit.
     const ig = intrinsicGas(tx.data, tx.to == null);

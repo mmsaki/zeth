@@ -32,6 +32,9 @@ pub const STACK_DEPTH_LIMIT: u32 = 1024;
 /// Maximum operand stack size.
 pub const STACK_LIMIT: usize = 1024;
 
+/// EIP-3860: maximum init-code length (2 * MAX_CODE_SIZE).
+pub const MAX_INIT_CODE_SIZE: u256 = 49152;
+
 /// Upper bound on addressable memory. Real execution runs out of gas long
 /// before reaching this (memory cost is quadratic); we use it to reject
 /// absurd offsets without overflowing the gas math.
@@ -967,6 +970,7 @@ pub const Evm = struct {
         // EIP-3860 init-code word cost (CREATE2 additionally hashes the code).
         try self.chargeGasWide(Gas.CREATE_BASE + Gas.CODE_INIT_PER_WORD * word_count + ext.cost);
         try self.growMemory(ext.expand_by);
+        if (mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas; // EIP-3860
         if (self.is_static) return error.StaticStateChange;
 
         const create_gas = self.gas_left - self.gas_left / 64; // EIP-150 63/64
@@ -992,6 +996,7 @@ pub const Evm = struct {
         try self.chargeGasWide(Gas.CREATE_BASE + Gas.KECCAK_PER_WORD * words +
             Gas.CODE_INIT_PER_WORD * words + ext.cost);
         try self.growMemory(ext.expand_by);
+        if (mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas; // EIP-3860
         if (self.is_static) return error.StaticStateChange;
 
         const create_gas = self.gas_left - self.gas_left / 64; // EIP-150
