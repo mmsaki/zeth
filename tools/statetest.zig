@@ -174,14 +174,19 @@ fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap, id
         };
         if (jstr(env_o, "currentRandom")) |r| env.prev_randao = u256FromHex(r);
 
-        // Effective gas price (legacy gasPrice or 1559 fee market).
+        // Effective gas price (legacy gasPrice or 1559 fee market), plus the raw
+        // fee cap / priority used for pre-execution validation.
         var gas_price: u256 = undefined;
+        var max_fee_cap: u256 = undefined;
+        var max_prio: u256 = 0;
         if (jstr(tx_o, "gasPrice")) |gp| {
             gas_price = u256FromHex(gp);
+            max_fee_cap = gas_price;
         } else {
             const max_fee = u256FromHex(jstr(tx_o, "maxFeePerGas") orelse return .skip);
-            const max_prio = u256FromHex(jstr(tx_o, "maxPriorityFeePerGas") orelse "0x0");
+            max_prio = u256FromHex(jstr(tx_o, "maxPriorityFeePerGas") orelse "0x0");
             gas_price = @min(max_fee, base_fee + max_prio);
+            max_fee_cap = max_fee;
         }
         env.gas_price = gas_price;
 
@@ -234,7 +239,10 @@ fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap, id
             .blob_data_fee = blob_data_fee,
         };
 
-        _ = zeth.tx.process(a, &st, &env, tx);
+        // Reject invalid transactions outright (state stays at the pre-state).
+        if (zeth.tx.validate(&st, &env, tx, max_fee_cap, max_prio)) {
+            _ = zeth.tx.process(a, &st, &env, tx);
+        }
         const got = zeth.trie.stateRoot(a, &st);
 
         var want: [32]u8 = undefined;
