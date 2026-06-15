@@ -13,6 +13,7 @@ zevm
 gevm
 evmone
 hive
+py_ecc
 
 # Python
 __pycache__/
