@@ -203,6 +203,8 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap, 
         .chain_id = 1,
         .block_hashes = block_hashes, // [genesis, block1, …] for the BLOCKHASH opcode
     };
+    // BLOBBASEFEE for any tx, from the block's excess blob gas.
+    env.blob_base_fee = zeth.tx.blobGasPrice(u256H(jstr(header, "excessBlobGas") orelse "0x0"));
 
     // Block-start system calls (EIP-4788 beacon roots, EIP-2935 history) write
     // state, so they must run before the transactions.
