@@ -890,6 +890,10 @@ pub const Evm = struct {
             Gas.LOG_DATA_PER_BYTE * @as(u128, @intCast(size)) +
             Gas.LOG_TOPIC * @as(u64, num_topics) + ext.cost);
         try self.growMemory(ext.expand_by);
+        if (self.is_static) {
+            self.allocator.free(topics);
+            return error.StaticStateChange; // LOG mutates state (EIP-214)
+        }
 
         const at: usize = @intCast(mem_start);
         const data = self.allocator.dupe(u8, self.memory.data[at .. at + @as(usize, @intCast(size))]) catch @panic("out of memory");
@@ -1085,7 +1089,9 @@ pub const Evm = struct {
         try self.chargeGasWide(mcg.cost + ext.cost);
         try self.growMemory(ext.expand_by);
 
-        if (self.is_static and transfers_value) return error.StaticStateChange;
+        // Only CALL (which can transfer value to *another* account) is barred in
+        // a static context. CALLCODE sends value to self, so it is permitted.
+        if (self.is_static and kind == .call and value != 0) return error.StaticStateChange;
 
         if (transfers_value and self.state.balanceOf(self.message.current_target) < value) {
             // Insufficient balance: the call fails immediately, gas refunded.
