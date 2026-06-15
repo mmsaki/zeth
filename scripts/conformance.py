@@ -33,72 +33,56 @@ STOP = not ALL
 ENV = dict(os.environ, ZETH_ALL="1") if ALL else dict(os.environ)
 
 
-SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-_spin = [0]
+PASS_MARK = "\x1b[32m✓\x1b[0m"
+FAIL_MARK = "\x1b[31m✗\x1b[0m"
 
 
-def status(name, npass, nfail, current):
-    """Overwrite the current line with a spinner, live counts and the current
-    test name. Passing tests stream through here; failures are printed above."""
-    _spin[0] = (_spin[0] + 1) % len(SPINNER)
-    frame = SPINNER[_spin[0]]
-    head = f"  \x1b[36m{frame}\x1b[0m {name}  \x1b[32m✓{npass}\x1b[0m \x1b[31m✗{nfail}\x1b[0m  \x1b[2m"
-    # Budget the remaining width for the (dim) current-test name.
-    room = max(0, WIDTH - 12 - len(name) - len(str(npass)) - len(str(nfail)))
-    sys.stdout.write("\r\x1b[K" + head + current[:room] + "\x1b[0m")
-    sys.stdout.flush()
-
-
-def clear():
-    sys.stdout.write("\r\x1b[K")
-    sys.stdout.flush()
-
-
-def run(files, live, name=""):
-    """Run the binary on `files`; show a single updating spinner line with live
-    pass/fail counts when `live`, keeping failures permanent. Returns
-    (pass, fail, skip, crashed)."""
+def run(files, live):
+    """Run the binary on `files`. In `live` mode print a pytest-style row of
+    ✓/✗ marks as each test reports, buffering the verbose failure detail to
+    print afterwards. Returns (pass, fail, skip, crashed, fail_lines)."""
     try:
         p = subprocess.Popen([BIN, *files], stdout=subprocess.DEVNULL,
                              stderr=subprocess.PIPE, text=True, bufsize=1, env=ENV)
         res = None
-        seen_pass = seen_fail = 0
+        fail_lines = []        # buffered verbose failure output (with color)
+        col = [0]              # marks printed on the current row
+
+        def mark(m):
+            if not live:
+                return
+            sys.stdout.write(m)
+            col[0] += 1
+            if col[0] % (WIDTH - 4) == 0:
+                sys.stdout.write("\n  ")
+            sys.stdout.flush()
+
         for raw in (p.stderr or []):
             clean = ANSI.sub("", raw).rstrip("\n")
             m = SUMMARY.search(clean)
             if m:
                 res = (int(m[1]), int(m[2]), int(m[3]))
                 continue
-            if not live:
-                continue
             if "FAIL" in clean:
-                seen_fail += 1
-                clear()
-                print("  " + raw.rstrip())          # keep failures (with color)
+                mark(FAIL_MARK)
+                fail_lines.append("  " + raw.rstrip())
             elif any(k in clean for k in ("got ", "want ", "balance", "nonce", "slot", "mismatch")):
-                print("    " + clean.strip())        # diff detail under a failure
+                fail_lines.append("    " + clean.strip())   # diff detail
             elif "...OK" in clean or "...ok" in clean.lower():
-                seen_pass += 1
-                # Show the passing test name, replaced in place, with the spinner.
-                nm = clean.split("...")[0].strip().lstrip("0123456789/ ")
-                status(name, seen_pass, seen_fail, nm)
-            elif "..." in clean:
-                status(name, seen_pass, seen_fail, clean.strip())
+                mark(PASS_MARK)
         p.wait()
         if res:
-            if live:
-                clear()
-            return res[0], res[1], res[2], 0
+            return res[0], res[1], res[2], 0, fail_lines
     except Exception:
         pass
     if len(files) == 1:
-        return 0, 0, 0, 1
+        return 0, 0, 0, 1, []
     # Batch crashed — recover by running each file alone (quietly).
     tp = tf = ts = tx = 0
     for one in files:
-        dp, df, ds, dx = run([one], False)
+        dp, df, ds, dx, _ = run([one], False)
         tp += dp; tf += df; ts += ds; tx += dx
-    return tp, tf, ts, tx
+    return tp, tf, ts, tx, []
 
 
 def main():
@@ -110,21 +94,32 @@ def main():
     print(f"\n\x1b[1m{SUBDIR} conformance — root-checked, fork=Prague\x1b[0m\n")
 
     tot = [0, 0, 0, 0]
+    all_fails = []
     for cat in cats:
         files = [f for f in glob.glob(os.path.join(cat, "**", "*.json"), recursive=True)
                  if ".meta" not in f]
         if not files:
             continue
         name = os.path.basename(cat)
-        print(f"\x1b[36m▶ {name}\x1b[0m \x1b[2m({len(files)} files)\x1b[0m")
-        p, f, s, x = run(files, True, name)
+        # Category header, then the ✓/✗ graph row, then the count.
+        sys.stdout.write(f"\x1b[36m▶ {name}\x1b[0m \x1b[2m({len(files)} files)\x1b[0m\n  ")
+        sys.stdout.flush()
+        p, f, s, x, fails = run(files, True)
         for i, v in enumerate((p, f, s, x)):
             tot[i] += v
-        mark = "\x1b[32m✓\x1b[0m" if (f == 0 and x == 0 and p > 0) else ""
-        print(f"  \x1b[2m{name}: {p} passed, {f} failed, {x} crashed\x1b[0m {mark}\n")
+        tag = PASS_MARK if (f == 0 and x == 0 and p > 0) else FAIL_MARK
+        print(f"\n  \x1b[2m{name}: {p} passed, {f} failed, {x} crashed\x1b[0m {tag}\n")
+        all_fails += fails
         if STOP and (f > 0 or x > 0):
-            print("\x1b[1mstopped at first failure — run `ALL=1 make ...` for the full sweep\x1b[0m")
+            print("\n".join(all_fails))
+            print("\n\x1b[1mstopped at first failure — run `ALL=1 make ...` for the full sweep\x1b[0m")
             sys.exit(1)
+
+    # After the whole graph, print the verbose failures.
+    if all_fails:
+        print("\x1b[1m── failures ──\x1b[0m")
+        print("\n".join(all_fails))
+        print()
 
     p, f, s, x = tot
     rate = p / max(1, p + f) * 100
