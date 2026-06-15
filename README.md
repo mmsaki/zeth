@@ -1,4 +1,4 @@
-# Zetherum
+# Zeth
 
 A Zig implementation of the Ethereum execution layer, ported faithfully from
 the Python [execution-specs](https://github.com/ethereum/execution-specs)

@@ -3,7 +3,7 @@
 //!   zig build run -- 6006600701    # PUSH1 6, PUSH1 7, ADD
 
 const std = @import("std");
-const zeth = @import("zetherum");
+const zeth = @import("zeth");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;

@@ -1,4 +1,4 @@
-# Zetherum — Zig Ethereum execution client
+# Zeth — Zig Ethereum execution client
 #
 # Thin wrappers around `zig build`. Override the compiler with `ZIG=/path/zig`.
 
