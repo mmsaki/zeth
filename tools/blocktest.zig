@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const zeth = @import("zeth");
+const report = @import("report.zig");
 const Address = zeth.state.Address;
 
 var g_color = true;
@@ -32,7 +33,7 @@ fn shortName(n: []const u8) []const u8 {
 }
 
 /// Print which accounts/slots differ from the fixture's expected post state.
-fn diffState(st: *zeth.State, post: std.json.ObjectMap) void {
+fn diffState(rep: *report.Reporter, st: *zeth.State, post: std.json.ObjectMap) void {
     var it = post.iterator();
     while (it.next()) |e| {
         if (e.value_ptr.* != .object) continue;
@@ -40,15 +41,15 @@ fn diffState(st: *zeth.State, post: std.json.ObjectMap) void {
         const addr = addrH(tag);
         const exp = e.value_ptr.object;
         const wb = u256H(jstr(exp, "balance") orelse "0x0");
-        if (st.balanceOf(addr) != wb) std.debug.print("      {s} balance got {d} want {d}\n", .{ tag, st.balanceOf(addr), wb });
+        if (st.balanceOf(addr) != wb) rep.failLine("      {s} balance got {d} want {d}\n", .{ tag, st.balanceOf(addr), wb });
         const wn = u64H(jstr(exp, "nonce") orelse "0x0");
-        if (st.nonceOf(addr) != wn) std.debug.print("      {s} nonce got {d} want {d}\n", .{ tag, st.nonceOf(addr), wn });
+        if (st.nonceOf(addr) != wn) rep.failLine("      {s} nonce got {d} want {d}\n", .{ tag, st.nonceOf(addr), wn });
         if (exp.get("storage")) |sto| if (sto == .object) {
             var sit = sto.object.iterator();
             while (sit.next()) |s| if (s.value_ptr.* == .string) {
                 const key = u256H(s.key_ptr.*);
                 const wv = u256H(s.value_ptr.string);
-                if (st.getStorage(addr, key) != wv) std.debug.print("      {s} slot {x} got {x} want {x}\n", .{ tag, key, st.getStorage(addr, key), wv });
+                if (st.getStorage(addr, key) != wv) rep.failLine("      {s} slot {x} got {x} want {x}\n", .{ tag, key, st.getStorage(addr, key), wv });
             };
         };
     }
@@ -234,7 +235,7 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap) 
     return std.mem.eql(u8, &got, &want);
 }
 
-fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap) Verdict {
+fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name: []const u8, obj: std.json.ObjectMap) Verdict {
     const net = jstr(obj, "network") orelse return .skip;
     if (!std.mem.eql(u8, net, FORK)) return .skip;
     const pre = jobj(obj, "pre") orelse return .skip;
@@ -255,7 +256,7 @@ fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap) Ve
             var want: [32]u8 = undefined;
             _ = std.fmt.hexToBytes(&want, sr[2..]) catch {};
             if (!std.mem.eql(u8, &got, &want)) {
-                std.debug.print("  {s}FAIL{s} {s}\n      {s}genesis state root differs (pre-state load){s}\n", .{ clr(RED), clr(RESET), shortName(name), clr(DIM), clr(RESET) });
+                rep.failLine("  {s}{s}{s} {s}{s}{s} genesis state root differs (pre-state load)\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET) });
                 return .fail;
             }
         }
@@ -268,35 +269,33 @@ fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap) Ve
         if (block.get("expectException") != null) continue;
         if (block.get("blockHeader") == null) continue;
         if (!applyBlock(a, &st, block)) {
-            std.debug.print("  {s}FAIL{s} {s}\n      {s}block {d} post-state root differs:{s}\n", .{ clr(RED), clr(RESET), shortName(name), clr(DIM), bn, clr(RESET) });
-            if (jobj(obj, "postState")) |ps| diffState(&st, ps);
+            rep.failLine("  {s}{s}{s} {s}{s}{s} block {d} post-state root differs:\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET), bn });
+            if (jobj(obj, "postState")) |ps| diffState(rep, &st, ps);
             return .fail;
         }
     }
     return .pass;
 }
 
-fn runFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Tally {
-    var t = Tally{};
-    const content = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return t;
+fn runFile(gpa: std.mem.Allocator, io: std.Io, rep: *report.Reporter, path: []const u8) void {
+    const content = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return;
     defer gpa.free(content);
-    var parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch return t;
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch return;
     defer parsed.deinit();
-    if (parsed.value != .object) return t;
+    if (parsed.value != .object) return;
 
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
-        switch (runTest(gpa, entry.key_ptr.*, entry.value_ptr.object)) {
-            .pass => t.pass += 1,
+        switch (runTest(gpa, rep, path, entry.key_ptr.*, entry.value_ptr.object)) {
+            .pass => rep.passed(),
             .fail => {
-                t.fail += 1;
-                if (g_stop) break;
+                rep.failed();
+                if (g_stop) return;
             },
-            .skip => t.skip += 1,
+            .skip => rep.skipped(),
         }
     }
-    return t;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -307,21 +306,17 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("ZETH_TRACE") != null) zeth.vm.trace_enabled = true;
     if (init.environ_map.get("ZETH_ALL") != null) g_stop = false;
     if (args.len < 2) {
-        std.debug.print("usage: blocktest <fixture.json> ...\n", .{});
+        std.debug.print("usage: blocktest <fixture.json | dir> ...\n", .{});
         return error.MissingArgument;
     }
 
-    var total = Tally{};
-    for (args[1..]) |path| {
-        const t = runFile(gpa, init.io, path);
-        total.pass += t.pass;
-        total.fail += t.fail;
-        total.skip += t.skip;
-        if (g_stop and total.fail > 0) break;
+    const files = try report.collectJson(gpa, init.io, args[1..]);
+    var rep = report.Reporter{ .alloc = gpa, .color = g_color };
+    std.debug.print("  ", .{});
+    for (files) |path| {
+        runFile(gpa, init.io, &rep, path);
+        if (g_stop and rep.fail > 0) break;
     }
-    const ok = total.fail == 0;
-    std.debug.print("\n{s}{s}{d} passed{s}, {d} failed, {s}{d} skipped{s}\n", .{
-        clr(BOLD), if (ok) clr(GREEN) else clr(RED), total.pass, clr(RESET), total.fail, clr(YELLOW), total.skip, clr(RESET),
-    });
+    const ok = rep.finish("BlockchainTests");
     if (!ok) return error.ConformanceFailed;
 }
