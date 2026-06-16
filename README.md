@@ -26,23 +26,34 @@ Prints gas used, the stack, and memory.
 
 ## Tests
 
-```sh
-make test          # Zig unit tests
-make eels          # TrieTests + a slice of GeneralStateTests, root-checked
-make conformance   # GeneralStateTests (stops at the first failure)
-make hive-tests    # BlockchainTests (stops at the first failure)
-make report        # full sweep of both suites: ✓/✗ graph + pass rate
-```
-
-`make conformance` and `make hive-tests` stop at the first failure (like a
-compiler). Prefix with `ALL=1` to run the whole suite past failures:
+Tests are grouped by **where the fixtures come from**:
 
 ```sh
-ALL=1 make hive-tests
+make test           # unit tests — our own Zig `test {}` blocks (fast inner loop)
+make test-ethereum  # ethereum/tests   — classic EF repo: state + blockchain + trie
+make test-eest      # execution-spec-tests — modern EF fixtures, ALL forks (local)
+make test-hive      # hive — Docker: drives the EEST fixtures at a live zeth over RPC
+make test-all       # everything local (no Docker): the three above
 ```
 
-Official fixtures live under `ethereum-tests/` (gitignored). `ZETH_TRACE=1`
-prints a per-opcode execution trace; `ZETH_DATA=N` runs only data index `N`.
+`test-eest` runs the *same* fixtures hive feeds the client, just locally and far
+faster. Populate them once (extracted from the hive simulator image, ~4 GB):
+
+```sh
+make fixtures-eest
+```
+
+The two fixture runners (`blocktest`, `statetest`) take flags directly:
+
+```sh
+./zig-out/bin/blocktest --all --fork London eest-fixtures/blockchain_tests
+#   --all   run past failures   --fork <name>  one fork only
+#   --import drive the real node pipeline   --trace  per-opcode trace
+```
+
+Without `--all` they stop at the first failure (like a compiler). Run
+`blocktest --help` / `statetest --help` for the full flag list. Fixtures live
+under `ethereum-tests/` and `eest-fixtures/` (both gitignored).
 
 ## Benchmark
 
@@ -63,4 +74,4 @@ alongside Mgas/s throughput.
 | `src/tx.zig` | transaction processing + validation |
 | `src/precompiles.zig` | precompiles (incl. bn254, BLS12-381, KZG) |
 | `src/bn254.zig`, `src/bls12_381.zig` | pairing-friendly curve crypto |
-| `tools/` | conformance runners (`statetest`, `blocktest`, `eels`) |
+| `tools/` | fixture-test runners (`statetest`, `blocktest`, `eels`) |
