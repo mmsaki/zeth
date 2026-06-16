@@ -28,6 +28,7 @@ pub const handshake = @import("handshake.zig");
 pub const eth_proto = @import("eth_proto.zig");
 pub const peer = @import("peer.zig");
 pub const forkid = @import("forkid.zig");
+pub const discv4 = @import("discv4.zig");
 
 pub const Evm = vm.Evm;
 pub const Op = vm.Op;
