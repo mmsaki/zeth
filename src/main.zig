@@ -207,6 +207,8 @@ fn syncFromPeer(
     network_id: u64,
     genesis_hash: [32]u8,
     fid: zeth.forkid.ForkId,
+    follow: bool,
+    store_opt: ?*zeth.store.Store,
 ) !void {
     const priv = zeth.ecies.randomPriv(io);
     const pub_key = try zeth.ecies.pubFromPriv(priv);
@@ -230,34 +232,34 @@ fn syncFromPeer(
         defer ha.deinit();
         try p.writeMessage(zeth.eth_proto.eth.status, try our_status.encode(ha.allocator()));
     }
-    const status_payload = try p.readUntil(gpa, zeth.eth_proto.eth.status);
-    defer gpa.free(status_payload);
-    var sa = std.heap.ArenaAllocator.init(gpa);
-    defer sa.deinit();
-    const peer_status = try zeth.eth_proto.Status69.decode(sa.allocator(), status_payload);
-    const target = peer_status.latest_block;
-    std.debug.print("✓ eth/69 handshake — peer head #{d}\n", .{target});
+    {
+        const status_payload = try p.readUntil(gpa, zeth.eth_proto.eth.status);
+        defer gpa.free(status_payload);
+        var sa = std.heap.ArenaAllocator.init(gpa);
+        defer sa.deinit();
+        const peer_status = try zeth.eth_proto.Status69.decode(sa.allocator(), status_payload);
+        std.debug.print("✓ eth/69 handshake — peer head #{d}\n", .{peer_status.latest_block});
+    }
 
-    // Header → body → execute, in batches, until we reach the peer's head.
+    // Pull headers from head+1 in batches and execute them. When caught up,
+    // either stop (one-shot) or poll for new blocks (follow).
     var reqid: u64 = 1;
-    while (ch.head.number < target) {
+    while (true) {
         var batch_arena = std.heap.ArenaAllocator.init(gpa);
         defer batch_arena.deinit();
         const ba = batch_arena.allocator();
 
         const start = ch.head.number + 1;
-        const remaining = target - ch.head.number;
-        const amount: u64 = @min(@as(u64, 192), remaining);
-
         reqid += 1;
-        const hreq = zeth.eth_proto.GetBlockHeaders{ .request_id = reqid, .origin_number = start, .amount = amount };
+        const hreq = zeth.eth_proto.GetBlockHeaders{ .request_id = reqid, .origin_number = start, .amount = 192 };
         try p.writeMessage(zeth.eth_proto.eth.get_block_headers, try hreq.encode(ba));
         const hpayload = try p.readUntil(gpa, zeth.eth_proto.eth.block_headers);
         defer gpa.free(hpayload);
         const hresp = try zeth.eth_proto.decodeBlockHeaders(ba, hpayload);
         if (hresp.headers.len == 0) {
-            std.debug.print("peer returned no headers at #{d}; stopping\n", .{start});
-            break;
+            if (!follow) break;
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(2000), .awake) catch {};
+            continue;
         }
 
         var hashes = try ba.alloc([32]u8, hresp.headers.len);
@@ -276,7 +278,8 @@ fn syncFromPeer(
                 return e;
             };
         }
-        std.debug.print("  synced → #{d} / {d}\n", .{ ch.head.number, target });
+        std.debug.print("  synced → #{d}\n", .{ch.head.number});
+        if (store_opt) |store| ch.persistTo(ba, store) catch |e| std.debug.print("warning: persist failed: {s}\n", .{@errorName(e)});
     }
 }
 
@@ -291,8 +294,10 @@ fn syncCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     }
     const enode = try zeth.peer.parseEnode(args[0]);
     var datadir: ?[]const u8 = null;
+    var follow = false;
     for (args[2..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--datadir=")) datadir = arg["--datadir=".len..];
+        if (std.mem.eql(u8, arg, "--follow")) follow = true;
     }
 
     // Genesis → state + chain.
@@ -331,12 +336,8 @@ fn syncCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
         }
     }
 
-    try syncFromPeer(gpa, io, &ch, enode, network_id, genesis_hash, fid);
-
-    if (store_opt) |*store| {
-        try ch.persistTo(a, store);
-        std.debug.print("persisted to {s}\n", .{datadir.?});
-    }
+    const store_ptr: ?*zeth.store.Store = if (store_opt) |*s| s else null;
+    try syncFromPeer(gpa, io, &ch, enode, network_id, genesis_hash, fid, follow, store_ptr);
 
     const hh = try ch.head.hash(gpa);
     std.debug.print("✓ sync complete: head #{d} 0x{s}\n", .{ ch.head.number, std.fmt.bytesToHex(&hh, .lower) });
@@ -525,10 +526,11 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
         if (zeth.peer.parseEnode(en)) |enode| {
             const ghash = try g.header.hash(gpa);
             const fid = zeth.forkid.compute(ghash, &.{}, 0);
-            syncFromPeer(gpa, io, &ch, enode, g.schedule.chain_id, ghash, fid) catch |e|
+            const store_ptr: ?*zeth.store.Store = if (store_opt) |*s| s else null;
+            // Catch up to the peer's head, then serve. (Following the live head
+            // while serving needs the chain guarded by a mutex — a follow-up.)
+            syncFromPeer(gpa, io, &ch, enode, g.schedule.chain_id, ghash, fid, false, store_ptr) catch |e|
                 std.debug.print("peer sync ended: {s}\n", .{@errorName(e)});
-            if (store_opt) |*store|
-                ch.persistTo(a, store) catch |e| std.debug.print("warning: persist failed: {s}\n", .{@errorName(e)});
         } else |e| std.debug.print("bad --peer enode: {s}\n", .{@errorName(e)});
     }
 
