@@ -214,6 +214,14 @@ fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?
             if (byte & bit != 0) mulmod(allocator, &result, &result, &base, &mod);
         }
     }
+    // Reduce the initial `1` modulo the modulus for the empty/zero-exponent case
+    // (base**0 == 1, but 1 mod 1 == 0): the loop above never ran, so `result` is
+    // still the unreduced 1. mulmod keeps it reduced whenever the loop executes.
+    {
+        var q = Managed.init(allocator) catch @panic("oom");
+        defer q.deinit();
+        q.divFloor(&result, &result, &mod) catch @panic("oom"); // result %= mod
+    }
     writeBigBe(result, out);
     return .{ .data = out, .gas = cost };
 }
