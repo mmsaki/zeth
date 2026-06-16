@@ -300,6 +300,27 @@ fn parseAccessList(a: std.mem.Allocator, tx_o: std.json.ObjectMap) []const zeth.
     return list.items;
 }
 
+/// Parse an EIP-7702 `authorizationList` from a fixture transaction object.
+fn parseAuthList(a: std.mem.Allocator, tx_o: std.json.ObjectMap) []const zeth.tx.Authorization {
+    var list = std.ArrayList(zeth.tx.Authorization).empty;
+    if (jarr(tx_o, "authorizationList")) |al| {
+        for (al) |e_v| {
+            if (e_v != .object) continue;
+            const e = e_v.object;
+            const yp = jstr(e, "yParity") orelse jstr(e, "v") orelse "0x0";
+            list.append(a, .{
+                .chain_id = u256H(jstr(e, "chainId") orelse "0x0"),
+                .address = addrH(jstr(e, "address") orelse continue),
+                .nonce = u64H(jstr(e, "nonce") orelse "0x0"),
+                .y_parity = @intCast(u256H(yp)),
+                .r = u256H(jstr(e, "r") orelse "0x0"),
+                .s = u256H(jstr(e, "s") orelse "0x0"),
+            }) catch @panic("oom");
+        }
+    }
+    return list.items;
+}
+
 /// RLP-encode a u256 as its minimal big-endian byte string (0 → empty/0x80).
 fn rlpQ(a: std.mem.Allocator, v: u256) []const u8 {
     var buf: [32]u8 = undefined;
@@ -454,6 +475,7 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap, 
                 .data = bytesH(a, jstr(tx_o, "data") orelse "0x"),
                 .access_list = parseAccessList(a, tx_o),
                 .blob_data_fee = blob_data_fee,
+                .authorizations = parseAuthList(a, tx_o),
             };
             if (g_check_receipts) {
                 var logs: std.ArrayList(zeth.vm.Log) = .empty;
