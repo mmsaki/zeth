@@ -18,6 +18,8 @@ pub const DecodeError = error{ Malformed, BadSignature, OutOfMemory };
 
 /// A fully decoded, signature-recovered transaction. Fee fields are normalized:
 /// legacy / 2930 set `max_fee == max_priority_fee == gas_price`.
+pub const Authorization = txmod.Authorization;
+
 pub const Transaction = struct {
     tx_type: u8,
     chain_id: ?u64 = null,
@@ -31,6 +33,7 @@ pub const Transaction = struct {
     access_list: []const txmod.AccessEntry = &.{},
     max_fee_per_blob_gas: u256 = 0,
     blob_versioned_hashes: []const [32]u8 = &.{},
+    authorizations: []const Authorization = &.{},
     y_parity: u8 = 0,
     r: u256 = 0,
     s: u256 = 0,
@@ -163,7 +166,22 @@ fn decodeTyped(a: std.mem.Allocator, tx_type: u8, payload: []const u8) DecodeErr
         }
         tx.blob_versioned_hashes = bvh;
         idx += 2;
-    } else if (tx_type == 4) { // EIP-7702 authorization list (kept opaque for now)
+    } else if (tx_type == 4) { // EIP-7702 authorization list
+        const auths = f[idx].items() catch return error.Malformed;
+        var list = try a.alloc(Authorization, auths.len);
+        for (auths, 0..) |auth_v, i| {
+            const af = auth_v.items() catch return error.Malformed;
+            if (af.len != 6) return error.Malformed;
+            list[i] = .{
+                .chain_id = try uintField(af[0], u256),
+                .address = (try addrField(af[1])) orelse return error.Malformed,
+                .nonce = try uintField(af[2], u64),
+                .y_parity = @intCast(try uintField(af[3], u64)),
+                .r = try uintField(af[4], u256),
+                .s = try uintField(af[5], u256),
+            };
+        }
+        tx.authorizations = list;
         idx += 1;
     }
 

@@ -7,11 +7,28 @@
 const std = @import("std");
 const vm = @import("vm.zig");
 const state_mod = @import("state.zig");
+const rlp = @import("rlp.zig");
+const crypto = @import("crypto.zig");
+const precompiles = @import("precompiles.zig");
 const Address = state_mod.Address;
 const State = state_mod.State;
 const Fork = @import("fork.zig").Fork;
 
+/// secp256k1 group order; EIP-2 / EIP-7702 require s ≤ n/2 and 0 < r,s < n.
+const SECP256K1N: u256 = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141;
+
 pub const AccessEntry = struct { address: Address, keys: []const u256 };
+
+/// EIP-7702 authorization tuple `[chainId, address, nonce, yParity, r, s]`. The
+/// authority (signer) is recovered when the delegation is applied at tx start.
+pub const Authorization = struct {
+    chain_id: u256 = 0,
+    address: Address = state_mod.zero_address,
+    nonce: u64 = 0,
+    y_parity: u8 = 0,
+    r: u256 = 0,
+    s: u256 = 0,
+};
 
 pub const Tx = struct {
     sender: Address,
@@ -25,6 +42,8 @@ pub const Tx = struct {
     /// EIP-4844 blob data fee (total_blob_gas × blob_gas_price), paid upfront
     /// and burned (never refunded).
     blob_data_fee: u256 = 0,
+    /// EIP-7702 (type-4) authorizations. Applied as delegations at tx start.
+    authorizations: []const Authorization = &.{},
 };
 
 pub const GAS_PER_BLOB: u64 = 1 << 17; // 131072
@@ -62,6 +81,8 @@ pub fn blobGasPrice(excess_blob_gas: u256, fork: Fork) u256 {
 
 const ACCESS_LIST_ADDRESS: u64 = 2400;
 const ACCESS_LIST_KEY: u64 = 1900;
+const AUTH_PER_EMPTY_ACCOUNT: u64 = 25000; // EIP-7702 intrinsic per authorization
+const REFUND_AUTH_PER_EXISTING_ACCOUNT: u64 = 12500; // refund for an existing authority
 
 pub const Result = struct { gas_used: u64, success: bool };
 
@@ -95,6 +116,75 @@ fn isValidDelegation(code: []const u8) bool {
     return code.len == 23 and code[0] == 0xef and code[1] == 0x01 and code[2] == 0x00;
 }
 
+/// Minimal big-endian RLP encoding of a 256-bit quantity (leading zeros dropped).
+fn encodeQuantity(a: std.mem.Allocator, value: u256) ![]u8 {
+    var buf: [32]u8 = undefined;
+    std.mem.writeInt(u256, &buf, value, .big);
+    var start: usize = 0;
+    while (start < buf.len and buf[start] == 0) start += 1;
+    return rlp.encodeBytes(a, buf[start..]);
+}
+
+/// Recover the authority (signer) of an EIP-7702 authorization, or null if the
+/// signature is malformed. signing_hash = keccak256(0x05 ‖ rlp([chainId,
+/// address, nonce])); the recovery enforces the EIP-2 low-s and r/s bounds.
+fn recoverAuthority(a: std.mem.Allocator, auth: Authorization) ?Address {
+    if (auth.y_parity > 1) return null;
+    if (auth.r == 0 or auth.r >= SECP256K1N) return null;
+    if (auth.s == 0 or auth.s > SECP256K1N / 2) return null;
+
+    const items = [_][]const u8{
+        encodeQuantity(a, auth.chain_id) catch return null,
+        rlp.encodeBytes(a, &auth.address) catch return null,
+        encodeQuantity(a, auth.nonce) catch return null,
+    };
+    const list = rlp.encodeList(a, &items) catch return null;
+    const pre = a.alloc(u8, 1 + list.len) catch return null;
+    pre[0] = 0x05; // SET_CODE_TX_MAGIC
+    @memcpy(pre[1..], list);
+    const h = crypto.keccak256(pre);
+
+    var rb: [32]u8 = undefined;
+    var sb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &rb, auth.r, .big);
+    std.mem.writeInt(u256, &sb, auth.s, .big);
+    return precompiles.recoverAddress(h, auth.y_parity, rb, sb);
+}
+
+/// Apply EIP-7702 authorizations at the start of a type-4 transaction: for each
+/// valid authorization, set the authority's code to the delegation indicator
+/// (or clear it when the target is the zero address) and bump its nonce. These
+/// writes happen before the EVM runs and persist even if execution reverts.
+/// Returns the gas refund accrued for authorities that already existed.
+fn applyDelegations(a: std.mem.Allocator, state: *State, env: *const vm.Environment, auths: []const Authorization) u64 {
+    var refund: u64 = 0;
+    for (auths) |auth| {
+        // chain_id must be 0 (any chain) or this chain.
+        if (auth.chain_id != 0 and auth.chain_id != @as(u256, env.chain_id)) continue;
+        if (auth.nonce == std.math.maxInt(u64)) continue;
+        const authority = recoverAuthority(a, auth) orelse continue;
+        _ = state.accessAddress(authority);
+        // An authority that already holds non-delegation code is not an EOA.
+        const code = state.codeOf(authority);
+        if (code.len != 0 and !isValidDelegation(code)) continue;
+        if (state.nonceOf(authority) != auth.nonce) continue;
+        // Refund the difference for an authority account that already exists.
+        if (state.exists(authority)) refund += AUTH_PER_EMPTY_ACCOUNT - REFUND_AUTH_PER_EXISTING_ACCOUNT;
+        if (std.mem.allEqual(u8, &auth.address, 0)) {
+            state.setCode(authority, &.{}) catch @panic("oom"); // clear delegation
+        } else {
+            var dcode = std.mem.zeroes([23]u8);
+            dcode[0] = 0xef;
+            dcode[1] = 0x01;
+            dcode[2] = 0x00;
+            @memcpy(dcode[3..], &auth.address);
+            state.setCode(authority, &dcode) catch @panic("oom");
+        }
+        state.setNonce(authority, state.nonceOf(authority) + 1) catch @panic("oom");
+    }
+    return refund;
+}
+
 /// Why a transaction is invalid. `message()` returns a descriptive string the
 /// Engine API surfaces as `validationError` (and an EEST exception mapper can
 /// map to TransactionException types).
@@ -108,6 +198,7 @@ pub const InvalidReason = enum {
     nonce_mismatch,
     insufficient_funds,
     sender_not_eoa,
+    set_code_creation,
 
     pub fn message(self: InvalidReason) []const u8 {
         return switch (self) {
@@ -120,6 +211,7 @@ pub const InvalidReason = enum {
             .nonce_mismatch => "nonce mismatch",
             .insufficient_funds => "insufficient funds for gas * price + value",
             .sender_not_eoa => "sender not an eoa",
+            .set_code_creation => "set code transaction must not be a contract creation",
         };
     }
 };
@@ -141,10 +233,15 @@ pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: 
     const eip3860 = env.fork.atLeast(.shanghai);
     if (eip3860 and tx.to == null and tx.data.len > vm.MAX_INIT_CODE_SIZE) return .init_code_too_large;
 
+    // EIP-7702 (type-4): a set-code transaction must carry at least one
+    // authorization and may not be a contract creation.
+    if (tx.authorizations.len > 0 and tx.to == null) return .set_code_creation;
+
     // Intrinsic gas must fit within the gas limit.
     const ig = intrinsicGas(tx.data, tx.to == null, eip3860);
     var intrinsic = ig.standard;
     for (tx.access_list) |e| intrinsic += ACCESS_LIST_ADDRESS + ACCESS_LIST_KEY * e.keys.len;
+    intrinsic += AUTH_PER_EMPTY_ACCOUNT * tx.authorizations.len;
     if (tx.gas_limit < intrinsic) return .intrinsic_gas_too_low;
 
     // Nonce must match exactly, and must leave room to increment (EELS rejects
@@ -209,16 +306,36 @@ fn processImpl(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
         for (e.keys) |k| _ = state.accessStorage(e.address, k);
     }
 
+    // EIP-7702 (Prague): apply the type-4 authorizations as delegations. The
+    // code/nonce writes persist regardless of how execution ends; the refund is
+    // added to the (capped) total refund below, also regardless of outcome.
+    intrinsic += AUTH_PER_EMPTY_ACCOUNT * tx.authorizations.len;
+    const auth_refund: u64 = if (tx.authorizations.len > 0)
+        applyDelegations(allocator, state, env, tx.authorizations)
+    else
+        0;
+
     const exec_gas = tx.gas_limit - intrinsic;
 
     var evm: vm.Evm = undefined;
     if (tx.to) |to| {
         _ = state.accessAddress(to);
+        // Follow a delegation indicator at the top level: run the delegate's
+        // code in `to`'s storage context (EIP-7702). `code_address` stays `to`
+        // (not the delegate) so a delegation to a precompile address runs
+        // nothing — EELS disables precompiles for the top-level delegated call.
+        var code = state.codeOf(to);
+        if (isValidDelegation(code)) {
+            var del: Address = undefined;
+            @memcpy(&del, code[3..23]);
+            _ = state.accessAddress(del);
+            code = state.codeOf(del);
+        }
         evm = vm.processMessage(allocator, state, env, .{
             .caller = tx.sender,
             .current_target = to,
             .code_address = to,
-            .code = state.codeOf(to),
+            .code = code,
             .gas = exec_gas,
             .value = tx.value,
             .data = tx.data,
@@ -251,9 +368,12 @@ fn processImpl(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
         }
     };
 
-    // EIP-3529 refund, capped at gas_used / 5.
-    if (success) {
-        var refund: i64 = evm.refund_counter;
+    // EIP-3529 refund, capped at gas_used / 5. The EIP-7702 authorization refund
+    // is part of the total and applies even when execution reverts; the EVM's
+    // own (SSTORE/selfdestruct) refund only counts on success.
+    {
+        var refund: i64 = @intCast(auth_refund);
+        if (success) refund += evm.refund_counter;
         if (refund < 0) refund = 0;
         const max_refund: u64 = gas_used / 5;
         const applied: u64 = @min(@as(u64, @intCast(refund)), max_refund);
