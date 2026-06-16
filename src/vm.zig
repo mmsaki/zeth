@@ -1544,9 +1544,10 @@ pub fn processCreateMessage(
     var snapshot = state.clone() catch @panic("out of memory");
     // EIP-6780: record the address as created this tx (shared, not rolled back)
     // so SELFDESTRUCT may delete it; also a newly created contract starts at
-    // nonce 1 (EIP-161).
+    // nonce 1 (EIP-161, Spurious Dragon) — before that it starts at nonce 0.
     state.markAccountCreated(message.current_target);
-    state.incrementNonce(message.current_target) catch @panic("out of memory");
+    if (env.fork.atLeast(.spurious_dragon))
+        state.incrementNonce(message.current_target) catch @panic("out of memory");
 
     var frame = processMessage(allocator, state, env, message, parent);
 

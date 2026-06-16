@@ -375,11 +375,18 @@ pub const Chain = struct {
             var logs: std.ArrayList(vm.Log) = .empty;
             const res = txmod.processWithReceipt(a, self.state, &env, tx, &logs);
             cumulative_gas += res.gas_used;
+            // Pre-Byzantium (before EIP-658) the receipt carries the intermediate
+            // post-transaction state root in place of a status code.
+            const post_state: ?[32]u8 = if (fork.atLeast(.byzantium))
+                null
+            else
+                trie.stateRoot(a, self.state, fork.atLeast(.spurious_dragon));
             receipts.append(a, .{
                 .tx_type = dt.tx_type,
                 .success = res.success,
                 .cumulative_gas_used = cumulative_gas,
                 .logs = logs.items,
+                .post_state = post_state,
             }) catch return error.OutOfMemory;
 
             // Retain a gpa-owned record for the RPC layer.
@@ -457,7 +464,7 @@ pub const Chain = struct {
         }
 
         // Validate the execution result against the header (the consensus checks).
-        const state_root = trie.stateRoot(a, self.state);
+        const state_root = trie.stateRoot(a, self.state, fork.atLeast(.spurious_dragon));
         if (!std.mem.eql(u8, &state_root, &h.state_root)) return error.StateRootMismatch;
         const tx_root = block.orderedTrieRoot(a, blk.transactions);
         if (!std.mem.eql(u8, &tx_root, &h.transactions_root)) return error.TransactionsRootMismatch;

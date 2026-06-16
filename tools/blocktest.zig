@@ -54,8 +54,21 @@ var g_import = false; // ZETH_IMPORT=1: drive the real chain.importBlock pipelin
 /// A fork schedule pinned so `forkAt` always returns `f` (every block in a
 /// fixture shares one fork).
 fn scheduleForFork(f: zeth.Fork) zeth.genesis.ForkSchedule {
+    // The fixture runs a single fork active from genesis: every fork up to the
+    // target activates at block 0 (pre-Merge) or timestamp 0 (post-Merge), and
+    // the Merge is "from genesis" for Paris and later.
     return .{
         .chain_id = 1,
+        .homestead_block = if (f.atLeast(.homestead)) 0 else null,
+        .tangerine_block = if (f.atLeast(.tangerine_whistle)) 0 else null,
+        .spurious_block = if (f.atLeast(.spurious_dragon)) 0 else null,
+        .byzantium_block = if (f.atLeast(.byzantium)) 0 else null,
+        .constantinople_block = if (f.atLeast(.constantinople)) 0 else null,
+        .petersburg_block = if (f.atLeast(.petersburg)) 0 else null,
+        .istanbul_block = if (f.atLeast(.istanbul)) 0 else null,
+        .berlin_block = if (f.atLeast(.berlin)) 0 else null,
+        .london_block = if (f.atLeast(.london)) 0 else null,
+        .merged_from_genesis = f.atLeast(.paris),
         .shanghai_time = if (f.atLeast(.shanghai)) 0 else null,
         .cancun_time = if (f.atLeast(.cancun)) 0 else null,
         .prague_time = if (f.atLeast(.prague)) 0 else null,
@@ -546,7 +559,7 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap, 
         systemCall(a, st, &env, "0x0000BBdDc7CE488642fb579F8B00f3a590007251", &.{}); // EIP-7251
     }
 
-    const got = zeth.trie.stateRoot(a, st);
+    const got = zeth.trie.stateRoot(a, st, g_fork.atLeast(.spurious_dragon));
     var want: [32]u8 = undefined;
     const sr = jstr(header, "stateRoot") orelse return false;
     _ = std.fmt.hexToBytes(&want, sr[2..]) catch {};
@@ -597,7 +610,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
     if (jobj(obj, "genesisBlockHeader")) |gh| {
         appendHash(&block_hashes, a, gh);
         if (jstr(gh, "stateRoot")) |sr| {
-            const got = zeth.trie.stateRoot(a, &st);
+            const got = zeth.trie.stateRoot(a, &st, g_fork.atLeast(.spurious_dragon));
             var want: [32]u8 = undefined;
             _ = std.fmt.hexToBytes(&want, sr[2..]) catch {};
             if (!std.mem.eql(u8, &got, &want)) {
