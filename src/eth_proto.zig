@@ -276,6 +276,32 @@ pub fn decodeGetBlockBodies(a: std.mem.Allocator, payload: []const u8) !struct {
     return .{ .request_id = try f[0].uint(u64), .hashes = out };
 }
 
+/// Decode a BlockBodies response into the raw RLP of each body
+/// ([transactions, ommers, withdrawals]); caller owns the slice + entries.
+pub fn decodeBlockBodies(a: std.mem.Allocator, payload: []const u8) !struct { request_id: u64, bodies: [][]const u8 } {
+    const item = try rlp.decode(a, payload);
+    const f = try item.items();
+    if (f.len < 2) return error.BadResponse;
+    const blist = try f[1].items();
+    const out = try a.alloc([]const u8, blist.len);
+    errdefer a.free(out);
+    for (blist, 0..) |b, i| out[i] = try reencodeItem(a, b);
+    return .{ .request_id = try f[0].uint(u64), .bodies = out };
+}
+
+/// Reassemble a full block RLP (`[header, txs, ommers, withdrawals?]`) from a
+/// decoded header and a body's raw RLP — the form `chain.importBlock` consumes.
+pub fn assembleBlock(a: std.mem.Allocator, header: block.Header, body_rlp: []const u8) ![]u8 {
+    const hdr = try header.encode(a);
+    defer a.free(hdr);
+    const spans = try rlp.listSpans(a, body_rlp); // [txs, ommers, (withdrawals)]
+    var items: std.ArrayList([]const u8) = .empty;
+    defer items.deinit(a);
+    try items.append(a, hdr);
+    for (spans) |s| try items.append(a, s);
+    return rlp.encodeList(a, items.items);
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 fn encodeU256(a: std.mem.Allocator, v: u256) ![]u8 {
     var buf: [32]u8 = undefined;

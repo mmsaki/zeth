@@ -133,7 +133,24 @@ pub const Peer = struct {
         return .{ .id = split.id, .payload = try gpa.dupe(u8, split.payload) };
     }
 
-    /// Send our p2p Hello (announcing eth/68) as the first frame.
+    /// Read messages until one with id `want` arrives (caller owns its payload),
+    /// auto-replying to ping and skipping unrelated announcements. Errors on a
+    /// Disconnect.
+    pub fn readUntil(self: *Peer, gpa: std.mem.Allocator, want: u64) ![]u8 {
+        while (true) {
+            const msg = try self.readMessage(gpa);
+            if (msg.id == want) return msg.payload;
+            defer gpa.free(msg.payload);
+            if (msg.id == eth_proto.p2p.ping) {
+                try self.writeMessage(eth_proto.p2p.pong, "\xc0"); // rlp([])
+            } else if (msg.id == eth_proto.p2p.disconnect) {
+                return error.Disconnected;
+            }
+            // else: NewBlockHashes / Transactions / etc. — ignore.
+        }
+    }
+
+    /// Send our p2p Hello (announcing eth/69) as the first frame.
     pub fn sendHello(self: *Peer, our_pub: [64]u8) !void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
