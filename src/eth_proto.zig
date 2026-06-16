@@ -107,6 +107,68 @@ pub const Status = struct {
     }
 };
 
+/// eth/69 Status (EIP-7642): drops total-difficulty + best-hash, adds the
+/// available block range. rlp[version, networkId, genesis, [forkHash, forkNext],
+/// earliestBlock, latestBlock, latestBlockHash].
+pub const Status69 = struct {
+    version: u64 = 69,
+    network_id: u64,
+    genesis_hash: [32]u8,
+    fork_hash: [4]u8,
+    fork_next: u64,
+    earliest_block: u64 = 0,
+    latest_block: u64 = 0,
+    latest_block_hash: [32]u8,
+
+    pub fn encode(self: Status69, a: std.mem.Allocator) ![]u8 {
+        const forkid = blk: {
+            const items = [_][]const u8{
+                try rlp.encodeBytes(a, &self.fork_hash),
+                try rlp.encodeUint(a, self.fork_next),
+            };
+            defer for (items) |it| a.free(it);
+            break :blk try rlp.encodeList(a, &items);
+        };
+        defer a.free(forkid);
+        const fields = [_][]const u8{
+            try rlp.encodeUint(a, self.version),
+            try rlp.encodeUint(a, self.network_id),
+            try rlp.encodeBytes(a, &self.genesis_hash),
+            forkid,
+            try rlp.encodeUint(a, self.earliest_block),
+            try rlp.encodeUint(a, self.latest_block),
+            try rlp.encodeBytes(a, &self.latest_block_hash),
+        };
+        defer {
+            a.free(fields[0]);
+            a.free(fields[1]);
+            a.free(fields[2]);
+            a.free(fields[4]);
+            a.free(fields[5]);
+            a.free(fields[6]);
+        }
+        return rlp.encodeList(a, &fields);
+    }
+
+    pub fn decode(a: std.mem.Allocator, payload: []const u8) !Status69 {
+        const item = try rlp.decode(a, payload);
+        const f = try item.items();
+        if (f.len < 7) return error.BadStatus;
+        const fork = try f[3].items();
+        if (fork.len < 2) return error.BadStatus;
+        return .{
+            .version = try f[0].uint(u64),
+            .network_id = try f[1].uint(u64),
+            .genesis_hash = try fixed(32, f[2]),
+            .fork_hash = try fixed(4, fork[0]),
+            .fork_next = try fork[1].uint(u64),
+            .earliest_block = try f[4].uint(u64),
+            .latest_block = try f[5].uint(u64),
+            .latest_block_hash = try fixed(32, f[6]),
+        };
+    }
+};
+
 // ── GetBlockHeaders / BlockHeaders ───────────────────────────────────────────
 /// A header request: by block number or by hash, then amount/skip/reverse.
 pub const GetBlockHeaders = struct {
@@ -181,6 +243,8 @@ pub fn decodeBlockHeaders(a: std.mem.Allocator, payload: []const u8) !struct { r
         const enc = try reencodeItem(a, hi);
         defer a.free(enc);
         out[i] = try block.headerFromRlp(a, enc);
+        // headerFromRlp's extra_data borrows from `enc` (freed below); own it.
+        out[i].extra_data = try a.dupe(u8, out[i].extra_data);
     }
     return .{ .request_id = try f[0].uint(u64), .headers = out };
 }

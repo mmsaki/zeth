@@ -61,17 +61,25 @@ fn dispatch(ctx: *MainCtx) void {
     }
 }
 
-/// `zeth p2p <enode> [network_id]` — dial a peer, run the RLPx handshake,
-/// exchange Hello, and read the peer's Hello + eth Status. A connectivity probe
-/// for validating the devp2p transport against a real client (e.g. a kurtosis
-/// devnet node).
+/// `zeth p2p <enode> [network_id] [genesis_hash]` — dial a peer, run the RLPx
+/// handshake, exchange a real eth/68 Status (genesis hash + EIP-2124 forkid),
+/// then request and print the first few block headers. Validates the full
+/// transport + sync handshake against a real client (e.g. a kurtosis devnet).
 fn p2pConnect(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     if (args.len < 1) {
-        std.debug.print("usage: zeth p2p <enode://...> [network_id]\n", .{});
+        std.debug.print("usage: zeth p2p <enode://...> [network_id] [genesis_hash_hex]\n", .{});
         return error.MissingArgument;
     }
     const enode = try zeth.peer.parseEnode(args[0]);
     const network_id: u64 = if (args.len >= 2) (std.fmt.parseInt(u64, args[1], 10) catch 1) else 1;
+    var genesis_hash = std.mem.zeroes([32]u8);
+    if (args.len >= 3) {
+        const hx = if (std.mem.startsWith(u8, args[2], "0x")) args[2][2..] else args[2];
+        _ = std.fmt.hexToBytes(&genesis_hash, hx) catch {};
+    }
+    // Every fork on the devnet activates at genesis, so the forkid is just
+    // CRC32(genesis) with no upcoming fork.
+    const fid = zeth.forkid.compute(genesis_hash, &.{}, 0);
 
     const priv = zeth.ecies.randomPriv(io);
     const pub_key = try zeth.ecies.pubFromPriv(priv);
@@ -81,11 +89,18 @@ fn p2pConnect(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !voi
     std.debug.print("✓ RLPx handshake complete\n", .{});
 
     try p.sendHello(pub_key);
-    std.debug.print("→ sent Hello (eth/68)\n", .{});
+    std.debug.print("→ sent Hello (eth/69)\n", .{});
+
+    // One scratch arena for all per-message decode/encode, reset each iteration.
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
 
     var sent_status = false;
+    var requested = false;
     var i: usize = 0;
-    while (i < 8) : (i += 1) {
+    while (i < 16) : (i += 1) {
+        _ = scratch.reset(.retain_capacity);
+        const sa = scratch.allocator();
         const msg = p.readMessage(gpa) catch |e| {
             std.debug.print("read ended: {s}\n", .{@errorName(e)});
             break;
@@ -94,37 +109,82 @@ fn p2pConnect(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !voi
         switch (msg.id) {
             zeth.eth_proto.p2p.hello => {
                 std.debug.print("← Hello ({d} bytes) — peer speaks p2p\n", .{msg.payload.len});
-                // Reply with our Status so the peer reveals theirs.
+                // Decode the peer's advertised capabilities.
+                if (zeth.rlp.decode(sa, msg.payload)) |item| {
+                    if (item.items()) |hf| {
+                        if (hf.len >= 3) if (hf[2].items()) |caps| {
+                            for (caps) |c| if (c.items()) |cv| {
+                                if (cv.len >= 2) {
+                                    const name = cv[0].bytes() catch &.{};
+                                    const ver = cv[1].uint(u64) catch 0;
+                                    std.debug.print("    cap: {s}/{d}\n", .{ name, ver });
+                                }
+                            } else |_| {};
+                        } else |_| {};
+                    } else |_| {}
+                } else |_| {}
                 if (!sent_status) {
-                    const st = zeth.eth_proto.Status{
-                        .version = zeth.eth_proto.ETH_VERSION,
+                    const st = zeth.eth_proto.Status69{
+                        .version = 69,
                         .network_id = network_id,
-                        .total_difficulty = 0,
-                        .best_hash = std.mem.zeroes([32]u8),
-                        .genesis_hash = std.mem.zeroes([32]u8),
-                        .fork_hash = std.mem.zeroes([4]u8),
-                        .fork_next = 0,
+                        .genesis_hash = genesis_hash,
+                        .fork_hash = fid.hash,
+                        .fork_next = fid.next,
+                        .earliest_block = 0,
+                        .latest_block = 0,
+                        .latest_block_hash = genesis_hash,
                     };
-                    const payload = try st.encode(gpa);
-                    defer gpa.free(payload);
+                    const payload = try st.encode(sa);
                     try p.writeMessage(zeth.eth_proto.eth.status, payload);
                     sent_status = true;
-                    std.debug.print("→ sent Status (networkId={d})\n", .{network_id});
+                    std.debug.print("→ sent Status (networkId={d} forkid=0x{s})\n", .{ network_id, std.fmt.bytesToHex(&fid.hash, .lower) });
+                    // Request headers immediately (don't wait for the peer's
+                    // Status) — geth may serve the request before dropping a
+                    // genesis-only peer as "useless".
+                    if (!requested) {
+                        const req = zeth.eth_proto.GetBlockHeaders{ .request_id = 1, .origin_number = 0, .amount = 4, .skip = 0, .reverse = false };
+                        const rp = try req.encode(sa);
+                        try p.writeMessage(zeth.eth_proto.eth.get_block_headers, rp);
+                        requested = true;
+                        std.debug.print("→ GetBlockHeaders(from=0, amount=4)\n", .{});
+                    }
                 }
             },
+            zeth.eth_proto.p2p.ping => {
+                try p.writeMessage(zeth.eth_proto.p2p.pong, "\xc0"); // rlp([])
+            },
             zeth.eth_proto.p2p.disconnect => {
-                std.debug.print("← Disconnect (peer closed; expected on chain/forkid mismatch)\n", .{});
+                const reason = if (msg.payload.len > 0) msg.payload[msg.payload.len - 1] else 0xff;
+                std.debug.print("← Disconnect reason=0x{x} (len={d})\n", .{ reason, msg.payload.len });
                 break;
             },
             zeth.eth_proto.eth.status => {
-                const st = zeth.eth_proto.Status.decode(gpa, msg.payload) catch {
+                const st = zeth.eth_proto.Status69.decode(sa, msg.payload) catch {
                     std.debug.print("← Status (undecodable)\n", .{});
                     break;
                 };
-                std.debug.print("← Status: eth/{d} networkId={d} td={d}\n", .{ st.version, st.network_id, st.total_difficulty });
-                std.debug.print("    genesis=0x{s}\n", .{std.fmt.bytesToHex(&st.genesis_hash, .lower)});
-                std.debug.print("    bestHash=0x{s}\n", .{std.fmt.bytesToHex(&st.best_hash, .lower)});
-                std.debug.print("✓ eth/68 Status exchanged — transport works against this peer\n", .{});
+                std.debug.print("← Status: eth/{d} networkId={d} latest=#{d} forkid=0x{s}\n", .{ st.version, st.network_id, st.latest_block, std.fmt.bytesToHex(&st.fork_hash, .lower) });
+                std.debug.print("    genesis=0x{s} latestHash=0x{s}\n", .{ std.fmt.bytesToHex(&st.genesis_hash, .lower), std.fmt.bytesToHex(&st.latest_block_hash, .lower) });
+                std.debug.print("✓ eth/69 Status accepted — requesting headers\n", .{});
+                if (!requested) {
+                    const req = zeth.eth_proto.GetBlockHeaders{ .request_id = 1, .origin_number = 0, .amount = 4, .skip = 0, .reverse = false };
+                    const payload = try req.encode(sa);
+                    try p.writeMessage(zeth.eth_proto.eth.get_block_headers, payload);
+                    requested = true;
+                    std.debug.print("→ GetBlockHeaders(from=0, amount=4)\n", .{});
+                }
+            },
+            zeth.eth_proto.eth.block_headers => {
+                const resp = zeth.eth_proto.decodeBlockHeaders(sa, msg.payload) catch {
+                    std.debug.print("← BlockHeaders (undecodable)\n", .{});
+                    break;
+                };
+                std.debug.print("← BlockHeaders: {d} header(s) (reqId={d})\n", .{ resp.headers.len, resp.request_id });
+                for (resp.headers) |*h| {
+                    const hh = h.hash(sa) catch continue;
+                    std.debug.print("    #{d}  hash=0x{s}  gasLimit={d}\n", .{ h.number, std.fmt.bytesToHex(&hh, .lower), h.gas_limit });
+                }
+                std.debug.print("✓ downloaded headers from a real peer over devp2p\n", .{});
                 break;
             },
             else => std.debug.print("← msg id=0x{x} ({d} bytes)\n", .{ msg.id, msg.payload.len }),
