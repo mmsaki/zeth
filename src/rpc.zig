@@ -7,6 +7,7 @@ const std = @import("std");
 const chain_mod = @import("chain.zig");
 const state_mod = @import("state.zig");
 const block = @import("block.zig");
+const vm = @import("vm.zig");
 const Address = state_mod.Address;
 
 const CLIENT_VERSION = "zeth/0.1.0-dev";
@@ -43,6 +44,69 @@ fn parseAddr(s: []const u8) ?Address {
 fn parseU256(s: []const u8) u256 {
     const b = if (std.mem.startsWith(u8, s, "0x")) s[2..] else s;
     return std.fmt.parseInt(u256, b, 16) catch 0;
+}
+fn parseU64(s: []const u8) u64 {
+    const b = if (std.mem.startsWith(u8, s, "0x")) s[2..] else s;
+    return std.fmt.parseInt(u64, b, 16) catch 0;
+}
+fn jstr(o: std.json.ObjectMap, k: []const u8) ?[]const u8 {
+    const v = o.get(k) orelse return null;
+    return if (v == .string) v.string else null;
+}
+fn hexBytes(a: std.mem.Allocator, s: []const u8) []u8 {
+    const b = if (std.mem.startsWith(u8, s, "0x")) s[2..] else s;
+    const out = a.alloc(u8, b.len / 2) catch @panic("oom");
+    _ = std.fmt.hexToBytes(out, b) catch {};
+    return out;
+}
+
+/// Build an EVM environment from the chain head (for eth_call/estimateGas).
+fn headEnv(c: *const chain_mod.Chain) vm.Environment {
+    const h = c.head;
+    return .{
+        .fork = c.schedule.forkAt(h.timestamp),
+        .chain_id = c.chain_id,
+        .coinbase = h.coinbase,
+        .number = h.number,
+        .time = h.timestamp,
+        .gas_limit = h.gas_limit,
+        .base_fee = h.base_fee_per_gas orelse 0,
+        .prev_randao = std.mem.readInt(u256, &h.prev_randao, .big),
+        .block_hashes = c.hashes.items,
+    };
+}
+
+/// Execute a call object against a throwaway clone of the current state.
+/// Returns the EVM frame (caller owns it / must deinit) and the clone (deinit
+/// after reading). Used by eth_call + eth_estimateGas.
+const CallResult = struct { output: []const u8, success: bool, gas_used: u64 };
+fn execCall(a: std.mem.Allocator, c: *chain_mod.Chain, call: std.json.ObjectMap, gas: u64) CallResult {
+    const from = if (jstr(call, "from")) |f| (parseAddr(f) orelse state_mod.zero_address) else state_mod.zero_address;
+    const to = if (jstr(call, "to")) |t| (parseAddr(t) orelse state_mod.zero_address) else state_mod.zero_address;
+    const data = if (jstr(call, "data") orelse jstr(call, "input")) |d| hexBytes(a, d) else &.{};
+    const value = if (jstr(call, "value")) |v| parseU256(v) else 0;
+
+    var st = c.state.clone() catch return .{ .output = "", .success = false, .gas_used = 0 };
+    defer st.deinit();
+    st.beginTx();
+    var env = headEnv(c);
+    env.origin = from;
+    env.gas_price = if (jstr(call, "gasPrice")) |gp| parseU256(gp) else 0;
+
+    var evm = vm.processMessage(a, &st, &env, .{
+        .caller = from,
+        .current_target = to,
+        .code_address = to,
+        .code = st.codeOf(to),
+        .data = data,
+        .gas = gas,
+        .value = value,
+    }, null);
+    defer evm.deinit();
+    const success = evm.halt_error == null and !evm.reverted;
+    // Copy output out of the frame before it's freed.
+    const out = a.dupe(u8, evm.output) catch "";
+    return .{ .output = out, .success = success, .gas_used = gas - evm.gas_left };
 }
 
 /// Resolve a block tag/number param to a concrete number against the head.
@@ -151,6 +215,39 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
         var word: [32]u8 = undefined;
         std.mem.writeInt(u256, &word, c.state.getStorage(addr, key), .big);
         return okStr(a, id, hash32Hex(a, word));
+    }
+
+    if (std.mem.eql(u8, method, "eth_call")) {
+        if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
+        const r = execCall(a, c, params[0].object, 30_000_000);
+        return okStr(a, id, dataHex(a, r.output));
+    }
+    if (std.mem.eql(u8, method, "eth_estimateGas")) {
+        if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
+        const call = params[0].object;
+        // Intrinsic cost (tx base + calldata + create), then binary-search the
+        // least *message* gas for which execution succeeds; sum the two.
+        const data = if (jstr(call, "data") orelse jstr(call, "input")) |d| hexBytes(a, d) else &.{};
+        var zero: u64 = 0;
+        var nz: u64 = 0;
+        for (data) |b| if (b == 0) {
+            zero += 1;
+        } else {
+            nz += 1;
+        };
+        const is_create = jstr(call, "to") == null;
+        const intrinsic: u64 = 21000 + zero * 4 + nz * 16 + (if (is_create) @as(u64, 32000) else 0);
+        if (c.head.gas_limit <= intrinsic) return err(a, id, -32000, "gas limit too low");
+        // A call needing no execution gas (e.g. to an EOA) costs just intrinsic.
+        if (execCall(a, c, call, 0).success) return okStr(a, id, qHex(a, intrinsic));
+        var lo: u64 = 0;
+        var hi: u64 = c.head.gas_limit - intrinsic;
+        if (!execCall(a, c, call, hi).success) return err(a, id, -32000, "execution reverted");
+        while (lo + 1 < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (execCall(a, c, call, mid).success) hi = mid else lo = mid;
+        }
+        return okStr(a, id, qHex(a, intrinsic + hi));
     }
 
     return err(a, id, -32601, "method not found");
