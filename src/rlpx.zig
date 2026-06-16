@@ -124,31 +124,49 @@ pub const Conn = struct {
         try out.appendSlice(allocator, &fmac);
     }
 
-    /// Read one frame from `in`, returning the decrypted capability message
-    /// (caller owns it) and the number of input bytes consumed.
-    pub fn readFrame(self: *Conn, allocator: std.mem.Allocator, in: []const u8) !struct { msg: []u8, consumed: usize } {
-        if (in.len < 32) return error.ShortFrame;
-        var header: [16]u8 = undefined;
-        @memcpy(&header, in[0..16]);
-        const want_hmac = updateMac(&self.ingress_mac, self.mac_secret, header);
-        if (!std.crypto.timing_safe.eql([16]u8, want_hmac, in[16..32].*)) return error.BadHeaderMac;
-        self.dec.xor(&header, &header);
-        const size = std.mem.readInt(u24, header[0..3], .big);
+    /// Verify + decrypt a 32-byte frame header (header-ct(16) ‖ header-mac(16)),
+    /// returning the frame body size in bytes. Advances the ingress MAC + CTR.
+    pub fn readHeader(self: *Conn, header: [32]u8) !usize {
+        const want_hmac = updateMac(&self.ingress_mac, self.mac_secret, header[0..16].*);
+        if (!std.crypto.timing_safe.eql([16]u8, want_hmac, header[16..32].*)) return error.BadHeaderMac;
+        var h: [16]u8 = undefined;
+        @memcpy(&h, header[0..16]);
+        self.dec.xor(&h, &h);
+        return std.mem.readInt(u24, h[0..3], .big);
+    }
 
-        const padded = (@as(usize, size) + 15) / 16 * 16;
-        if (in.len < 32 + padded + 16) return error.ShortFrame;
-        const ct = in[32 .. 32 + padded];
+    /// The on-wire body length following a header of frame size `size`:
+    /// the zero-padded ciphertext plus the 16-byte frame MAC.
+    pub fn bodyLen(size: usize) usize {
+        return (size + 15) / 16 * 16 + 16;
+    }
+
+    /// Verify + decrypt a frame body (ciphertext(padded) ‖ frame-mac(16)) of the
+    /// `size` reported by `readHeader`, returning the message (caller owns it).
+    pub fn readBody(self: *Conn, allocator: std.mem.Allocator, size: usize, body: []const u8) ![]u8 {
+        const padded = (size + 15) / 16 * 16;
+        if (body.len < padded + 16) return error.ShortFrame;
+        const ct = body[0..padded];
         self.ingress_mac.update(ct);
         var seed: [32]u8 = undefined;
         peek(self.ingress_mac, &seed);
         const want_fmac = updateMac(&self.ingress_mac, self.mac_secret, seed[0..16].*);
-        if (!std.crypto.timing_safe.eql([16]u8, want_fmac, in[32 + padded ..][0..16].*)) return error.BadFrameMac;
+        if (!std.crypto.timing_safe.eql([16]u8, want_fmac, body[padded..][0..16].*)) return error.BadFrameMac;
 
         const buf = try allocator.alloc(u8, padded);
         errdefer allocator.free(buf);
         self.dec.xor(buf, ct);
-        const msg = try allocator.realloc(buf, size);
-        return .{ .msg = msg, .consumed = 32 + padded + 16 };
+        return allocator.realloc(buf, size);
+    }
+
+    /// Read one whole frame from an in-memory buffer (convenience for tests).
+    pub fn readFrame(self: *Conn, allocator: std.mem.Allocator, in: []const u8) !struct { msg: []u8, consumed: usize } {
+        if (in.len < 32) return error.ShortFrame;
+        const size = try self.readHeader(in[0..32].*);
+        const blen = bodyLen(size);
+        if (in.len < 32 + blen) return error.ShortFrame;
+        const msg = try self.readBody(allocator, size, in[32 .. 32 + blen]);
+        return .{ .msg = msg, .consumed = 32 + blen };
     }
 };
 
