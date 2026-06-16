@@ -192,6 +192,7 @@ fn processImpl(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
             .code = tx.data,
             .gas = exec_gas,
             .value = tx.value,
+            .trace_type = "CREATE",
         }, null);
     }
     defer evm.deinit();

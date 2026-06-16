@@ -120,7 +120,7 @@ pub const Chain = struct {
 
     /// Replay the chain on a fresh genesis-state clone up to `hash`, capturing
     /// the target transaction's opcode trace into `sink` (debug_traceTransaction).
-    pub fn traceTransaction(self: *Chain, a: std.mem.Allocator, hash: [32]u8, sink: *std.ArrayList(vm.StructLog)) ?TraceResult {
+    pub fn traceTransaction(self: *Chain, a: std.mem.Allocator, hash: [32]u8, sink: ?*std.ArrayList(vm.StructLog), call_tr: ?*vm.CallTracer) ?TraceResult {
         const loc = self.tx_index.get(hash) orelse return null;
         var st = (self.genesis_state orelse return null).clone() catch return null;
         defer st.deinit();
@@ -151,7 +151,10 @@ pub const Chain = struct {
                 env.blob_versioned_hashes = dt.blob_versioned_hashes;
                 const blob_fee: u256 = @as(u256, txmod.GAS_PER_BLOB) * dt.blob_versioned_hashes.len * env.blob_base_fee;
                 const target = bn == loc.block_number and i == loc.index;
-                if (target) vm.trace_sink = sink;
+                if (target) {
+                    vm.trace_sink = sink;
+                    vm.call_tracer = call_tr;
+                }
                 const res = txmod.process(a, &st, &env, .{
                     .sender = dt.sender,
                     .to = dt.to,
@@ -165,6 +168,7 @@ pub const Chain = struct {
                 });
                 if (target) {
                     vm.trace_sink = null;
+                    vm.call_tracer = null;
                     return .{ .gas_used = res.gas_used, .success = res.success, .output = "" };
                 }
             }

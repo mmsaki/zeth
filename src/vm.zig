@@ -86,6 +86,54 @@ pub const StructLog = struct {
 /// frames). Used by debug_traceTransaction/traceCall. Single-threaded.
 pub var trace_sink: ?*std.ArrayList(StructLog) = null;
 
+/// A call-frame in the geth `callTracer` tree (also the data Foundry renders).
+pub const CallFrame = struct {
+    typ: []const u8, // CALL / STATICCALL / DELEGATECALL / CALLCODE / CREATE / CREATE2
+    from: Address,
+    to: Address,
+    value: u256,
+    gas: u64,
+    gas_used: u64 = 0,
+    input: []const u8 = &.{},
+    output: []const u8 = &.{},
+    err: ?[]const u8 = null,
+    calls: std.ArrayList(*CallFrame) = .empty,
+};
+
+/// Builds the call-frame tree as the EVM enters/exits messages.
+pub const CallTracer = struct {
+    alloc: std.mem.Allocator,
+    root: ?*CallFrame = null,
+    stack: std.ArrayList(*CallFrame) = .empty,
+
+    pub fn enter(self: *CallTracer, typ: []const u8, from: Address, to: Address, value: u256, gas: u64, input: []const u8) void {
+        const f = self.alloc.create(CallFrame) catch return;
+        f.* = .{ .typ = typ, .from = from, .to = to, .value = value, .gas = gas, .input = self.alloc.dupe(u8, input) catch &.{} };
+        if (self.stack.items.len > 0)
+            self.stack.items[self.stack.items.len - 1].calls.append(self.alloc, f) catch {}
+        else
+            self.root = f;
+        self.stack.append(self.alloc, f) catch {};
+    }
+    pub fn exit(self: *CallTracer, gas_used: u64, output: []const u8, err: ?[]const u8) void {
+        if (self.stack.items.len == 0) return;
+        const f = self.stack.items[self.stack.items.len - 1];
+        self.stack.items.len -= 1;
+        f.gas_used = gas_used;
+        f.output = self.alloc.dupe(u8, output) catch &.{};
+        f.err = err;
+    }
+};
+
+/// When set, the EVM records the call-frame tree here (debug callTracer).
+pub var call_tracer: ?*CallTracer = null;
+
+fn frameError(frame: *const Evm) ?[]const u8 {
+    if (frame.halt_error) |e| return @errorName(e);
+    if (frame.reverted) return "execution reverted";
+    return null;
+}
+
 const Address = state_mod.Address;
 const State = state_mod.State;
 
@@ -294,6 +342,8 @@ pub const Message = struct {
     depth: u32 = 0,
     is_static: bool = false,
     should_transfer_value: bool = true,
+    /// Call-frame type for the callTracer (CALL by default; set by CALL/CREATE sites).
+    trace_type: []const u8 = "CALL",
 };
 
 /// An emitted log entry. `topics` and `data` are heap-owned by the frame that
@@ -1059,7 +1109,7 @@ pub const Evm = struct {
         const init_code = self.memRead(mem_start, mem_size);
         const contract = state_mod.computeContractAddress(self.allocator, sender, self.state.nonceOf(sender)) catch @panic("out of memory");
 
-        try self.runCreate(sender, contract, endowment, create_gas, init_code);
+        try self.runCreate(sender, contract, endowment, create_gas, init_code, "CREATE");
         self.pc += 1;
     }
 
@@ -1084,12 +1134,12 @@ pub const Evm = struct {
         const init_code = self.memRead(mem_start, mem_size);
         const contract = computeCreate2Address(sender, &salt, init_code);
 
-        try self.runCreate(sender, contract, endowment, create_gas, init_code);
+        try self.runCreate(sender, contract, endowment, create_gas, init_code, "CREATE2");
         self.pc += 1;
     }
 
     /// Shared CREATE/CREATE2 body: collision checks, child execution, result.
-    fn runCreate(self: *Evm, sender: Address, contract: Address, endowment: u256, create_gas: u64, init_code: []const u8) VmError!void {
+    fn runCreate(self: *Evm, sender: Address, contract: Address, endowment: u256, create_gas: u64, init_code: []const u8, trace_type: []const u8) VmError!void {
         const sender_balance = self.state.balanceOf(sender);
         const sender_nonce = self.state.nonceOf(sender);
         _ = self.state.accessAddress(contract); // warm the new address (EIP-2929)
@@ -1117,6 +1167,7 @@ pub const Evm = struct {
             .data = &.{},
             .code = init_code,
             .depth = self.message.depth + 1,
+            .trace_type = trace_type,
         }, self);
         defer child.deinit();
 
@@ -1195,6 +1246,12 @@ pub const Evm = struct {
                 .in_size = in_size,
                 .out_start = out_start,
                 .out_size = @intCast(out_size),
+                .trace_type = switch (kind) {
+                    .call => "CALL",
+                    .callcode => "CALLCODE",
+                    .delegatecall => "DELEGATECALL",
+                    .staticcall => "STATICCALL",
+                },
             });
         }
         self.pc += 1;
@@ -1212,6 +1269,7 @@ pub const Evm = struct {
         in_size: u256,
         out_start: u256,
         out_size: usize,
+        trace_type: []const u8 = "CALL",
     };
 
     /// Replace `return_data` with an owned copy of `bytes`.
@@ -1241,6 +1299,7 @@ pub const Evm = struct {
             .depth = self.message.depth + 1,
             .is_static = p.is_static,
             .should_transfer_value = p.should_transfer_value,
+            .trace_type = p.trace_type,
         }, self);
         defer child.deinit();
 
@@ -1369,6 +1428,8 @@ pub fn processMessage(
         frame.gas_left = 0;
         return frame;
     }
+    if (call_tracer) |t| t.enter(message.trace_type, message.caller, message.current_target, message.value, message.gas, message.data);
+    defer if (call_tracer) |t| t.exit(message.gas - frame.gas_left, frame.output, frameError(&frame));
 
     var snapshot = state.clone() catch @panic("out of memory");
     state.touch(message.current_target) catch @panic("out of memory");
