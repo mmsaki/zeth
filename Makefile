@@ -47,11 +47,11 @@ conformance:
 ## Cross-compile a static-Linux zeth and stage the hive client adapter into
 ## hive/clients/zeth (run `./hive --client zeth --sim ethereum/eels/consume-rlp`).
 hive-stage:
-	$(ZIG) build -Dtarget=$(HIVE_TARGET) -Doptimize=ReleaseFast
+	$(ZIG) build -Dtarget=$(HIVE_TARGET) -Doptimize=ReleaseFast --prefix zig-out-linux
 	mkdir -p hive/clients/zeth
 	cp hive-client/Dockerfile hive-client/zeth.sh hive-client/mapper.jq hive-client/enode.sh hive/clients/zeth/
-	cp zig-out/bin/zeth hive/clients/zeth/zeth
-	@echo "staged hive/clients/zeth/ ($(HIVE_TARGET) binary + adapter)"
+	cp zig-out-linux/bin/zeth hive/clients/zeth/zeth
+	@echo "staged hive/clients/zeth/ ($(HIVE_TARGET) binary + adapter; native zig-out preserved)"
 
 ## Execute hex bytecode: `make run ARGS="0x6006600701"`.
 run:
