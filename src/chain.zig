@@ -226,8 +226,14 @@ pub const Chain = struct {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-
         const blk = block.decodeBlock(a, raw) catch return error.DecodeError;
+        return self.importDecoded(a, blk);
+    }
+
+    /// Execute + validate a decoded block (header + EIP-2718 tx encodings +
+    /// withdrawal encodings) and append it. Shared by RLP import and the Engine
+    /// API (engine_newPayload builds the parts from an ExecutionPayload).
+    pub fn importDecoded(self: *Chain, a: std.mem.Allocator, blk: block.Block) ImportError!Header {
         const h = blk.header;
         const parent_hash = self.head.hash(self.gpa) catch return error.OutOfMemory;
         if (!std.mem.eql(u8, &h.parent_hash, &parent_hash)) return error.BadParent;
@@ -333,7 +339,10 @@ pub const Chain = struct {
         self.pushBlock(h, bh) catch return error.OutOfMemory;
         const owned = self.gpa.dupe(TxRecord, records.items) catch return error.OutOfMemory;
         self.block_txs.append(self.gpa, owned) catch return error.OutOfMemory;
-        self.sizes.append(self.gpa, raw.len) catch return error.OutOfMemory;
+        var size: u64 = @intCast((h.encode(a) catch return error.OutOfMemory).len);
+        for (blk.transactions) |t| size += t.len;
+        for (blk.withdrawals) |w| size += w.len;
+        self.sizes.append(self.gpa, size + 16) catch return error.OutOfMemory; // ~RLP list overhead
         for (owned, 0..) |r, i|
             self.tx_index.put(self.gpa, r.hash, .{ .block_number = h.number, .index = @intCast(i) }) catch return error.OutOfMemory;
         return self.head;

@@ -10,6 +10,7 @@ const block = @import("block.zig");
 const vm = @import("vm.zig");
 const transaction = @import("transaction.zig");
 const crypto = @import("crypto.zig");
+const rlp = @import("rlp.zig");
 const Address = state_mod.Address;
 
 const CLIENT_VERSION = "zeth/0.1.0-dev";
@@ -569,6 +570,31 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
         return ok(a, id, feeHistory(a, c, params));
     }
 
+    // ── Engine API ──
+    if (std.mem.startsWith(u8, method, "engine_newPayloadV")) {
+        const ver: u8 = std.fmt.parseInt(u8, method["engine_newPayloadV".len..], 10) catch 1;
+        return newPayload(a, c, id, params, ver);
+    }
+    if (std.mem.startsWith(u8, method, "engine_forkchoiceUpdatedV")) {
+        // headBlockHash must be a block we know → VALID; else SYNCING.
+        const fcs = if (params.len > 0 and params[0] == .object) params[0].object else return err(a, id, -32602, "invalid params");
+        const head = fixed(32, jstr(fcs, "headBlockHash"));
+        var known = false;
+        for (c.hashes.items) |h| if (std.mem.eql(u8, &h, &head)) {
+            known = true;
+        };
+        const body = if (known)
+            std.fmt.allocPrint(a, "{{\"payloadStatus\":{{\"status\":\"VALID\",\"latestValidHash\":\"{s}\",\"validationError\":null}},\"payloadId\":null}}", .{hash32Hex(a, head)}) catch @panic("oom")
+        else
+            "{\"payloadStatus\":{\"status\":\"SYNCING\",\"latestValidHash\":null,\"validationError\":null},\"payloadId\":null}";
+        return ok(a, id, body);
+    }
+    if (std.mem.eql(u8, method, "engine_exchangeCapabilities")) {
+        return ok(a, id,
+            \\["engine_newPayloadV1","engine_newPayloadV2","engine_newPayloadV3","engine_newPayloadV4","engine_forkchoiceUpdatedV1","engine_forkchoiceUpdatedV2","engine_forkchoiceUpdatedV3","engine_getPayloadV1","engine_getPayloadV2","engine_getPayloadV3","engine_getPayloadV4"]
+        );
+    }
+
     return err(a, id, -32601, "method not found");
 }
 
@@ -645,6 +671,111 @@ fn traceResultJson(a: std.mem.Allocator, logs: []const vm.StructLog, gas_used: u
     }
     buf.appendSlice(a, "]}") catch @panic("oom");
     return buf.items;
+}
+
+// ── Engine API ──────────────────────────────────────────────────────────────
+
+fn fixed(comptime N: usize, s: ?[]const u8) [N]u8 {
+    var out: [N]u8 = std.mem.zeroes([N]u8);
+    if (s) |v| {
+        const b = if (std.mem.startsWith(u8, v, "0x")) v[2..] else v;
+        _ = std.fmt.hexToBytes(&out, b) catch {};
+    }
+    return out;
+}
+
+/// Build a block from an Engine API ExecutionPayload, computing the tx/
+/// withdrawals/requests roots so the assembled header hashes to `blockHash`.
+fn buildPayloadBlock(a: std.mem.Allocator, payload: std.json.ObjectMap, pbbr: ?[32]u8, requests: ?[]std.json.Value) struct { blk: block.Block, hash: [32]u8 } {
+    var h = block.Header{};
+    h.parent_hash = fixed(32, jstr(payload, "parentHash"));
+    h.coinbase = fixed(20, jstr(payload, "feeRecipient"));
+    h.state_root = fixed(32, jstr(payload, "stateRoot"));
+    h.receipts_root = fixed(32, jstr(payload, "receiptsRoot"));
+    h.logs_bloom = fixed(256, jstr(payload, "logsBloom"));
+    h.number = parseU64(jstr(payload, "blockNumber") orelse "0x0");
+    h.gas_limit = parseU64(jstr(payload, "gasLimit") orelse "0x0");
+    h.gas_used = parseU64(jstr(payload, "gasUsed") orelse "0x0");
+    h.timestamp = parseU64(jstr(payload, "timestamp") orelse "0x0");
+    h.extra_data = hexBytes(a, jstr(payload, "extraData") orelse "0x");
+    h.prev_randao = fixed(32, jstr(payload, "prevRandao"));
+    h.base_fee_per_gas = parseU256(jstr(payload, "baseFeePerGas") orelse "0x0");
+
+    // Transactions (hex EIP-2718 encodings) → transactions root.
+    var txs: std.ArrayList([]const u8) = .empty;
+    if (payload.get("transactions")) |tv| if (tv == .array)
+        for (tv.array.items) |t| if (t == .string) txs.append(a, hexBytes(a, t.string)) catch @panic("oom");
+    h.transactions_root = block.orderedTrieRoot(a, txs.items);
+
+    // Withdrawals (V2+): RLP-encode each → withdrawals root.
+    var wds: std.ArrayList([]const u8) = .empty;
+    var has_w = false;
+    if (payload.get("withdrawals")) |wv| if (wv == .array) {
+        has_w = true;
+        for (wv.array.items) |w| if (w == .object) {
+            const o = w.object;
+            const items = [_][]const u8{
+                rlp.encodeUint(a, parseU64(jstr(o, "index") orelse "0x0")) catch @panic("oom"),
+                rlp.encodeUint(a, parseU64(jstr(o, "validatorIndex") orelse "0x0")) catch @panic("oom"),
+                rlp.encodeBytes(a, &fixed(20, jstr(o, "address"))) catch @panic("oom"),
+                rlp.encodeUint(a, parseU64(jstr(o, "amount") orelse "0x0")) catch @panic("oom"),
+            };
+            wds.append(a, rlp.encodeList(a, &items) catch @panic("oom")) catch @panic("oom");
+        };
+        h.withdrawals_root = block.orderedTrieRoot(a, wds.items);
+    };
+
+    // Cancun blob gas (V3+) + parent beacon root.
+    if (jstr(payload, "blobGasUsed")) |g| h.blob_gas_used = parseU64(g);
+    if (jstr(payload, "excessBlobGas")) |g| h.excess_blob_gas = parseU64(g);
+    if (pbbr) |r| h.parent_beacon_block_root = r;
+    // Prague execution requests (V4) → requests hash (EIP-7685, sha256 commitment).
+    if (requests) |reqs| h.requests_hash = computeRequestsHash(a, reqs);
+
+    const hash = h.hash(a) catch std.mem.zeroes([32]u8);
+    return .{ .blk = .{ .header = h, .transactions = txs.items, .withdrawals = wds.items, .has_withdrawals = has_w }, .hash = hash };
+}
+
+/// EIP-7685 requests hash: sha256(sha256(req_0) ‖ sha256(req_1) ‖ …).
+fn computeRequestsHash(a: std.mem.Allocator, reqs: []std.json.Value) [32]u8 {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var outer = Sha256.init(.{});
+    for (reqs) |r| if (r == .string) {
+        const bytes = hexBytes(a, r.string);
+        if (bytes.len == 0) continue;
+        var inner: [32]u8 = undefined;
+        Sha256.hash(bytes, &inner, .{});
+        outer.update(&inner);
+    };
+    var out: [32]u8 = undefined;
+    outer.final(&out);
+    return out;
+}
+
+/// engine_newPayloadV* → import the payload, return the payload status.
+fn newPayload(a: std.mem.Allocator, c: *chain_mod.Chain, id: ?std.json.Value, params: []const std.json.Value, version: u8) []const u8 {
+    if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
+    // V3+ carry parentBeaconBlockRoot at params[2]; V4 executionRequests at params[3].
+    const pbbr: ?[32]u8 = if (version >= 3 and params.len >= 3 and params[2] == .string) fixed(32, params[2].string) else null;
+    const reqs: ?[]std.json.Value = if (version >= 4 and params.len >= 4 and params[3] == .array) params[3].array.items else null;
+    const built = buildPayloadBlock(a, params[0].object, pbbr, reqs);
+
+    const want_hash = fixed(32, jstr(params[0].object, "blockHash"));
+    if (!std.mem.eql(u8, &built.hash, &want_hash))
+        return payloadStatus(a, id, "INVALID", null, "block hash mismatch");
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    _ = c.importDecoded(arena.allocator(), built.blk) catch |e|
+        return payloadStatus(a, id, "INVALID", null, @errorName(e));
+    return payloadStatus(a, id, "VALID", &built.hash, null);
+}
+
+fn payloadStatus(a: std.mem.Allocator, id: ?std.json.Value, status: []const u8, latest_valid: ?*const [32]u8, validation_err: ?[]const u8) []const u8 {
+    var inner: std.ArrayList(u8) = .empty;
+    p(a, &inner, "{{\"status\":\"{s}\",\"latestValidHash\":{s}", .{ status, if (latest_valid) |lv| std.fmt.allocPrint(a, "\"{s}\"", .{hash32Hex(a, lv.*)}) catch "null" else "null" });
+    if (validation_err) |ve| p(a, &inner, ",\"validationError\":\"{s}\"", .{ve}) else inner.appendSlice(a, ",\"validationError\":null") catch @panic("oom");
+    inner.append(a, '}') catch @panic("oom");
+    return ok(a, id, inner.items);
 }
 
 /// Handle a raw request body (single object or batch array) → response JSON.
