@@ -13,6 +13,7 @@ const trie = @import("trie.zig");
 const vm = @import("vm.zig");
 const crypto = @import("crypto.zig");
 const genesis_mod = @import("genesis.zig");
+const store_mod = @import("store.zig");
 const Header = block.Header;
 const State = state_mod.State;
 const Address = state_mod.Address;
@@ -245,6 +246,30 @@ pub const Chain = struct {
         try self.headers.append(self.gpa, owned);
         try self.hashes.append(self.gpa, hash);
         self.head = owned;
+    }
+
+    /// Persist the whole canonical chain + world state to `st` (a snapshot, for
+    /// `--datadir`). Headers/canonical indices, the head pointer, and a flat
+    /// account snapshot are written, then the log is flushed.
+    pub fn persistTo(self: *Chain, a: std.mem.Allocator, st: *store_mod.Store) !void {
+        for (self.headers.items, 0..) |*h, n| {
+            const enc = try h.encode(self.gpa);
+            defer self.gpa.free(enc);
+            try st.putHeader(self.hashes.items[n], enc);
+            try st.setCanonical(n, self.hashes.items[n]);
+        }
+        try st.setHead(self.hashes.items[self.head.number], self.head.number);
+        try st.snapshotState(a, self.state);
+        try st.db.flush();
+    }
+
+    /// Append a canonical header read back from disk during resume (no
+    /// execution; the world state is loaded separately via `store.loadState`).
+    /// Per-block transaction history is not reconstructed — a follow-up.
+    pub fn appendResumed(self: *Chain, h: Header, hash: [32]u8, size: u64) !void {
+        try self.pushBlock(h, hash);
+        try self.block_txs.append(self.gpa, &.{});
+        try self.sizes.append(self.gpa, size);
     }
 
     /// The canonical header at a block number, or null if beyond the head.
