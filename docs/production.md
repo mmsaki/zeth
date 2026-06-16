@@ -19,15 +19,19 @@
 | **Persistence** (`--datadir`: snapshot + resume) | ✅ | round-trips genesis state across restart |
 | **devp2p transport** (ECIES, RLPx, eth/69 handshake) | ✅ validated vs geth | see [kurtosis.md](./kurtosis.md) |
 | **P2P full sync** (headers→bodies→execute→validate) | ✅ basic | `zeth sync` synced 233 blocks from geth; head hash matched exactly |
+| **Continuous live-head follow** (`zeth sync --follow`) | ✅ basic | tracked geth's live head #336→#337→#338 |
 
 ## What is NOT ready (required before mainnet)
 
-- **Continuous / live sync.** One-shot batch sync to a fixed head works
-  (`zeth sync`); staying at the head (following new blocks), persisting the
-  synced chain to `--datadir`, and recovering from a peer that drops mid-sync
-  are not done yet.
-- **Peer discovery (discovery v4/v5).** zeth can't *find* peers — you must hand
-  it an enode. No DHT, no bootnodes.
+- **Robust multi-peer sync.** Batch sync, persisting to `--datadir`, and
+  following the live head (`zeth sync --follow`) all work against a single peer.
+  Still missing: recovering from a peer that drops mid-sync, and pulling from a
+  *set* of peers rather than one.
+- **Peer discovery (discovery v4/v5).** The discovery v4 wire codec (signed
+  ping/pong/findnode/neighbors + a bonding/`FindNode` flow) is implemented and
+  unit-tested (`src/discv4.zig`), but not yet wired into a live routing table /
+  bootstrap loop — so in practice you still hand zeth an enode. Discovery v5
+  (the encrypted, ENR/topic protocol) is not started.
 - **Transaction pool / gossip.** No mempool, no tx propagation.
 - **Multi-peer management & reorgs.** Single-peer probe today; no peer set,
   scoring, or deep fork-choice/reorg handling.
@@ -91,9 +95,11 @@ adapter into `hive/clients/zeth/`. Then, from the hive checkout:
 In rough dependency order:
 
 1. **P2P full sync** — ✅ done (`zeth sync`): header→body→execute→validate from a
-   peer. *Remaining:* persist to `--datadir` during sync, follow the live head,
-   and handle mid-sync peer drops.
-2. **Discovery v4/v5** — find peers without a hardcoded enode.
+   peer, persist to `--datadir` during sync, and follow the live head
+   (`--follow`). *Remaining:* handle mid-sync peer drops and pull from a peer set.
+2. **Discovery v4/v5** — wire codec done (`src/discv4.zig`, unit-tested);
+   *remaining:* a live routing table + bootstrap loop so zeth can find peers
+   without a hardcoded enode. Discovery v5 (encrypted/ENR) not started.
 3. **Transaction pool + gossip** — accept, validate, propagate, and include txs.
 4. **Multi-peer + reorgs** — peer set, scoring, and robust fork choice.
 5. **snap sync** — state-range download for fast initial sync.
