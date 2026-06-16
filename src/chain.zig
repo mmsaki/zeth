@@ -20,11 +20,42 @@ const Address = state_mod.Address;
 const SYSTEM_ADDRESS: Address = .{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe };
 const BEACON_ROOTS = addr("000F3df6D732807Ef1319fB7B8bB8522d0Beac02"); // EIP-4788
 const HISTORY_STORAGE = addr("0000F90827F1C53a10cb7A02335B175320002935"); // EIP-2935
+// EIP-7685 general-purpose requests (Prague).
+const WITHDRAWAL_REQUEST_PREDEPLOY = addr("00000961Ef480Eb55e80D19ad83579A64c007002"); // EIP-7002
+const CONSOLIDATION_REQUEST_PREDEPLOY = addr("0000BBdDc7CE488642fb579F8B00f3a590007251"); // EIP-7251
+const DEPOSIT_CONTRACT = addr("00000000219ab540356cBB839Cbe05303d7705Fa"); // EIP-6110
+const DEPOSIT_EVENT_SIG = [32]u8{ 0x64, 0x9b, 0xbc, 0x62, 0xd0, 0xe3, 0x13, 0x42, 0xaf, 0xea, 0x4e, 0x5c, 0xd8, 0x2d, 0x40, 0x49, 0xe7, 0xe1, 0xee, 0x91, 0x2f, 0xc0, 0x88, 0x9a, 0xa7, 0x90, 0x80, 0x3b, 0xe3, 0x90, 0x38, 0xc5 };
 
 fn addr(comptime hex: []const u8) Address {
     var a: Address = undefined;
     _ = std.fmt.hexToBytes(&a, hex) catch unreachable;
     return a;
+}
+
+/// EIP-7685: fold one type-prefixed request into the requests-hash accumulator —
+/// `outer` collects sha256(type ‖ data) digests, and its final digest is the
+/// header's requests_hash.
+fn hashRequest(outer: *std.crypto.hash.sha2.Sha256, type_byte: u8, data: []const u8) void {
+    var inner = std.crypto.hash.sha2.Sha256.init(.{});
+    inner.update(&[_]u8{type_byte});
+    inner.update(data);
+    var d: [32]u8 = undefined;
+    inner.final(&d);
+    outer.update(&d);
+}
+
+/// EIP-6110: strip the Solidity ABI framing from a 576-byte DepositEvent payload,
+/// returning the 192-byte pubkey‖credentials‖amount‖signature‖index. Offsets and
+/// sizes are fixed by the spec, so a wrong length yields null (log ignored).
+fn extractDepositData(data: []const u8) ?[192]u8 {
+    if (data.len != 576) return null;
+    var out: [192]u8 = undefined;
+    @memcpy(out[0..48], data[192..240]); // pubkey (48)
+    @memcpy(out[48..80], data[288..320]); // withdrawal credentials (32)
+    @memcpy(out[80..88], data[352..360]); // amount (8)
+    @memcpy(out[88..184], data[416..512]); // signature (96)
+    @memcpy(out[184..192], data[544..552]); // index (8)
+    return out;
 }
 
 pub const ImportError = error{
@@ -37,6 +68,7 @@ pub const ImportError = error{
     WithdrawalsRootMismatch,
     GasUsedMismatch,
     BloomMismatch,
+    RequestsHashMismatch,
     DecodeError,
     OutOfMemory,
 };
@@ -146,8 +178,10 @@ pub const Chain = struct {
                 .block_hashes = self.hashes.items[0..bn],
                 .blob_base_fee = txmod.blobGasPrice(h.excess_blob_gas orelse 0, fork),
             };
-            if (fork.atLeast(.cancun)) if (h.parent_beacon_block_root) |r| self.systemCall(a, &env, BEACON_ROOTS, &r);
-            if (fork.atLeast(.prague)) self.systemCall(a, &env, HISTORY_STORAGE, &h.parent_hash);
+            if (fork.atLeast(.cancun)) if (h.parent_beacon_block_root) |r| {
+                _ = self.systemCall(a, &env, BEACON_ROOTS, &r);
+            };
+            if (fork.atLeast(.prague)) _ = self.systemCall(a, &env, HISTORY_STORAGE, &h.parent_hash);
 
             for (self.block_txs.items[bn], 0..) |rec, i| {
                 const dt = transaction.decode(a, rec.raw) catch return null;
@@ -274,10 +308,11 @@ pub const Chain = struct {
         };
 
         // Block-start system calls (state writes before transactions).
-        if (fork.atLeast(.cancun)) if (h.parent_beacon_block_root) |r|
-            self.systemCall(a, &env, BEACON_ROOTS, &r);
+        if (fork.atLeast(.cancun)) if (h.parent_beacon_block_root) |r| {
+            _ = self.systemCall(a, &env, BEACON_ROOTS, &r);
+        };
         if (fork.atLeast(.prague))
-            self.systemCall(a, &env, HISTORY_STORAGE, &h.parent_hash);
+            _ = self.systemCall(a, &env, HISTORY_STORAGE, &h.parent_hash);
 
         // Execute the transactions, accumulating receipts + retained records.
         var receipts: std.ArrayList(block.Receipt) = .empty;
@@ -363,6 +398,37 @@ pub const Chain = struct {
             self.state.setBalance(h.coinbase, self.state.balanceOf(h.coinbase) + miner_reward) catch return error.OutOfMemory;
         }
 
+        // EIP-7685 (Prague): collect general-purpose requests in ascending type
+        // order — deposits (0x00) parsed from this block's logs, then the
+        // withdrawal (0x01) and consolidation (0x02) predeploy system calls
+        // (which dequeue, mutating their storage) — and check the requests hash.
+        if (fork.atLeast(.prague)) {
+            const Sha256 = std.crypto.hash.sha2.Sha256;
+            var outer = Sha256.init(.{}); // sha256 over the per-request sha256s
+
+            var deposits: std.ArrayList(u8) = .empty;
+            for (receipts.items) |*r| for (r.logs) |lg| {
+                if (std.mem.eql(u8, &lg.address, &DEPOSIT_CONTRACT) and lg.topics.len > 0 and std.mem.eql(u8, &lg.topics[0], &DEPOSIT_EVENT_SIG)) {
+                    const dd = extractDepositData(lg.data) orelse continue;
+                    deposits.appendSlice(a, &dd) catch return error.OutOfMemory;
+                }
+            };
+            if (deposits.items.len > 0) hashRequest(&outer, 0x00, deposits.items);
+
+            const wd = self.systemCall(a, &env, WITHDRAWAL_REQUEST_PREDEPLOY, &.{});
+            if (wd.len > 0) hashRequest(&outer, 0x01, wd);
+            const cd = self.systemCall(a, &env, CONSOLIDATION_REQUEST_PREDEPLOY, &.{});
+            if (cd.len > 0) hashRequest(&outer, 0x02, cd);
+
+            var got_rh: [32]u8 = undefined;
+            outer.final(&got_rh);
+            const want_rh = h.requests_hash orelse std.mem.zeroes([32]u8);
+            if (!std.mem.eql(u8, &got_rh, &want_rh)) {
+                self.last_error = "invalid requests hash";
+                return error.RequestsHashMismatch;
+            }
+        }
+
         // Validate the execution result against the header (the consensus checks).
         const state_root = trie.stateRoot(a, self.state);
         if (!std.mem.eql(u8, &state_root, &h.state_root)) return error.StateRootMismatch;
@@ -393,8 +459,10 @@ pub const Chain = struct {
         return self.head;
     }
 
-    fn systemCall(self: *Chain, a: std.mem.Allocator, env: *const vm.Environment, to: Address, data: []const u8) void {
-        if (self.state.codeOf(to).len == 0) return; // not deployed in this fork
+    /// Run a system call (caller = SYSTEM_ADDRESS, 30M gas, no fees) and return
+    /// the call's output, copied into `a`. Empty when the target has no code.
+    fn systemCall(self: *Chain, a: std.mem.Allocator, env: *const vm.Environment, to: Address, data: []const u8) []const u8 {
+        if (self.state.codeOf(to).len == 0) return &.{}; // not deployed in this fork
         var evm = vm.processMessage(a, self.state, env, .{
             .caller = SYSTEM_ADDRESS,
             .current_target = to,
@@ -404,7 +472,8 @@ pub const Chain = struct {
             .gas = 30_000_000,
             .value = 0,
         }, null);
-        evm.deinit();
+        defer evm.deinit();
+        return a.dupe(u8, evm.output) catch &.{};
     }
 };
 
