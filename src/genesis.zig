@@ -18,23 +18,54 @@ pub const EMPTY_REQUESTS_HASH: [32]u8 = .{
     0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
 };
 
-/// The fork-activation schedule from a genesis `config`. We target the Merge and
-/// later, so only timestamp-activated forks are tracked; the chain is PoS.
+/// The fork-activation schedule from a genesis `config`: block-number activations
+/// for pre-Merge forks, the merge point, and timestamp activations for post-Merge
+/// forks.
 pub const ForkSchedule = struct {
     chain_id: u64 = 1,
+    // Block-activated (pre-Merge).
+    homestead_block: ?u64 = null,
+    tangerine_block: ?u64 = null, // eip150
+    spurious_block: ?u64 = null, // eip158
+    byzantium_block: ?u64 = null,
+    constantinople_block: ?u64 = null,
+    petersburg_block: ?u64 = null,
+    istanbul_block: ?u64 = null,
+    berlin_block: ?u64 = null,
+    london_block: ?u64 = null,
+    // The Merge (Paris): a block number (mergeNetsplitBlock) and/or TTD-passed.
+    merge_block: ?u64 = null,
+    merged_from_genesis: bool = false,
+    // Timestamp-activated (post-Merge).
     shanghai_time: ?u64 = null,
     cancun_time: ?u64 = null,
     prague_time: ?u64 = null,
     osaka_time: ?u64 = null,
 
-    /// The fork active at a given block timestamp (number-activated pre-Merge
-    /// forks are out of scope; the baseline is Paris).
-    pub fn forkAt(self: ForkSchedule, timestamp: u64) Fork {
+    /// The fork active at a given block number + timestamp. Timestamp forks
+    /// (post-Merge) take precedence; otherwise the Merge gates Paris; otherwise
+    /// the block-number activations select the pre-Merge fork (Frontier baseline).
+    pub fn forkAt(self: ForkSchedule, number: u64, timestamp: u64) Fork {
         if (self.osaka_time) |t| if (timestamp >= t) return .osaka;
         if (self.prague_time) |t| if (timestamp >= t) return .prague;
         if (self.cancun_time) |t| if (timestamp >= t) return .cancun;
         if (self.shanghai_time) |t| if (timestamp >= t) return .shanghai;
-        return .paris;
+        if (self.merged_from_genesis) return .paris;
+        if (self.merge_block) |b| if (number >= b) return .paris;
+        if (active(self.london_block, number)) return .london;
+        if (active(self.berlin_block, number)) return .berlin;
+        if (active(self.istanbul_block, number)) return .istanbul;
+        if (active(self.petersburg_block, number)) return .petersburg;
+        if (active(self.constantinople_block, number)) return .constantinople;
+        if (active(self.byzantium_block, number)) return .byzantium;
+        if (active(self.spurious_block, number)) return .spurious_dragon;
+        if (active(self.tangerine_block, number)) return .tangerine_whistle;
+        if (active(self.homestead_block, number)) return .homestead;
+        return .frontier;
+    }
+
+    fn active(block_num: ?u64, number: u64) bool {
+        return if (block_num) |b| number >= b else false;
     }
 };
 
@@ -92,6 +123,21 @@ pub fn load(a: std.mem.Allocator, st: *State, root: std.json.Value) !Genesis {
     if (obj.get("config")) |c| if (c == .object) {
         const cfg = c.object;
         if (jU64(cfg, "chainId")) |id| sched.chain_id = id;
+        // Block-activated pre-Merge forks.
+        sched.homestead_block = jU64(cfg, "homesteadBlock");
+        sched.tangerine_block = jU64(cfg, "eip150Block");
+        sched.spurious_block = jU64(cfg, "eip158Block");
+        sched.byzantium_block = jU64(cfg, "byzantiumBlock");
+        sched.constantinople_block = jU64(cfg, "constantinopleBlock");
+        sched.petersburg_block = jU64(cfg, "petersburgBlock");
+        sched.istanbul_block = jU64(cfg, "istanbulBlock");
+        sched.berlin_block = jU64(cfg, "berlinBlock");
+        sched.london_block = jU64(cfg, "londonBlock");
+        // The Merge.
+        sched.merge_block = jU64(cfg, "mergeNetsplitBlock");
+        sched.merged_from_genesis = (jU64(cfg, "terminalTotalDifficulty") != null and hU256(jstr(cfg, "terminalTotalDifficulty")) == 0) or
+            (cfg.get("terminalTotalDifficultyPassed") != null and cfg.get("terminalTotalDifficultyPassed").? == .bool and cfg.get("terminalTotalDifficultyPassed").?.bool and sched.merge_block == null);
+        // Timestamp-activated post-Merge forks.
         sched.shanghai_time = jU64(cfg, "shanghaiTime");
         sched.cancun_time = jU64(cfg, "cancunTime");
         sched.prague_time = jU64(cfg, "pragueTime");
@@ -177,7 +223,7 @@ test "load minimal genesis: alloc, schedule, header shape" {
     const g = try load(a, &st, parsed.value);
 
     try testing.expectEqual(@as(u64, 7), g.schedule.chain_id);
-    try testing.expectEqual(Fork.prague, g.schedule.forkAt(0));
+    try testing.expectEqual(Fork.prague, g.schedule.forkAt(0, 0));
     try testing.expectEqual(@as(u64, 0), g.header.number);
     try testing.expectEqual(@as(?u256, 7), g.header.base_fee_per_gas);
     try testing.expect(g.header.withdrawals_root != null); // Shanghai+
