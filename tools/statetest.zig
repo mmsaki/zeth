@@ -270,7 +270,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
         };
 
         // Reject invalid transactions outright (state stays at the pre-state).
-        if (blob_ok and zeth.tx.validate(&st, &env, tx, max_fee_cap, max_prio)) {
+        if (blob_ok and zeth.tx.validate(&st, &env, tx, max_fee_cap, max_prio) == null) {
             _ = zeth.tx.process(a, &st, &env, tx);
         }
         const got = zeth.trie.stateRoot(a, &st);

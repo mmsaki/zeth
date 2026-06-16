@@ -87,46 +87,76 @@ fn isValidDelegation(code: []const u8) bool {
     return code.len == 23 and code[0] == 0xef and code[1] == 0x01 and code[2] == 0x00;
 }
 
-/// Pre-execution transaction validity (EELS `check_transaction`). A failing
-/// transaction is rejected outright and leaves the state untouched, so callers
-/// must run this before `process`. `max_fee_cap`/`max_prio` are the raw 1559
-/// fields (for a legacy tx pass gas_price as the cap and 0 as the priority).
-pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: u256, max_prio: u256) bool {
+/// Why a transaction is invalid. `message()` returns a descriptive string the
+/// Engine API surfaces as `validationError` (and an EEST exception mapper can
+/// map to TransactionException types).
+pub const InvalidReason = enum {
+    fee_cap_below_base_fee,
+    tip_above_fee_cap,
+    gas_limit_exceeds_block,
+    init_code_too_large,
+    intrinsic_gas_too_low,
+    nonce_too_high,
+    nonce_mismatch,
+    insufficient_funds,
+    sender_not_eoa,
+
+    pub fn message(self: InvalidReason) []const u8 {
+        return switch (self) {
+            .fee_cap_below_base_fee => "max fee per gas less than block base fee",
+            .tip_above_fee_cap => "max priority fee per gas higher than max fee per gas",
+            .gas_limit_exceeds_block => "transaction gas limit exceeds block gas limit",
+            .init_code_too_large => "max initcode size exceeded",
+            .intrinsic_gas_too_low => "intrinsic gas too low",
+            .nonce_too_high => "nonce too high",
+            .nonce_mismatch => "nonce mismatch",
+            .insufficient_funds => "insufficient funds for gas * price + value",
+            .sender_not_eoa => "sender not an eoa",
+        };
+    }
+};
+
+/// Pre-execution transaction validity (EELS `check_transaction`) → the reason
+/// it is invalid, or null if valid. A failing transaction is rejected outright
+/// and leaves the state untouched, so callers must run this before `process`.
+/// `max_fee_cap`/`max_prio` are the raw 1559 fields (for a legacy tx pass
+/// gas_price as the cap and 0 as the priority).
+pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: u256, max_prio: u256) ?InvalidReason {
     // EIP-1559 fee-cap sanity.
-    if (max_fee_cap < env.base_fee) return false;
-    if (max_fee_cap < max_prio) return false;
+    if (max_fee_cap < env.base_fee) return .fee_cap_below_base_fee;
+    if (max_fee_cap < max_prio) return .tip_above_fee_cap;
 
     // The transaction's gas limit may not exceed the block gas limit.
-    if (tx.gas_limit > env.gas_limit) return false;
+    if (tx.gas_limit > env.gas_limit) return .gas_limit_exceeds_block;
 
     // EIP-3860: a creation transaction's init code is bounded.
-    if (tx.to == null and tx.data.len > vm.MAX_INIT_CODE_SIZE) return false;
+    if (tx.to == null and tx.data.len > vm.MAX_INIT_CODE_SIZE) return .init_code_too_large;
 
     // Intrinsic gas must fit within the gas limit.
     const ig = intrinsicGas(tx.data, tx.to == null);
     var intrinsic = ig.standard;
     for (tx.access_list) |e| intrinsic += ACCESS_LIST_ADDRESS + ACCESS_LIST_KEY * e.keys.len;
-    if (tx.gas_limit < intrinsic) return false;
+    if (tx.gas_limit < intrinsic) return .intrinsic_gas_too_low;
 
     // Nonce must match exactly, and must leave room to increment (EELS rejects
     // a nonce of U64.MAX_VALUE so sender.nonce + 1 cannot overflow).
-    if (tx.nonce >= std.math.maxInt(u64)) return false;
-    if (state.nonceOf(tx.sender) != tx.nonce) return false;
+    if (tx.nonce >= std.math.maxInt(u64)) return .nonce_too_high;
+    if (state.nonceOf(tx.sender) != tx.nonce) return .nonce_mismatch;
 
     // The sender must be able to cover the worst-case fee plus value. Compute in
     // u512 since gas_limit * max_fee_cap can exceed u256 for adversarial prices.
     const max_gas_fee: u512 = @as(u512, tx.gas_limit) * max_fee_cap + tx.blob_data_fee + tx.value;
-    if (@as(u512, state.balanceOf(tx.sender)) < max_gas_fee) return false;
+    if (@as(u512, state.balanceOf(tx.sender)) < max_gas_fee) return .insufficient_funds;
 
     // EIP-3607: the sender must be an EOA (no code). Prague (EIP-7702) makes one
     // exception — an account carrying a valid delegation indicator still
     // originates transactions; pre-Prague, any code disqualifies the sender.
     const code = state.codeOf(tx.sender);
     if (code.len != 0) {
-        if (!(env.fork.atLeast(.prague) and isValidDelegation(code))) return false;
+        if (!(env.fork.atLeast(.prague) and isValidDelegation(code))) return .sender_not_eoa;
     }
 
-    return true;
+    return null;
 }
 
 pub fn process(allocator: std.mem.Allocator, state: *State, env: *const vm.Environment, tx: Tx) Result {

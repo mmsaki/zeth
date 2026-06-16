@@ -72,6 +72,8 @@ pub const Chain = struct {
     /// A clone of the genesis world state, retained so debug_traceTransaction
     /// can replay the chain up to a target transaction.
     genesis_state: ?State = null,
+    /// Reason the most recent import failed (for the Engine API validationError).
+    last_error: ?[]const u8 = null,
     /// Canonical headers by block number (index 0 = genesis). Each header's
     /// `extra_data` is owned by `gpa` (the decoded header otherwise lives in a
     /// per-block arena freed when importBlock returns). RPC serves from here.
@@ -235,6 +237,7 @@ pub const Chain = struct {
     /// withdrawal encodings) and append it. Shared by RLP import and the Engine
     /// API (engine_newPayload builds the parts from an ExecutionPayload).
     pub fn importDecoded(self: *Chain, a: std.mem.Allocator, blk: block.Block) ImportError!Header {
+        self.last_error = null;
         const h = blk.header;
         const parent_hash = self.head.hash(self.gpa) catch return error.OutOfMemory;
         if (!std.mem.eql(u8, &h.parent_hash, &parent_hash)) return error.BadParent;
@@ -285,8 +288,10 @@ pub const Chain = struct {
             // A block is invalid if any transaction is invalid (intrinsic gas,
             // nonce, balance, fee caps, EIP-3607/3860). The state-test runner
             // skips such blocks; the Engine API must reject them.
-            if (!txmod.validate(self.state, &env, tx, dt.max_fee, dt.max_priority_fee))
+            if (txmod.validate(self.state, &env, tx, dt.max_fee, dt.max_priority_fee)) |reason| {
+                self.last_error = reason.message();
                 return error.InvalidTransaction;
+            }
 
             var logs: std.ArrayList(vm.Log) = .empty;
             const res = txmod.processWithReceipt(a, self.state, &env, tx, &logs);
