@@ -84,14 +84,37 @@ def run_revm(hexcode):
     return int(m.group(1)), float(m.group(2))
 
 
+def _evmone_bench_bin():
+    """Locate evmone-bench: a CMake build in evmone/build/, or on PATH."""
+    local = os.path.join(ROOT, "evmone", "build", "bin", "evmone-bench")
+    return local if os.path.exists(local) else shutil.which("evmone-bench")
+
+
 def run_evmone(hexcode):
-    # evmone-bench takes a code file + an input; we feed an empty input.
-    out = subprocess.run(["evmone-bench", "--code", hexcode],
-                         capture_output=True, text=True)
-    text = out.stdout + out.stderr
-    gas = int(search(r"gas used:\s*(\d+)", text).group(1))
-    ns = parse_duration_ns(search(r"time:\s*(\S+)", text).group(1))
-    return gas, ns
+    # evmone-bench reads the code from a file; it reports gas_used + time for
+    # the baseline interpreter (the production path). Empty input/expected.
+    import json
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".hex", delete=False) as f:
+        f.write(hexcode)
+        path = f.name
+    try:
+        # Only the baseline interpreter's execute phase matters; skipping the
+        # analyse/advanced benchmarks (and a short min-time) is ~5× faster.
+        out = subprocess.run([_evmone_bench_bin() or "evmone-bench", path, "", "",
+                              "--benchmark_filter=baseline/execute",
+                              "--benchmark_min_time=0.02s", "--benchmark_format=json"],
+                             capture_output=True, text=True).stdout
+        data = json.loads(out)
+    finally:
+        os.unlink(path)
+    unit = {"ns": 1, "us": 1e3, "ms": 1e6, "s": 1e9}
+    for b in data["benchmarks"]:
+        if "baseline/execute" in b["name"] and "gas_used" in b:
+            return int(b["gas_used"]), b["real_time"] * unit[b["time_unit"]]
+    # evmone's bench harness runs a fixed revision; opcodes it doesn't enable
+    # (e.g. PUSH0, MCOPY) execute as invalid and report no gas — skip them.
+    return None, None
 
 
 # Engine registry: (name, availability check, adapter). zeth first = reference.
@@ -100,7 +123,7 @@ ENGINES = [
     ("zeth", lambda: os.path.exists(ZETH_RUN), run_zetherum),
     ("geth", lambda: shutil.which("evm") is not None, run_geth),
     ("reth", lambda: os.path.exists(REVM_RUN), run_revm),
-    ("evmone", lambda: shutil.which("evmone-bench") is not None, run_evmone),
+    ("evmone", lambda: _evmone_bench_bin() is not None, run_evmone),
 ]
 
 

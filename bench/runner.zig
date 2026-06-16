@@ -10,7 +10,7 @@
 //! fork) reports the *same* gas, making gas-equality a correctness oracle.
 
 const std = @import("std");
-const zeth = @import("zetherum");
+const zeth = @import("zeth");
 
 const Clock = std.Io.Clock;
 const COUNT: u24 = 250_000;

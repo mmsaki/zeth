@@ -11,7 +11,7 @@
 //! On Linux this is where perf_event_open counters would slot in as extra rows.
 
 const std = @import("std");
-const zeth = @import("zetherum");
+const zeth = @import("zeth");
 
 const Clock = std.Io.Clock;
 
@@ -209,7 +209,7 @@ pub fn main(init: std.process.Init) !void {
     var best_thr: f64 = 0;
     for (results) |r| best_thr = @max(best_thr, r.thr.mean);
 
-    std.debug.print("\n{s}zetherum EVM — poop-style comparison{s}  ({d} samples, loop x{d})\n\n", .{ c(BOLD), c(RESET), SAMPLES, LOOP_COUNT });
+    std.debug.print("\n{s}zeth EVM — poop-style comparison{s}  ({d} samples, loop x{d})\n\n", .{ c(BOLD), c(RESET), SAMPLES, LOOP_COUNT });
 
     for (results, 0..) |r, ri| {
         const base = if (ri == 0) null else results[0];

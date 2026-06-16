@@ -1,21 +1,29 @@
-//! Precompiled contracts at addresses 0x01–0x0a. Implemented: ecrecover (0x01),
-//! sha256 (0x02), ripemd160 (0x03), identity (0x04), modexp (0x05), bn254
-//! ecadd/ecmul/ecpairing (0x06–0x08), blake2f (0x09). Not yet: KZG point-eval
-//! (0x0a) and the BLS12-381 set (0x0b–0x12), which report failure.
+//! Precompiled contracts. Implemented: ecrecover (0x01), sha256 (0x02),
+//! ripemd160 (0x03), identity (0x04), modexp (0x05), bn254 ecadd/ecmul/ecpairing
+//! (0x06–0x08), blake2f (0x09), KZG point-eval (0x0a), and BLS12-381
+//! G1ADD/G1MSM/G2ADD/G2MSM/PAIRING/MAP_FP_TO_G1 (0x0b–0x10). Not yet:
+//! MAP_FP2_TO_G2).
 
 const std = @import("std");
 const crypto = @import("crypto.zig");
 const state_mod = @import("state.zig");
 const bn254 = @import("bn254.zig");
+const bls = @import("bls12_381.zig");
 const Address = state_mod.Address;
 
 pub const Output = struct { data: []u8, gas: u64 };
 
-/// Return the precompile id (1..0x0a) if `addr` is a precompile, else null.
+/// Return the precompile id if `addr` is an implemented precompile, else null.
+/// 0x01–0x09 (classic), 0x0b (BLS12-381 G1ADD). 0x0a (KZG) and the rest of the
+/// BLS set are not yet implemented, so they are not treated as precompiles.
 pub fn idOf(addr: Address) ?u8 {
     for (addr[0..19]) |b| if (b != 0) return null;
     const id = addr[19];
-    return if (id >= 1 and id <= 0x0a) id else null;
+    if (id >= 1 and id <= 0x09) return id;
+    if (id == 0x0a) return id; // KZG point evaluation (EIP-4844)
+    // BLS12-381: G1ADD, G1MSM, G2ADD, G2MSM, PAIRING.
+    if (id >= 0x0b and id <= 0x11) return id;
+    return null;
 }
 
 fn words(len: usize) u64 {
@@ -29,14 +37,22 @@ pub fn run(allocator: std.mem.Allocator, id: u8, input: []const u8, gas_availabl
     return switch (id) {
         0x01 => ecrecover(allocator, input, gas_available),
         0x02 => sha256(allocator, input, gas_available),
-        0x04 => identity(allocator, input, gas_available),
         0x03 => ripemd160(allocator, input, gas_available),
+        0x04 => identity(allocator, input, gas_available),
         0x05 => modexp(allocator, input, gas_available),
         0x06 => bnAdd(allocator, input, gas_available),
         0x07 => bnMul(allocator, input, gas_available),
         0x08 => bnPairing(allocator, input, gas_available),
         0x09 => blake2f(allocator, input, gas_available),
-        else => null, // unimplemented precompile (kzg/bls)
+        0x0a => kzgPointEval(allocator, input, gas_available),
+        0x0b => blsG1Add(allocator, input, gas_available),
+        0x0c => blsG1Msm(allocator, input, gas_available),
+        0x0d => blsG2Add(allocator, input, gas_available),
+        0x0e => blsG2Msm(allocator, input, gas_available),
+        0x0f => blsPairing(allocator, input, gas_available),
+        0x10 => blsMapFpToG1(allocator, input, gas_available),
+        0x11 => blsMapFp2ToG2(allocator, input, gas_available),
+        else => null, // unimplemented precompile (kzg / map)
     };
 }
 
@@ -109,6 +125,23 @@ fn mulmod(allocator: std.mem.Allocator, r: *Managed, a: *const Managed, b: *cons
     q.divFloor(r, &prod, m) catch @panic("oom");
 }
 
+/// First min(32, exp_len) bytes of the exponent, as a big-endian integer (the
+/// "exponent head" the EIP-2565 iteration count is based on). Zero-padded.
+fn modexpExpHead(input: []const u8, base_len: u256, exp_len: u256) u256 {
+    if (exp_len == 0) return 0;
+    const off_u: u256 = 96 + base_len;
+    if (off_u >= input.len) return 0; // exponent lies entirely past the input
+    const off: usize = @intCast(off_u);
+    const n: usize = @intCast(@min(exp_len, 32));
+    var head: u256 = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const b: u8 = if (off + i < input.len) input[off + i] else 0;
+        head = (head << 8) | b;
+    }
+    return head;
+}
+
 /// EIP-2565 modexp. Input: base_len(32) ‖ exp_len(32) ‖ mod_len(32) ‖ base ‖ exp ‖ mod.
 fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?Output {
     var hdr: [96]u8 = std.mem.zeroes([96]u8);
@@ -116,12 +149,33 @@ fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?
     const base_len = read32(hdr[0..32]);
     const exp_len = read32(hdr[32..64]);
     const mod_len = read32(hdr[64..96]);
-    if (base_len > 4096 or exp_len > 4096 or mod_len > 4096) return null; // DoS guard
+
+    // Gas (EIP-2565), computed without materializing huge operands. Work in u512
+    // so adversarial multi-thousand-bit lengths cannot overflow the arithmetic.
+    const max_len: u512 = @max(base_len, mod_len);
+    const w: u512 = (max_len + 7) / 8;
+    const mult_complexity: u512 = w * w;
+    // If the multiplication term alone can't be afforded, reject before the
+    // (potentially enormous) iteration-count multiply.
+    if (mult_complexity > @as(u512, gas_available) * 3) return null;
+    const iters: u512 = blk: {
+        const head = modexpExpHead(input, base_len, exp_len);
+        const head_bits: u512 = if (head == 0) 0 else 256 - @clz(head);
+        const adj: u512 = if (head_bits == 0) 0 else head_bits - 1;
+        break :blk if (exp_len <= 32) adj else 8 * (@as(u512, exp_len) - 32) + adj;
+    };
+    const dyn: u512 = mult_complexity * @max(iters, 1) / 3;
+    const cost_u: u512 = @max(@as(u512, 200), dyn);
+    if (cost_u > gas_available) return null;
+    const cost: u64 = @intCast(cost_u);
+
+    // A zero-length modulus yields an empty result regardless of base/exponent.
+    if (mod_len == 0) return .{ .data = allocator.alloc(u8, 0) catch @panic("oom"), .gas = cost };
+
+    // The lengths are now bounded by affordability, so materialization is safe.
     const bl: usize = @intCast(base_len);
     const el: usize = @intCast(exp_len);
     const ml: usize = @intCast(mod_len);
-
-    // Zero-padded reads of the three operands.
     const padded = allocator.alloc(u8, @max(96 + bl + el + ml, input.len)) catch @panic("oom");
     defer allocator.free(padded);
     @memset(padded, 0);
@@ -130,18 +184,8 @@ fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?
     const exp_b = padded[96 + bl .. 96 + bl + el];
     const mod_b = padded[96 + bl + el .. 96 + bl + el + ml];
 
-    // Gas (EIP-2565).
-    const max_len = @max(bl, ml);
-    const w: u64 = @intCast((max_len + 7) / 8);
-    const mult_complexity: u128 = @as(u128, w) * w;
-    const iters = iterCount(exp_b);
-    const dyn: u128 = mult_complexity * @max(iters, 1) / 3;
-    const cost: u64 = @intCast(@max(@as(u128, 200), dyn));
-    if (cost > gas_available) return null;
-
     const out = allocator.alloc(u8, ml) catch @panic("oom");
     @memset(out, 0);
-    if (ml == 0) return .{ .data = out, .gas = cost };
 
     var mod = bigFromBe(allocator, mod_b);
     defer mod.deinit();
@@ -170,32 +214,32 @@ fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?
 // --- RIPEMD-160 (0x03) ---  std.crypto has no ripemd, so implement it here.
 
 const RIPEMD_R = [80]u5{
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-    7, 4, 13, 1, 10, 6, 15, 3, 12, 0, 9, 5, 2, 14, 11, 8,
-    3, 10, 14, 4, 9, 15, 8, 1, 2, 7, 0, 6, 13, 11, 5, 12,
-    1, 9, 11, 10, 0, 8, 12, 4, 13, 3, 7, 15, 14, 5, 6, 2,
-    4, 0, 5, 9, 7, 12, 2, 10, 14, 1, 3, 8, 11, 6, 15, 13,
+    0, 1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+    7, 4,  13, 1,  10, 6,  15, 3,  12, 0, 9,  5,  2,  14, 11, 8,
+    3, 10, 14, 4,  9,  15, 8,  1,  2,  7, 0,  6,  13, 11, 5,  12,
+    1, 9,  11, 10, 0,  8,  12, 4,  13, 3, 7,  15, 14, 5,  6,  2,
+    4, 0,  5,  9,  7,  12, 2,  10, 14, 1, 3,  8,  11, 6,  15, 13,
 };
 const RIPEMD_RR = [80]u5{
-    5, 14, 7, 0, 9, 2, 11, 4, 13, 6, 15, 8, 1, 10, 3, 12,
-    6, 11, 3, 7, 0, 13, 5, 10, 14, 15, 8, 12, 4, 9, 1, 2,
-    15, 5, 1, 3, 7, 14, 6, 9, 11, 8, 12, 2, 10, 0, 4, 13,
-    8, 6, 4, 1, 3, 11, 15, 0, 5, 12, 2, 13, 9, 7, 10, 14,
-    12, 15, 10, 4, 1, 5, 8, 7, 6, 2, 13, 14, 0, 3, 9, 11,
+    5,  14, 7,  0, 9, 2,  11, 4,  13, 6,  15, 8,  1,  10, 3,  12,
+    6,  11, 3,  7, 0, 13, 5,  10, 14, 15, 8,  12, 4,  9,  1,  2,
+    15, 5,  1,  3, 7, 14, 6,  9,  11, 8,  12, 2,  10, 0,  4,  13,
+    8,  6,  4,  1, 3, 11, 15, 0,  5,  12, 2,  13, 9,  7,  10, 14,
+    12, 15, 10, 4, 1, 5,  8,  7,  6,  2,  13, 14, 0,  3,  9,  11,
 };
 const RIPEMD_S = [80]u5{
-    11, 14, 15, 12, 5, 8, 7, 9, 11, 13, 14, 15, 6, 7, 9, 8,
-    7, 6, 8, 13, 11, 9, 7, 15, 7, 12, 15, 9, 11, 7, 13, 12,
-    11, 13, 6, 7, 14, 9, 13, 15, 14, 8, 13, 6, 5, 12, 7, 5,
-    11, 12, 14, 15, 14, 15, 9, 8, 9, 14, 5, 6, 8, 6, 5, 12,
-    9, 15, 5, 11, 6, 8, 13, 12, 5, 12, 13, 14, 11, 8, 5, 6,
+    11, 14, 15, 12, 5,  8,  7,  9,  11, 13, 14, 15, 6,  7,  9,  8,
+    7,  6,  8,  13, 11, 9,  7,  15, 7,  12, 15, 9,  11, 7,  13, 12,
+    11, 13, 6,  7,  14, 9,  13, 15, 14, 8,  13, 6,  5,  12, 7,  5,
+    11, 12, 14, 15, 14, 15, 9,  8,  9,  14, 5,  6,  8,  6,  5,  12,
+    9,  15, 5,  11, 6,  8,  13, 12, 5,  12, 13, 14, 11, 8,  5,  6,
 };
 const RIPEMD_SS = [80]u5{
-    8, 9, 9, 11, 13, 15, 15, 5, 7, 7, 8, 11, 14, 14, 12, 6,
-    9, 13, 15, 7, 12, 8, 9, 11, 7, 7, 12, 7, 6, 15, 13, 11,
-    9, 7, 15, 11, 8, 6, 6, 14, 12, 13, 5, 14, 13, 13, 7, 5,
-    15, 5, 8, 11, 14, 14, 6, 14, 6, 9, 12, 9, 12, 5, 15, 8,
-    8, 5, 12, 9, 12, 5, 14, 6, 8, 13, 6, 5, 15, 13, 11, 11,
+    8,  9,  9,  11, 13, 15, 15, 5,  7,  7,  8,  11, 14, 14, 12, 6,
+    9,  13, 15, 7,  12, 8,  9,  11, 7,  7,  12, 7,  6,  15, 13, 11,
+    9,  7,  15, 11, 8,  6,  6,  14, 12, 13, 5,  14, 13, 13, 7,  5,
+    15, 5,  8,  11, 14, 14, 6,  14, 6,  9,  12, 9,  12, 5,  15, 8,
+    8,  5,  12, 9,  12, 5,  14, 6,  8,  13, 6,  5,  15, 13, 11, 11,
 };
 const RIPEMD_K = [5]u32{ 0x00000000, 0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xA953FD4E };
 const RIPEMD_KK = [5]u32{ 0x50A28BE6, 0x5C4DD124, 0x6D703EF3, 0x7A6D76E9, 0x00000000 };
@@ -370,15 +414,220 @@ fn bnPairing(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output 
     return .{ .data = out, .gas = cost };
 }
 
-fn iterCount(exp_b: []const u8) u64 {
-    const head_len = @min(exp_b.len, 32);
-    var head: u256 = 0;
-    for (exp_b[0..head_len]) |b| head = (head << 8) | b;
-    const head_bits: u64 = if (head == 0) 0 else 256 - @clz(head);
-    if (exp_b.len <= 32) {
-        return if (head_bits == 0) 0 else head_bits - 1;
+// --- KZG point evaluation (0x0a, EIP-4844) ---
+
+/// Decode a 48-byte compressed BLS12-381 G1 point (zcash flag format).
+fn decodeG1Compressed(b: []const u8) ?bls.G1 {
+    const z = std.mem.readInt(u384, b[0..48], .big);
+    const c_flag = (z >> 383) & 1;
+    const b_flag = (z >> 382) & 1;
+    const a_flag = (z >> 381) & 1;
+    if (c_flag == 0) return null; // must be compressed form
+    const x: u384 = z % (@as(u384, 1) << 381);
+    const is_inf = (x == 0);
+    if ((b_flag == 1) != is_inf) return null;
+    if (is_inf) return if (a_flag == 1) null else bls.G1.infinity();
+    if (x >= bls.P) return null;
+    const fx = bls.Fp{ .v = x };
+    const rhs = fx.mul(fx).mul(fx).add(bls.Fp.scalar(4)); // x³ + 4
+    const y = bls.fpSqrt(rhs) orelse return null; // also confirms on-curve
+    var yv = y.v;
+    if ((@as(u512, yv) * 2) / bls.P != a_flag) yv = bls.P - yv; // pick sign per a_flag
+    return bls.G1{ .x = fx, .y = bls.Fp{ .v = yv }, .z = bls.Fp.one() };
+}
+
+fn kzgPointEval(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len != 192) return null;
+    const cost: u64 = 50000;
+    if (cost > gas) return null;
+    // versioned_hash == 0x01 ‖ sha256(commitment)[1..32].
+    var ch: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(input[96..144], &ch, .{});
+    ch[0] = 0x01;
+    if (!std.mem.eql(u8, input[0..32], &ch)) return null;
+
+    const z = std.mem.readInt(u256, input[32..64], .big);
+    const y = std.mem.readInt(u256, input[64..96], .big);
+    if (z >= bls.R or y >= bls.R) return null; // field elements must be < r
+    const commitment = decodeG1Compressed(input[96..144]) orelse return null;
+    const proof = decodeG1Compressed(input[144..192]) orelse return null;
+
+    // Verify P − y = Q·(X − z) via pairings:
+    //   e(commitment − [y]₁, −G₂) · e(proof, [τ]₂ − [z]₂) == 1.
+    const x_minus_z = bls.kzgSetupG2().add(bls.g2Generator().mul(bls.R - z));
+    const p_minus_y = commitment.add(bls.g1Generator().mul(bls.R - y));
+    const g2 = bls.g2Generator();
+    const neg_g2 = bls.G2{ .x = g2.x, .y = g2.y.neg(), .z = g2.z };
+    if (!bls.pairingProductIsOne(&.{
+        .{ .q = neg_g2, .p = p_minus_y },
+        .{ .q = x_minus_z, .p = proof },
+    })) return null;
+
+    // Output: FIELD_ELEMENTS_PER_BLOB (4096) ‖ BLS_MODULUS, each 32-byte BE.
+    const out = allocator.alloc(u8, 64) catch @panic("oom");
+    @memset(out, 0);
+    std.mem.writeInt(u256, out[0..32], 4096, .big);
+    std.mem.writeInt(u256, out[32..64], bls.R, .big);
+    return .{ .data = out, .gas = cost };
+}
+
+// --- BLS12-381 (EIP-2537) precompiles ---
+
+/// Decode a 64-byte big-endian field element, validating it is < P (which also
+/// rejects non-zero high padding, since P < 2^384 < 2^512).
+fn blsFp(input: []const u8, off: usize) ?bls.Fp {
+    var buf: [64]u8 = std.mem.zeroes([64]u8);
+    @memcpy(&buf, input[off .. off + 64]);
+    const v = std.mem.readInt(u512, &buf, .big);
+    if (v >= bls.P) return null;
+    return bls.Fp{ .v = @intCast(v) };
+}
+
+/// Decode a 128-byte G1 point (x ‖ y, 64 bytes each), validating the field and
+/// the curve. (0, 0) is the point at infinity.
+fn decodeBlsG1(input: []const u8, off: usize) ?bls.G1 {
+    const x = blsFp(input, off) orelse return null;
+    const y = blsFp(input, off + 64) orelse return null;
+    const z: bls.Fp = if (x.isZero() and y.isZero()) bls.Fp.zero() else bls.Fp.one();
+    const p = bls.G1{ .x = x, .y = y, .z = z };
+    if (!p.isOnCurve(bls.Fp.scalar(4))) return null;
+    return p;
+}
+
+fn encodeBlsG1(allocator: std.mem.Allocator, p: bls.G1) []u8 {
+    const aff = bls.normalizeG1(p);
+    const out = allocator.alloc(u8, 128) catch @panic("oom");
+    @memset(out, 0);
+    std.mem.writeInt(u512, out[0..64], @as(u512, aff.x.v), .big);
+    std.mem.writeInt(u512, out[64..128], @as(u512, aff.y.v), .big);
+    return out;
+}
+
+fn blsG1Add(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len != 256) return null; // EIP-2537: fixed 256-byte input
+    const cost: u64 = 375;
+    if (cost > gas) return null;
+    const p1 = decodeBlsG1(input, 0) orelse return null;
+    const p2 = decodeBlsG1(input, 128) orelse return null;
+    return .{ .data = encodeBlsG1(allocator, p1.add(p2)), .gas = cost };
+}
+
+/// Decode a 128-byte Fp2 element (c0 ‖ c1, 64 bytes each).
+fn blsFp2(input: []const u8, off: usize) ?bls.Fp2 {
+    const c0 = blsFp(input, off) orelse return null;
+    const c1 = blsFp(input, off + 64) orelse return null;
+    return bls.Fp2{ .c0 = c0, .c1 = c1 };
+}
+
+/// Decode a 256-byte G2 point (x ‖ y, 128-byte Fp2 each). (0, 0) is infinity.
+fn decodeBlsG2(input: []const u8, off: usize) ?bls.G2 {
+    const x = blsFp2(input, off) orelse return null;
+    const y = blsFp2(input, off + 128) orelse return null;
+    const z: bls.Fp2 = if (x.isZero() and y.isZero()) bls.Fp2.zero() else bls.Fp2.one();
+    const p = bls.G2{ .x = x, .y = y, .z = z };
+    if (!p.isOnCurve(bls.b2())) return null;
+    return p;
+}
+
+fn encodeBlsG2(allocator: std.mem.Allocator, p: bls.G2) []u8 {
+    const aff = bls.normalizeG2(p);
+    const out = allocator.alloc(u8, 256) catch @panic("oom");
+    @memset(out, 0);
+    std.mem.writeInt(u512, out[0..64], @as(u512, aff.x.c0.v), .big);
+    std.mem.writeInt(u512, out[64..128], @as(u512, aff.x.c1.v), .big);
+    std.mem.writeInt(u512, out[128..192], @as(u512, aff.y.c0.v), .big);
+    std.mem.writeInt(u512, out[192..256], @as(u512, aff.y.c1.v), .big);
+    return out;
+}
+
+fn blsG2Add(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len != 512) return null; // EIP-2537: fixed 512-byte input
+    const cost: u64 = 600;
+    if (cost > gas) return null;
+    const p1 = decodeBlsG2(input, 0) orelse return null;
+    const p2 = decodeBlsG2(input, 256) orelse return null;
+    return .{ .data = encodeBlsG2(allocator, p1.add(p2)), .gas = cost };
+}
+
+// EIP-2537 multi-scalar-multiplication per-k gas discounts (×1/1000).
+const BLS_G1_DISCOUNT = [128]u16{ 1000, 949, 848, 797, 764, 750, 738, 728, 719, 712, 705, 698, 692, 687, 682, 677, 673, 669, 665, 661, 658, 654, 651, 648, 645, 642, 640, 637, 635, 632, 630, 627, 625, 623, 621, 619, 617, 615, 613, 611, 609, 608, 606, 604, 603, 601, 599, 598, 596, 595, 593, 592, 591, 589, 588, 586, 585, 584, 582, 581, 580, 579, 577, 576, 575, 574, 573, 572, 570, 569, 568, 567, 566, 565, 564, 563, 562, 561, 560, 559, 558, 557, 556, 555, 554, 553, 552, 551, 550, 549, 548, 547, 547, 546, 545, 544, 543, 542, 541, 540, 540, 539, 538, 537, 536, 536, 535, 534, 533, 532, 532, 531, 530, 529, 528, 528, 527, 526, 525, 525, 524, 523, 522, 522, 521, 520, 520, 519 };
+const BLS_G2_DISCOUNT = [128]u16{ 1000, 1000, 923, 884, 855, 832, 812, 796, 782, 770, 759, 749, 740, 732, 724, 717, 711, 704, 699, 693, 688, 683, 679, 674, 670, 666, 663, 659, 655, 652, 649, 646, 643, 640, 637, 634, 632, 629, 627, 624, 622, 620, 618, 615, 613, 611, 609, 607, 606, 604, 602, 600, 598, 597, 595, 593, 592, 590, 589, 587, 586, 584, 583, 582, 580, 579, 578, 576, 575, 574, 573, 571, 570, 569, 568, 567, 566, 565, 563, 562, 561, 560, 559, 558, 557, 556, 555, 554, 553, 552, 552, 551, 550, 549, 548, 547, 546, 545, 545, 544, 543, 542, 541, 541, 540, 539, 538, 537, 537, 536, 535, 535, 534, 533, 532, 532, 531, 530, 530, 529, 528, 528, 527, 526, 526, 525, 524, 524 };
+
+/// Subgroup membership: a decoded curve point must also lie in the prime-order
+/// subgroup, i.e. [R]·P is the identity. Required by the MSM precompiles.
+fn msmGas(k: usize, mul_gas: u64, discounts: *const [128]u16, max_discount: u64) ?u64 {
+    const discount: u64 = if (k == 0) return null else if (k <= 128) discounts[k - 1] else max_discount;
+    const total: u128 = @as(u128, k) * mul_gas * discount / 1000;
+    return if (total > std.math.maxInt(u64)) null else @intCast(total);
+}
+
+fn blsG1Msm(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len == 0 or input.len % 160 != 0) return null;
+    const k = input.len / 160;
+    const cost = msmGas(k, 12000, &BLS_G1_DISCOUNT, 519) orelse return null;
+    if (cost > gas) return null;
+    var acc = bls.G1.infinity();
+    var i: usize = 0;
+    while (i < k) : (i += 1) {
+        const p = decodeBlsG1(input, i * 160) orelse return null;
+        if (!p.mul(bls.R).isInf()) return null; // subgroup check
+        const m = std.mem.readInt(u256, input[i * 160 + 128 ..][0..32], .big);
+        acc = acc.add(p.mul(m));
     }
-    return 8 * @as(u64, @intCast(exp_b.len - 32)) + (if (head_bits == 0) 0 else head_bits - 1);
+    return .{ .data = encodeBlsG1(allocator, acc), .gas = cost };
+}
+
+fn blsG2Msm(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len == 0 or input.len % 288 != 0) return null;
+    const k = input.len / 288;
+    const cost = msmGas(k, 22500, &BLS_G2_DISCOUNT, 524) orelse return null;
+    if (cost > gas) return null;
+    var acc = bls.G2.infinity();
+    var i: usize = 0;
+    while (i < k) : (i += 1) {
+        const p = decodeBlsG2(input, i * 288) orelse return null;
+        if (!p.mul(bls.R).isInf()) return null; // subgroup check
+        const m = std.mem.readInt(u256, input[i * 288 + 256 ..][0..32], .big);
+        acc = acc.add(p.mul(m));
+    }
+    return .{ .data = encodeBlsG2(allocator, acc), .gas = cost };
+}
+
+fn blsMapFpToG1(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len != 64) return null;
+    const cost: u64 = 5500;
+    if (cost > gas) return null;
+    const x = blsFp(input, 0) orelse return null;
+    return .{ .data = encodeBlsG1(allocator, bls.mapToG1(x)), .gas = cost };
+}
+
+fn blsMapFp2ToG2(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len != 128) return null;
+    const cost: u64 = 23800;
+    if (cost > gas) return null;
+    const x = blsFp2(input, 0) orelse return null;
+    return .{ .data = encodeBlsG2(allocator, bls.mapToG2(x)), .gas = cost };
+}
+
+fn blsPairing(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+    if (input.len == 0 or input.len % 384 != 0) return null;
+    const k = input.len / 384;
+    const cost: u64 = 32600 * @as(u64, @intCast(k)) + 37700;
+    if (cost > gas) return null;
+    const pts = allocator.alloc(bls.PairPoint, k) catch @panic("oom");
+    defer allocator.free(pts);
+    var i: usize = 0;
+    while (i < k) : (i += 1) {
+        const p = decodeBlsG1(input, 384 * i) orelse return null;
+        const q = decodeBlsG2(input, 384 * i + 128) orelse return null;
+        if (!p.mul(bls.R).isInf()) return null; // G1 subgroup check
+        if (!q.mul(bls.R).isInf()) return null; // G2 subgroup check
+        pts[i] = .{ .q = q, .p = p };
+    }
+    const out = allocator.alloc(u8, 32) catch @panic("oom");
+    @memset(out, 0);
+    out[31] = if (bls.pairingProductIsOne(pts)) 1 else 0;
+    return .{ .data = out, .gas = cost };
 }
 
 /// Write `m` as big-endian into `out` (left-zero-padded; high bytes dropped).
@@ -471,7 +720,7 @@ fn blake2f(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
 
 const Secp = std.crypto.ecc.Secp256k1;
 
-fn recoverAddress(msg: [32]u8, recid: u8, r_be: [32]u8, s_be: [32]u8) ?[20]u8 {
+pub fn recoverAddress(msg: [32]u8, recid: u8, r_be: [32]u8, s_be: [32]u8) ?[20]u8 {
     const Scalar = Secp.scalar.Scalar;
     // r, s must be in [1, n).
     const r = Scalar.fromBytes(r_be, .big) catch return null;

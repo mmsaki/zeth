@@ -9,7 +9,7 @@
 //!   eels <secured:0|1> <fixture.json> [more.json ...]
 
 const std = @import("std");
-const zeth = @import("zetherum");
+const zeth = @import("zeth");
 
 var g_color = true;
 fn clr(comptime code: []const u8) []const u8 {

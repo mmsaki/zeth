@@ -7,7 +7,8 @@
 //!   blocktest <fixture.json> [more.json ...]
 
 const std = @import("std");
-const zeth = @import("zetherum");
+const zeth = @import("zeth");
+const report = @import("report.zig");
 const Address = zeth.state.Address;
 
 var g_color = true;
@@ -32,7 +33,7 @@ fn shortName(n: []const u8) []const u8 {
 }
 
 /// Print which accounts/slots differ from the fixture's expected post state.
-fn diffState(st: *zeth.State, post: std.json.ObjectMap) void {
+fn diffState(rep: *report.Reporter, st: *zeth.State, post: std.json.ObjectMap) void {
     var it = post.iterator();
     while (it.next()) |e| {
         if (e.value_ptr.* != .object) continue;
@@ -40,15 +41,15 @@ fn diffState(st: *zeth.State, post: std.json.ObjectMap) void {
         const addr = addrH(tag);
         const exp = e.value_ptr.object;
         const wb = u256H(jstr(exp, "balance") orelse "0x0");
-        if (st.balanceOf(addr) != wb) std.debug.print("      {s} balance got {d} want {d}\n", .{ tag, st.balanceOf(addr), wb });
+        if (st.balanceOf(addr) != wb) rep.failLine("      {s} balance got {d} want {d}\n", .{ tag, st.balanceOf(addr), wb });
         const wn = u64H(jstr(exp, "nonce") orelse "0x0");
-        if (st.nonceOf(addr) != wn) std.debug.print("      {s} nonce got {d} want {d}\n", .{ tag, st.nonceOf(addr), wn });
+        if (st.nonceOf(addr) != wn) rep.failLine("      {s} nonce got {d} want {d}\n", .{ tag, st.nonceOf(addr), wn });
         if (exp.get("storage")) |sto| if (sto == .object) {
             var sit = sto.object.iterator();
             while (sit.next()) |s| if (s.value_ptr.* == .string) {
                 const key = u256H(s.key_ptr.*);
                 const wv = u256H(s.value_ptr.string);
-                if (st.getStorage(addr, key) != wv) std.debug.print("      {s} slot {x} got {x} want {x}\n", .{ tag, key, st.getStorage(addr, key), wv });
+                if (st.getStorage(addr, key) != wv) rep.failLine("      {s} slot {x} got {x} want {x}\n", .{ tag, key, st.getStorage(addr, key), wv });
             };
         };
     }
@@ -123,6 +124,50 @@ fn parseAccessList(a: std.mem.Allocator, tx_o: std.json.ObjectMap) []const zeth.
     return list.items;
 }
 
+/// RLP-encode a u256 as its minimal big-endian byte string (0 → empty/0x80).
+fn rlpQ(a: std.mem.Allocator, v: u256) []const u8 {
+    var buf: [32]u8 = undefined;
+    std.mem.writeInt(u256, &buf, v, .big);
+    var s: usize = 0;
+    while (s < 32 and buf[s] == 0) s += 1;
+    return zeth.rlp.encodeBytes(a, buf[s..]) catch @panic("oom");
+}
+
+/// Recover the sender of a legacy transaction from its (v, r, s) signature when
+/// the fixture doesn't give `sender` directly. Builds the EIP-155/pre-155
+/// signing hash by RLP-encoding the tx fields and runs secp256k1 recovery.
+fn recoverSender(a: std.mem.Allocator, tx_o: std.json.ObjectMap) ?Address {
+    const v = u64H(jstr(tx_o, "v") orelse return null);
+    const to_s = jstr(tx_o, "to") orelse "";
+    const to_bytes: []const u8 = if (to_s.len == 0 or std.mem.eql(u8, to_s, "0x")) &.{} else bytesH(a, to_s);
+
+    var items: std.ArrayList([]const u8) = .empty;
+    items.append(a, rlpQ(a, u256H(jstr(tx_o, "nonce") orelse "0x0"))) catch @panic("oom");
+    items.append(a, rlpQ(a, u256H(jstr(tx_o, "gasPrice") orelse "0x0"))) catch @panic("oom");
+    items.append(a, rlpQ(a, u256H(jstr(tx_o, "gasLimit") orelse "0x0"))) catch @panic("oom");
+    items.append(a, zeth.rlp.encodeBytes(a, to_bytes) catch @panic("oom")) catch @panic("oom");
+    items.append(a, rlpQ(a, u256H(jstr(tx_o, "value") orelse "0x0"))) catch @panic("oom");
+    items.append(a, zeth.rlp.encodeBytes(a, bytesH(a, jstr(tx_o, "data") orelse "0x")) catch @panic("oom")) catch @panic("oom");
+
+    var recid: u8 = undefined;
+    if (v == 27 or v == 28) {
+        recid = @intCast(v - 27);
+    } else {
+        const chain_id = (v - 35) / 2;
+        recid = @intCast((v - 35) % 2);
+        items.append(a, rlpQ(a, chain_id)) catch @panic("oom"); // EIP-155: chainId, 0, 0
+        items.append(a, zeth.rlp.encodeBytes(a, &.{}) catch @panic("oom")) catch @panic("oom");
+        items.append(a, zeth.rlp.encodeBytes(a, &.{}) catch @panic("oom")) catch @panic("oom");
+    }
+    const payload = zeth.rlp.encodeList(a, items.items) catch @panic("oom");
+    const hash = zeth.crypto.keccak256(payload);
+    var r: [32]u8 = undefined;
+    var s: [32]u8 = undefined;
+    std.mem.writeInt(u256, &r, u256H(jstr(tx_o, "r") orelse "0x0"), .big);
+    std.mem.writeInt(u256, &s, u256H(jstr(tx_o, "s") orelse "0x0"), .big);
+    return zeth.precompiles.recoverAddress(hash, recid, r, s);
+}
+
 const SYSTEM_ADDRESS = "0xfffffffffffffffffffffffffffffffffffffffe";
 
 /// Run a block-start system call (EIP-4788 / EIP-2935): invoke the system
@@ -144,7 +189,7 @@ fn systemCall(a: std.mem.Allocator, st: *zeth.State, env: *const zeth.Environmen
 
 /// Process one block's transactions and withdrawals against `st`. Returns false
 /// if the block's resulting state root disagrees with its header.
-fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap) bool {
+fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap, block_hashes: []const [32]u8) bool {
     const header = jobj(block, "blockHeader") orelse return false;
     const base_fee = u256H(jstr(header, "baseFeePerGas") orelse "0x0");
 
@@ -156,7 +201,10 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap) 
         .base_fee = base_fee,
         .prev_randao = u256H(jstr(header, "mixHash") orelse "0x0"),
         .chain_id = 1,
+        .block_hashes = block_hashes, // [genesis, block1, …] for the BLOCKHASH opcode
     };
+    // BLOBBASEFEE for any tx, from the block's excess blob gas.
+    env.blob_base_fee = zeth.tx.blobGasPrice(u256H(jstr(header, "excessBlobGas") orelse "0x0"));
 
     // Block-start system calls (EIP-4788 beacon roots, EIP-2935 history) write
     // state, so they must run before the transactions.
@@ -169,7 +217,11 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap) 
         for (txs) |tx_v| {
             if (tx_v != .object) continue;
             const tx_o = tx_v.object;
-            const sender = jstr(tx_o, "sender") orelse continue;
+            // Use the fixture's sender, or recover it from the signature.
+            const sender_addr: Address = if (jstr(tx_o, "sender")) |s|
+                addrH(s)
+            else
+                (recoverSender(a, tx_o) orelse continue);
 
             var gas_price: u256 = undefined;
             if (jstr(tx_o, "gasPrice")) |gp| {
@@ -180,11 +232,29 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap) 
                 gas_price = @min(mf, base_fee + mp);
             }
             env.gas_price = gas_price;
-            env.origin = addrH(sender);
+            env.origin = sender_addr;
+
+            // EIP-4844 blob transaction: charge the (burned) blob data fee and
+            // expose the versioned hashes + blob base fee to the EVM.
+            var blob_data_fee: u256 = 0;
+            if (jarr(tx_o, "blobVersionedHashes")) |bh| {
+                const excess = u256H(jstr(header, "excessBlobGas") orelse "0x0");
+                const price = zeth.tx.blobGasPrice(excess);
+                env.blob_base_fee = price;
+                blob_data_fee = @as(u256, zeth.tx.GAS_PER_BLOB) * bh.len * price;
+                var hashes = std.ArrayList([32]u8).empty;
+                for (bh) |h| if (h == .string) {
+                    var hh: [32]u8 = undefined;
+                    const hs = if (std.mem.startsWith(u8, h.string, "0x")) h.string[2..] else h.string;
+                    _ = std.fmt.hexToBytes(&hh, hs) catch {};
+                    hashes.append(a, hh) catch @panic("oom");
+                };
+                env.blob_versioned_hashes = hashes.items;
+            }
 
             const to_s = jstr(tx_o, "to") orelse "";
             const tx = zeth.tx.Tx{
-                .sender = addrH(sender),
+                .sender = sender_addr,
                 .to = if (to_s.len == 0 or std.mem.eql(u8, to_s, "0x")) null else addrH(to_s),
                 .nonce = u64H(jstr(tx_o, "nonce") orelse "0x0"),
                 .gas_limit = u64H(jstr(tx_o, "gasLimit") orelse "0x0"),
@@ -192,6 +262,7 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap) 
                 .value = u256H(jstr(tx_o, "value") orelse "0x0"),
                 .data = bytesH(a, jstr(tx_o, "data") orelse "0x"),
                 .access_list = parseAccessList(a, tx_o),
+                .blob_data_fee = blob_data_fee,
             };
             _ = zeth.tx.process(a, st, &env, tx);
         }
@@ -215,7 +286,7 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap) 
     return std.mem.eql(u8, &got, &want);
 }
 
-fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap) Verdict {
+fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name: []const u8, obj: std.json.ObjectMap) Verdict {
     const net = jstr(obj, "network") orelse return .skip;
     if (!std.mem.eql(u8, net, FORK)) return .skip;
     const pre = jobj(obj, "pre") orelse return .skip;
@@ -229,14 +300,29 @@ fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap) Ve
     defer st.deinit();
     loadPre(a, &st, pre);
 
+    // Block hashes for the BLOCKHASH opcode, indexed by block number:
+    // block_hashes[i] = hash of block i, starting with the genesis block.
+    var block_hashes: std.ArrayList([32]u8) = .empty;
+    const appendHash = struct {
+        fn f(al: *std.ArrayList([32]u8), alloc: std.mem.Allocator, hdr: std.json.ObjectMap) void {
+            if (jstr(hdr, "hash")) |h| {
+                var hh: [32]u8 = undefined;
+                const s = if (std.mem.startsWith(u8, h, "0x")) h[2..] else h;
+                _ = std.fmt.hexToBytes(&hh, s) catch return;
+                al.append(alloc, hh) catch {};
+            }
+        }
+    }.f;
+
     // Sanity: our pre-state root must match the genesis header before any block.
     if (jobj(obj, "genesisBlockHeader")) |gh| {
+        appendHash(&block_hashes, a, gh);
         if (jstr(gh, "stateRoot")) |sr| {
             const got = zeth.trie.stateRoot(a, &st);
             var want: [32]u8 = undefined;
             _ = std.fmt.hexToBytes(&want, sr[2..]) catch {};
             if (!std.mem.eql(u8, &got, &want)) {
-                std.debug.print("  {s}FAIL{s} {s}\n      {s}genesis state root differs (pre-state load){s}\n", .{ clr(RED), clr(RESET), shortName(name), clr(DIM), clr(RESET) });
+                rep.failLine("  {s}{s}{s}\n    {s}{s}{s} genesis state root differs (pre-state load)\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET) });
                 return .fail;
             }
         }
@@ -248,36 +334,35 @@ fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap) Ve
         // Blocks expected to be rejected are skipped (state unchanged).
         if (block.get("expectException") != null) continue;
         if (block.get("blockHeader") == null) continue;
-        if (!applyBlock(a, &st, block)) {
-            std.debug.print("  {s}FAIL{s} {s}\n      {s}block {d} post-state root differs:{s}\n", .{ clr(RED), clr(RESET), shortName(name), clr(DIM), bn, clr(RESET) });
-            if (jobj(obj, "postState")) |ps| diffState(&st, ps);
+        if (!applyBlock(a, &st, block, block_hashes.items)) {
+            rep.failLine("  {s}{s}{s}\n    {s}{s}{s} block {d} post-state root differs:\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET), bn });
+            if (jobj(obj, "postState")) |ps| diffState(rep, &st, ps);
             return .fail;
         }
+        if (jobj(block, "blockHeader")) |bh| appendHash(&block_hashes, a, bh);
     }
     return .pass;
 }
 
-fn runFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Tally {
-    var t = Tally{};
-    const content = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return t;
+fn runFile(gpa: std.mem.Allocator, io: std.Io, rep: *report.Reporter, path: []const u8) void {
+    const content = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return;
     defer gpa.free(content);
-    var parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch return t;
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch return;
     defer parsed.deinit();
-    if (parsed.value != .object) return t;
+    if (parsed.value != .object) return;
 
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
-        switch (runTest(gpa, entry.key_ptr.*, entry.value_ptr.object)) {
-            .pass => t.pass += 1,
+        switch (runTest(gpa, rep, path, entry.key_ptr.*, entry.value_ptr.object)) {
+            .pass => rep.passed(),
             .fail => {
-                t.fail += 1;
-                if (g_stop) break;
+                rep.failed();
+                if (g_stop) return;
             },
-            .skip => t.skip += 1,
+            .skip => rep.skipped(),
         }
     }
-    return t;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -288,21 +373,17 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("ZETH_TRACE") != null) zeth.vm.trace_enabled = true;
     if (init.environ_map.get("ZETH_ALL") != null) g_stop = false;
     if (args.len < 2) {
-        std.debug.print("usage: blocktest <fixture.json> ...\n", .{});
+        std.debug.print("usage: blocktest <fixture.json | dir> ...\n", .{});
         return error.MissingArgument;
     }
 
-    var total = Tally{};
-    for (args[1..]) |path| {
-        const t = runFile(gpa, init.io, path);
-        total.pass += t.pass;
-        total.fail += t.fail;
-        total.skip += t.skip;
-        if (g_stop and total.fail > 0) break;
+    const files = try report.collectJson(gpa, init.io, args[1..]);
+    var rep = report.Reporter{ .alloc = gpa, .color = g_color };
+    std.debug.print("  ", .{});
+    for (files) |path| {
+        runFile(gpa, init.io, &rep, path);
+        if (g_stop and rep.fail > 0) break;
     }
-    const ok = total.fail == 0;
-    std.debug.print("\n{s}{s}{d} passed{s}, {d} failed, {s}{d} skipped{s}\n", .{
-        clr(BOLD), if (ok) clr(GREEN) else clr(RED), total.pass, clr(RESET), total.fail, clr(YELLOW), total.skip, clr(RESET),
-    });
+    const ok = rep.finish("BlockchainTests");
     if (!ok) return error.ConformanceFailed;
 }
