@@ -176,9 +176,9 @@ fn updateMac(mac: *Keccak256, mac_secret: [32]u8, seed: [16]u8) [16]u8 {
     var digest: [32]u8 = undefined;
     peek(mac.*, &digest);
     var enc: [16]u8 = undefined;
-    // AES-128 ECB on the first 16 bytes of mac_secret (RLPx uses the leading
-    // 128 bits of the 256-bit mac-secret as the MAC block-cipher key).
-    const ctx = std.crypto.core.aes.Aes128.initEnc(mac_secret[0..16].*);
+    // AES-256 ECB keyed with the full 32-byte mac-secret (RLPx encrypts the
+    // running MAC digest with the mac-secret to seed each MAC step).
+    const ctx = Aes256.initEnc(mac_secret);
     ctx.encrypt(&enc, digest[0..16]);
     for (0..16) |i| enc[i] ^= seed[i];
     mac.update(&enc);
