@@ -20,5 +20,13 @@ if [ -d /blocks ]; then
   while IFS= read -r f; do RLP_ARGS+=("$f"); done < <(ls /blocks/*.rlp 2>/dev/null | sort)
 fi
 
-echo "zeth: starting node (genesis + ${#RLP_ARGS[@]} rlp file(s))"
-exec /usr/local/bin/zeth node "$GENESIS" "${RLP_ARGS[@]}" --http.addr=0.0.0.0:8545
+# Enable the Engine API (authrpc + JWT) for post-merge chains, like geth/reth.
+# hive's engine simulators use the well-known fixed test secret.
+AUTH_ARGS=()
+if [ -n "${HIVE_TERMINAL_TOTAL_DIFFICULTY}" ] || [ -n "${HIVE_SHANGHAI_TIMESTAMP}" ] || [ -n "${HIVE_CANCUN_TIMESTAMP}" ]; then
+  echo -n "7365637265747365637265747365637265747365637265747365637265747365" > /jwt.secret
+  AUTH_ARGS=(--authrpc.addr=0.0.0.0:8551 --authrpc.jwtsecret=/jwt.secret)
+fi
+
+echo "zeth: starting node (genesis + ${#RLP_ARGS[@]} rlp file(s); engine=${#AUTH_ARGS[@]})"
+exec /usr/local/bin/zeth node "$GENESIS" "${RLP_ARGS[@]}" --http.addr=0.0.0.0:8545 "${AUTH_ARGS[@]}"
