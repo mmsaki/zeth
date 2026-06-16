@@ -1252,9 +1252,21 @@ pub const Evm = struct {
 
         const ext = try self.extendMemory(&.{ .{ in_start, in_size }, .{ out_start, out_size } });
         const access_gas: u64 = if (self.state.accessAddress(code_address)) Gas.WARM_ACCESS else Gas.COLD_ACCOUNT_ACCESS;
+        // EIP-7702: if the target is a delegated EOA, pay an extra cold/warm
+        // charge to access the delegate. `genericCall` runs the delegate's code
+        // (keeping code_address = the target, which also disables precompiles).
+        var deleg_gas: u64 = 0;
+        if (self.env.fork.atLeast(.prague)) {
+            const tcode = self.state.codeOf(code_address);
+            if (tcode.len == 23 and tcode[0] == 0xef and tcode[1] == 0x01 and tcode[2] == 0x00) {
+                var del: Address = undefined;
+                @memcpy(&del, tcode[3..23]);
+                deleg_gas = if (self.state.accessAddress(del)) Gas.WARM_ACCESS else Gas.COLD_ACCOUNT_ACCESS;
+            }
+        }
         const create_gas: u64 = if (kind == .call and value != 0 and !self.accountAlive(to)) Gas.NEW_ACCOUNT else 0;
         const transfer_gas: u64 = if (transfers_value) Gas.CALL_VALUE else 0;
-        const extra_gas: u64 = access_gas + create_gas + transfer_gas;
+        const extra_gas: u64 = access_gas + deleg_gas + create_gas + transfer_gas;
 
         const mcg = messageCallGas(transfers_value, gas_req, self.gas_left, ext.cost, extra_gas);
         try self.chargeGasWide(mcg.cost + ext.cost);
@@ -1322,7 +1334,15 @@ pub const Evm = struct {
             return;
         }
         const call_data = self.memRead(p.in_start, p.in_size);
-        const code = self.state.codeOf(p.code_address);
+        // EIP-7702: follow a delegation indicator — execute the delegate's code
+        // in the target's context. `code_address` stays the target so precompile
+        // dispatch is suppressed (a delegation to a precompile runs nothing).
+        var code = self.state.codeOf(p.code_address);
+        if (self.env.fork.atLeast(.prague) and code.len == 23 and code[0] == 0xef and code[1] == 0x01 and code[2] == 0x00) {
+            var del: Address = undefined;
+            @memcpy(&del, code[3..23]);
+            code = self.state.codeOf(del);
+        }
 
         var child = processMessage(self.allocator, self.state, self.env, .{
             .caller = p.caller,
