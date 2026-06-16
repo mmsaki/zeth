@@ -1096,10 +1096,12 @@ pub const Evm = struct {
         const mem_size = try self.stack.pop();
         const ext = try self.extendMemory(&.{.{ mem_start, mem_size }});
         const word_count = numWords(mem_size);
-        // EIP-3860 init-code word cost (CREATE2 additionally hashes the code).
-        try self.chargeGasWide(Gas.CREATE_BASE + Gas.CODE_INIT_PER_WORD * word_count + ext.cost);
+        // EIP-3860 (Shanghai+): init-code word cost + size limit.
+        const eip3860 = self.env.fork.atLeast(.shanghai);
+        const init_cost: u64 = if (eip3860) Gas.CODE_INIT_PER_WORD * word_count else 0;
+        try self.chargeGasWide(Gas.CREATE_BASE + init_cost + ext.cost);
         try self.growMemory(ext.expand_by);
-        if (mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas; // EIP-3860
+        if (eip3860 and mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas;
         if (self.is_static) return error.StaticStateChange;
 
         const create_gas = self.gas_left - self.gas_left / 64; // EIP-150 63/64
@@ -1120,11 +1122,13 @@ pub const Evm = struct {
         const salt = word.toBeBytes32(try self.stack.pop());
         const ext = try self.extendMemory(&.{.{ mem_start, mem_size }});
         const words = numWords(mem_size);
-        // CREATE2 also pays to hash the init code (KECCAK per-word).
-        try self.chargeGasWide(Gas.CREATE_BASE + Gas.KECCAK_PER_WORD * words +
-            Gas.CODE_INIT_PER_WORD * words + ext.cost);
+        // CREATE2 always pays to hash the init code (KECCAK per-word, since
+        // Constantinople); EIP-3860 (Shanghai+) adds the init-code word cost + limit.
+        const eip3860 = self.env.fork.atLeast(.shanghai);
+        const init_cost: u64 = if (eip3860) Gas.CODE_INIT_PER_WORD * words else 0;
+        try self.chargeGasWide(Gas.CREATE_BASE + Gas.KECCAK_PER_WORD * words + init_cost + ext.cost);
         try self.growMemory(ext.expand_by);
-        if (mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas; // EIP-3860
+        if (eip3860 and mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas;
         if (self.is_static) return error.StaticStateChange;
 
         const create_gas = self.gas_left - self.gas_left / 64; // EIP-150
@@ -1371,9 +1375,10 @@ pub const Evm = struct {
             self.state.setBalance(originator, 0) catch @panic("out of memory");
         }
 
-        // EIP-6780: only actually delete the account (and burn its balance) if it
-        // was created in this same transaction.
-        if (self.state.wasCreatedThisTx(originator)) {
+        // EIP-6780 (Cancun+): only delete the account (and burn its balance) if it
+        // was created in this same transaction. Pre-Cancun, SELFDESTRUCT always
+        // deletes.
+        if (!self.env.fork.atLeast(.cancun) or self.state.wasCreatedThisTx(originator)) {
             self.state.setBalance(originator, 0) catch @panic("out of memory");
             self.accounts_to_delete.put(self.allocator, originator, {}) catch @panic("out of memory");
         }

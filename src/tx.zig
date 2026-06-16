@@ -66,13 +66,15 @@ const FLOOR_PER_TOKEN: u64 = 10; // EIP-7623
 
 const Intrinsic = struct { standard: u64, floor: u64 };
 
-fn intrinsicGas(data: []const u8, is_create: bool) Intrinsic {
+fn intrinsicGas(data: []const u8, is_create: bool, eip3860: bool) Intrinsic {
     var zero: u64 = 0;
     var nonzero: u64 = 0;
     for (data) |b| {
         if (b == 0) zero += 1 else nonzero += 1;
     }
-    const create_extra: u64 = if (is_create) TX_CREATE + INIT_WORD * ((data.len + 31) / 32) else 0;
+    // EIP-3860 (Shanghai) adds a per-word init-code cost to creation intrinsic.
+    const init_word_cost: u64 = if (eip3860) INIT_WORD * ((data.len + 31) / 32) else 0;
+    const create_extra: u64 = if (is_create) TX_CREATE + init_word_cost else 0;
     const standard: u64 = TX_BASE + zero * 4 + nonzero * 16 + create_extra;
     // EIP-7623 calldata floor — a minimum on the *final* gas used, not intrinsic.
     // The floor is a pure calldata price: no create or EVM costs are included.
@@ -129,11 +131,12 @@ pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: 
     // The transaction's gas limit may not exceed the block gas limit.
     if (tx.gas_limit > env.gas_limit) return .gas_limit_exceeds_block;
 
-    // EIP-3860: a creation transaction's init code is bounded.
-    if (tx.to == null and tx.data.len > vm.MAX_INIT_CODE_SIZE) return .init_code_too_large;
+    // EIP-3860 (Shanghai+): a creation transaction's init code is bounded.
+    const eip3860 = env.fork.atLeast(.shanghai);
+    if (eip3860 and tx.to == null and tx.data.len > vm.MAX_INIT_CODE_SIZE) return .init_code_too_large;
 
     // Intrinsic gas must fit within the gas limit.
-    const ig = intrinsicGas(tx.data, tx.to == null);
+    const ig = intrinsicGas(tx.data, tx.to == null, eip3860);
     var intrinsic = ig.standard;
     for (tx.access_list) |e| intrinsic += ACCESS_LIST_ADDRESS + ACCESS_LIST_KEY * e.keys.len;
     if (tx.gas_limit < intrinsic) return .intrinsic_gas_too_low;
@@ -171,7 +174,7 @@ pub fn processWithReceipt(allocator: std.mem.Allocator, state: *State, env: *con
 
 fn processImpl(allocator: std.mem.Allocator, state: *State, env: *const vm.Environment, tx: Tx, logs_out: ?*std.ArrayList(vm.Log)) Result {
     state.beginTx(); // reset access lists / transient / originals / created set
-    const ig = intrinsicGas(tx.data, tx.to == null);
+    const ig = intrinsicGas(tx.data, tx.to == null, env.fork.atLeast(.shanghai));
     var intrinsic = ig.standard;
     for (tx.access_list) |e| intrinsic += ACCESS_LIST_ADDRESS + ACCESS_LIST_KEY * e.keys.len;
 
