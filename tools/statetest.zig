@@ -21,7 +21,16 @@ const GREEN = "\x1b[32m";
 const RED = "\x1b[31m";
 const YELLOW = "\x1b[33m";
 
-const FORK = "Prague";
+/// A fork to evaluate, paired with the fixture `post` key naming it.
+const ForkVariant = struct { name: []const u8, fork: zeth.Fork };
+/// Forks we run by default — every fixture is checked against each. Override the
+/// set with ZETH_FORK=<name> (e.g. for debugging a single fork).
+const DEFAULT_FORKS = [_]ForkVariant{
+    .{ .name = "Cancun", .fork = .cancun },
+    .{ .name = "Prague", .fork = .prague },
+};
+var g_forks: []const ForkVariant = &DEFAULT_FORKS;
+var g_single: [1]ForkVariant = undefined; // backing store when ZETH_FORK is set
 var g_stop = true; // stop at the first failure (like a compiler); ZETH_ALL=1 runs everything
 var g_data_filter: ?usize = null; // ZETH_DATA=N runs only data index N (debugging)
 
@@ -134,9 +143,10 @@ fn jint(o: std.json.ObjectMap, key: []const u8) ?usize {
     return if (v == .integer) @intCast(v.integer) else null;
 }
 
-fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name: []const u8, obj: std.json.ObjectMap) Verdict {
+fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name: []const u8, obj: std.json.ObjectMap, variant: ForkVariant) Verdict {
+    const g_fork = variant.fork;
     const post = jobj(obj, "post") orelse return .skip;
-    const entries_v = post.get(FORK) orelse return .skip; // no Prague vector
+    const entries_v = post.get(variant.name) orelse return .skip; // no vector for this fork
     if (entries_v != .array) return .skip;
     const env_o = jobj(obj, "env") orelse return .skip;
     const tx_o = jobj(obj, "transaction") orelse return .skip;
@@ -165,6 +175,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
 
         const base_fee = u256FromHex(jstr(env_o, "currentBaseFee") orelse "0x0");
         var env = zeth.Environment{
+            .fork = g_fork,
             .coinbase = addrFromHex(jstr(env_o, "currentCoinbase") orelse "0x0"),
             .number = u64FromHex(jstr(env_o, "currentNumber") orelse "0x0"),
             .time = u256FromHex(jstr(env_o, "currentTimestamp") orelse "0x0"),
@@ -174,9 +185,10 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
             .chain_id = 1,
         };
         if (jstr(env_o, "currentRandom")) |r| env.prev_randao = u256FromHex(r);
+        if (jstr(env_o, "currentDifficulty")) |d| env.difficulty = u256FromHex(d);
         // BLOBBASEFEE is the blob gas price for the current excess blob gas,
         // regardless of whether this is a blob transaction.
-        env.blob_base_fee = zeth.tx.blobGasPrice(u256FromHex(jstr(env_o, "currentExcessBlobGas") orelse "0x0"));
+        env.blob_base_fee = zeth.tx.blobGasPrice(u256FromHex(jstr(env_o, "currentExcessBlobGas") orelse "0x0"), g_fork);
 
         // Effective gas price (legacy gasPrice or 1559 fee market), plus the raw
         // fee cap / priority used for pre-execution validation.
@@ -200,7 +212,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
         var blob_ok = true;
         if (tx_o.get("maxFeePerBlobGas") != null or tx_o.get("blobVersionedHashes") != null) {
             const excess = u256FromHex(jstr(env_o, "currentExcessBlobGas") orelse "0x0");
-            const price = zeth.tx.blobGasPrice(excess);
+            const price = zeth.tx.blobGasPrice(excess, g_fork);
             const max_fee_per_blob_gas = u256FromHex(jstr(tx_o, "maxFeePerBlobGas") orelse "0x0");
             env.blob_base_fee = price;
             const bh = jarr(tx_o, "blobVersionedHashes");
@@ -211,7 +223,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
             // and blob txs may not be contract creations.
             if (blob_count == 0) blob_ok = false;
             if (max_fee_per_blob_gas < price) blob_ok = false;
-            if (@as(u256, zeth.tx.GAS_PER_BLOB) * blob_count > zeth.tx.MAX_BLOB_GAS_PER_BLOCK) blob_ok = false;
+            if (@as(u256, zeth.tx.GAS_PER_BLOB) * blob_count > zeth.tx.maxBlobGasPerBlock(g_fork)) blob_ok = false;
             if (jstr(tx_o, "to")) |t| {
                 if (t.len == 0 or std.mem.eql(u8, t, "0x")) blob_ok = false;
             } else blob_ok = false;
@@ -259,7 +271,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
         };
 
         // Reject invalid transactions outright (state stays at the pre-state).
-        if (blob_ok and zeth.tx.validate(&st, &env, tx, max_fee_cap, max_prio)) {
+        if (blob_ok and zeth.tx.validate(&st, &env, tx, max_fee_cap, max_prio) == null) {
             _ = zeth.tx.process(a, &st, &env, tx);
         }
         const got = zeth.trie.stateRoot(a, &st);
@@ -289,15 +301,36 @@ fn runFile(gpa: std.mem.Allocator, io: std.Io, rep: *report.Reporter, path: []co
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
-        switch (runTest(gpa, rep, path, entry.key_ptr.*, entry.value_ptr.object)) {
-            .pass => rep.passed(),
-            .fail => {
-                rep.failed();
-                if (g_stop) return;
-            },
-            .skip => rep.skipped(),
+        for (g_forks) |variant| {
+            switch (runTest(gpa, rep, path, entry.key_ptr.*, entry.value_ptr.object, variant)) {
+                .pass => rep.passed(),
+                .fail => {
+                    rep.failed();
+                    if (g_stop) return;
+                },
+                .skip => rep.skipped(),
+            }
         }
     }
+}
+
+const USAGE =
+    \\usage: statetest [flags] <fixture.json | dir> ...
+    \\
+    \\flags:
+    \\  --all            run every fixture (don't stop at the first failure)
+    \\  --fork <name>    run only fixtures for this fork (e.g. --fork London)
+    \\  --data <n>       run only the transaction with this data index
+    \\  --trace          print an opcode trace
+;
+
+/// Pin the runner to a single fork (used by `--fork`/ZETH_FORK).
+fn setSingleFork(name: []const u8) !void {
+    g_single[0] = .{ .name = name, .fork = zeth.fork.Fork.fromName(name) orelse {
+        std.debug.print("unknown fork: {s}\n", .{name});
+        return error.MissingArgument;
+    } };
+    g_forks = &g_single;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -308,19 +341,67 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("ZETH_TRACE") != null) zeth.vm.trace_enabled = true;
     if (init.environ_map.get("ZETH_ALL") != null) g_stop = false; // run past failures
     if (init.environ_map.get("ZETH_DATA")) |d| g_data_filter = std.fmt.parseInt(usize, d, 10) catch null;
-    if (args.len < 2) {
-        std.debug.print("usage: statetest <fixture.json | dir> ...\n", .{});
+    if (init.environ_map.get("ZETH_FORK")) |f| setSingleFork(f) catch return error.MissingArgument;
+
+    // CLI flags (preferred; env vars above remain a silent fallback). Remaining
+    // args are fixture paths.
+    var paths: std.ArrayList([]const u8) = .empty;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--all")) {
+            g_stop = false;
+        } else if (std.mem.eql(u8, arg, "--trace")) {
+            zeth.vm.trace_enabled = true;
+        } else if (std.mem.eql(u8, arg, "--fork")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("--fork requires a name (e.g. --fork London)\n", .{});
+                return error.MissingArgument;
+            }
+            setSingleFork(args[i]) catch return error.MissingArgument;
+        } else if (std.mem.startsWith(u8, arg, "--fork=")) {
+            setSingleFork(arg["--fork=".len..]) catch return error.MissingArgument;
+        } else if (std.mem.startsWith(u8, arg, "--data=")) {
+            g_data_filter = std.fmt.parseInt(usize, arg["--data=".len..], 10) catch null;
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            std.debug.print("{s}\n", .{USAGE});
+            return;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("unknown flag: {s}\n{s}\n", .{ arg, USAGE });
+            return error.MissingArgument;
+        } else {
+            paths.append(gpa, arg) catch return error.OutOfMemory;
+        }
+    }
+    if (paths.items.len == 0) {
+        std.debug.print("{s}\n", .{USAGE});
         return error.MissingArgument;
     }
 
-    const files = try report.collectJson(gpa, init.io, args[1..]);
+    const files = try report.collectJson(gpa, init.io, paths.items);
     var rep = report.Reporter{ .alloc = gpa, .color = g_color };
     std.debug.print("  ", .{}); // indent the first graph row
-    for (files) |path| {
-        runFile(gpa, init.io, &rep, path);
-        if (g_stop and rep.fail > 0) break; // stop at the first failure
-    }
+    // Run on a thread with a large stack: a fixture can drive the EVM to its
+    // 1024-deep call recursion, which overflows the default main-thread stack.
+    var ctx = RunCtx{ .gpa = gpa, .io = init.io, .rep = &rep, .files = files };
+    const t = try std.Thread.spawn(.{ .stack_size = zeth.vm.NATIVE_STACK_SIZE }, runFilesWorker, .{&ctx});
+    t.join();
 
     const ok = rep.finish("GeneralStateTests");
     if (!ok) return error.ConformanceFailed;
+}
+
+const RunCtx = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    rep: *report.Reporter,
+    files: []const []const u8,
+};
+
+fn runFilesWorker(ctx: *RunCtx) void {
+    for (ctx.files) |path| {
+        runFile(ctx.gpa, ctx.io, ctx.rep, path);
+        if (g_stop and ctx.rep.fail > 0) break; // stop at the first failure
+    }
 }

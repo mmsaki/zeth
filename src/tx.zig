@@ -7,10 +7,28 @@
 const std = @import("std");
 const vm = @import("vm.zig");
 const state_mod = @import("state.zig");
+const rlp = @import("rlp.zig");
+const crypto = @import("crypto.zig");
+const precompiles = @import("precompiles.zig");
 const Address = state_mod.Address;
 const State = state_mod.State;
+const Fork = @import("fork.zig").Fork;
+
+/// secp256k1 group order; EIP-2 / EIP-7702 require s ≤ n/2 and 0 < r,s < n.
+const SECP256K1N: u256 = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141;
 
 pub const AccessEntry = struct { address: Address, keys: []const u256 };
+
+/// EIP-7702 authorization tuple `[chainId, address, nonce, yParity, r, s]`. The
+/// authority (signer) is recovered when the delegation is applied at tx start.
+pub const Authorization = struct {
+    chain_id: u256 = 0,
+    address: Address = state_mod.zero_address,
+    nonce: u64 = 0,
+    y_parity: u8 = 0,
+    r: u256 = 0,
+    s: u256 = 0,
+};
 
 pub const Tx = struct {
     sender: Address,
@@ -24,27 +42,47 @@ pub const Tx = struct {
     /// EIP-4844 blob data fee (total_blob_gas × blob_gas_price), paid upfront
     /// and burned (never refunded).
     blob_data_fee: u256 = 0,
+    /// EIP-7702 (type-4) authorizations. Applied as delegations at tx start.
+    authorizations: []const Authorization = &.{},
 };
 
 pub const GAS_PER_BLOB: u64 = 1 << 17; // 131072
-pub const MAX_BLOB_GAS_PER_BLOCK: u64 = 1179648; // Prague: 9 blobs
-const BLOB_BASE_FEE_UPDATE_FRACTION: u256 = 5007716;
+
+/// Max blob gas a block may carry: Cancun allows 6 blobs, Prague raises it to 9
+/// (EIP-7691).
+pub fn maxBlobGasPerBlock(fork: Fork) u64 {
+    return if (fork.atLeast(.prague)) 1179648 else 786432;
+}
+
+/// Target blob gas per block: Cancun 3 blobs, Prague 6 (EIP-7691). The header's
+/// excessBlobGas must equal max(0, parent_excess + parent_used - target).
+pub fn targetBlobGasPerBlock(fork: Fork) u64 {
+    return (if (fork.atLeast(.prague)) @as(u64, 6) else 3) * GAS_PER_BLOB;
+}
+
+/// EIP-4844 blob base-fee update fraction. EIP-7691 retunes it for Prague.
+fn blobBaseFeeUpdateFraction(fork: Fork) u256 {
+    return if (fork.atLeast(.prague)) 5007716 else 3338477;
+}
 
 /// `taylor_exponential(1, excess_blob_gas, fraction)` — the EIP-4844 blob gas
 /// price (a fake-exponential approximation).
-pub fn blobGasPrice(excess_blob_gas: u256) u256 {
+pub fn blobGasPrice(excess_blob_gas: u256, fork: Fork) u256 {
+    const fraction = blobBaseFeeUpdateFraction(fork);
     var output: u256 = 0;
-    var numerator_accum: u256 = BLOB_BASE_FEE_UPDATE_FRACTION; // factor(1) × denominator
+    var numerator_accum: u256 = fraction; // factor(1) × denominator
     var i: u256 = 1;
     while (numerator_accum > 0) : (i += 1) {
         output += numerator_accum;
-        numerator_accum = (numerator_accum * excess_blob_gas) / (BLOB_BASE_FEE_UPDATE_FRACTION * i);
+        numerator_accum = (numerator_accum * excess_blob_gas) / (fraction * i);
     }
-    return output / BLOB_BASE_FEE_UPDATE_FRACTION;
+    return output / fraction;
 }
 
 const ACCESS_LIST_ADDRESS: u64 = 2400;
 const ACCESS_LIST_KEY: u64 = 1900;
+const AUTH_PER_EMPTY_ACCOUNT: u64 = 25000; // EIP-7702 intrinsic per authorization
+const REFUND_AUTH_PER_EXISTING_ACCOUNT: u64 = 12500; // refund for an existing authority
 
 pub const Result = struct { gas_used: u64, success: bool };
 
@@ -55,13 +93,15 @@ const FLOOR_PER_TOKEN: u64 = 10; // EIP-7623
 
 const Intrinsic = struct { standard: u64, floor: u64 };
 
-fn intrinsicGas(data: []const u8, is_create: bool) Intrinsic {
+fn intrinsicGas(data: []const u8, is_create: bool, eip3860: bool) Intrinsic {
     var zero: u64 = 0;
     var nonzero: u64 = 0;
     for (data) |b| {
         if (b == 0) zero += 1 else nonzero += 1;
     }
-    const create_extra: u64 = if (is_create) TX_CREATE + INIT_WORD * ((data.len + 31) / 32) else 0;
+    // EIP-3860 (Shanghai) adds a per-word init-code cost to creation intrinsic.
+    const init_word_cost: u64 = if (eip3860) INIT_WORD * ((data.len + 31) / 32) else 0;
+    const create_extra: u64 = if (is_create) TX_CREATE + init_word_cost else 0;
     const standard: u64 = TX_BASE + zero * 4 + nonzero * 16 + create_extra;
     // EIP-7623 calldata floor — a minimum on the *final* gas used, not intrinsic.
     // The floor is a pure calldata price: no create or EVM costs are included.
@@ -76,48 +116,171 @@ fn isValidDelegation(code: []const u8) bool {
     return code.len == 23 and code[0] == 0xef and code[1] == 0x01 and code[2] == 0x00;
 }
 
-/// Pre-execution transaction validity (EELS `check_transaction`). A failing
-/// transaction is rejected outright and leaves the state untouched, so callers
-/// must run this before `process`. `max_fee_cap`/`max_prio` are the raw 1559
-/// fields (for a legacy tx pass gas_price as the cap and 0 as the priority).
-pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: u256, max_prio: u256) bool {
+/// Minimal big-endian RLP encoding of a 256-bit quantity (leading zeros dropped).
+fn encodeQuantity(a: std.mem.Allocator, value: u256) ![]u8 {
+    var buf: [32]u8 = undefined;
+    std.mem.writeInt(u256, &buf, value, .big);
+    var start: usize = 0;
+    while (start < buf.len and buf[start] == 0) start += 1;
+    return rlp.encodeBytes(a, buf[start..]);
+}
+
+/// Recover the authority (signer) of an EIP-7702 authorization, or null if the
+/// signature is malformed. signing_hash = keccak256(0x05 ‖ rlp([chainId,
+/// address, nonce])); the recovery enforces the EIP-2 low-s and r/s bounds.
+fn recoverAuthority(a: std.mem.Allocator, auth: Authorization) ?Address {
+    if (auth.y_parity > 1) return null;
+    if (auth.r == 0 or auth.r >= SECP256K1N) return null;
+    if (auth.s == 0 or auth.s > SECP256K1N / 2) return null;
+
+    const items = [_][]const u8{
+        encodeQuantity(a, auth.chain_id) catch return null,
+        rlp.encodeBytes(a, &auth.address) catch return null,
+        encodeQuantity(a, auth.nonce) catch return null,
+    };
+    const list = rlp.encodeList(a, &items) catch return null;
+    const pre = a.alloc(u8, 1 + list.len) catch return null;
+    pre[0] = 0x05; // SET_CODE_TX_MAGIC
+    @memcpy(pre[1..], list);
+    const h = crypto.keccak256(pre);
+
+    var rb: [32]u8 = undefined;
+    var sb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &rb, auth.r, .big);
+    std.mem.writeInt(u256, &sb, auth.s, .big);
+    return precompiles.recoverAddress(h, auth.y_parity, rb, sb);
+}
+
+/// Apply EIP-7702 authorizations at the start of a type-4 transaction: for each
+/// valid authorization, set the authority's code to the delegation indicator
+/// (or clear it when the target is the zero address) and bump its nonce. These
+/// writes happen before the EVM runs and persist even if execution reverts.
+/// Returns the gas refund accrued for authorities that already existed.
+fn applyDelegations(a: std.mem.Allocator, state: *State, env: *const vm.Environment, auths: []const Authorization) u64 {
+    var refund: u64 = 0;
+    for (auths) |auth| {
+        // chain_id must be 0 (any chain) or this chain.
+        if (auth.chain_id != 0 and auth.chain_id != @as(u256, env.chain_id)) continue;
+        if (auth.nonce == std.math.maxInt(u64)) continue;
+        const authority = recoverAuthority(a, auth) orelse continue;
+        _ = state.accessAddress(authority);
+        // An authority that already holds non-delegation code is not an EOA.
+        const code = state.codeOf(authority);
+        if (code.len != 0 and !isValidDelegation(code)) continue;
+        if (state.nonceOf(authority) != auth.nonce) continue;
+        // Refund the difference for an authority account that already exists.
+        if (state.exists(authority)) refund += AUTH_PER_EMPTY_ACCOUNT - REFUND_AUTH_PER_EXISTING_ACCOUNT;
+        if (std.mem.allEqual(u8, &auth.address, 0)) {
+            state.setCode(authority, &.{}) catch @panic("oom"); // clear delegation
+        } else {
+            var dcode = std.mem.zeroes([23]u8);
+            dcode[0] = 0xef;
+            dcode[1] = 0x01;
+            dcode[2] = 0x00;
+            @memcpy(dcode[3..], &auth.address);
+            state.setCode(authority, &dcode) catch @panic("oom");
+        }
+        state.setNonce(authority, state.nonceOf(authority) + 1) catch @panic("oom");
+    }
+    return refund;
+}
+
+/// Why a transaction is invalid. `message()` returns a descriptive string the
+/// Engine API surfaces as `validationError` (and an EEST exception mapper can
+/// map to TransactionException types).
+pub const InvalidReason = enum {
+    fee_cap_below_base_fee,
+    tip_above_fee_cap,
+    gas_limit_exceeds_block,
+    init_code_too_large,
+    intrinsic_gas_too_low,
+    nonce_too_high,
+    nonce_mismatch,
+    insufficient_funds,
+    sender_not_eoa,
+    set_code_creation,
+
+    pub fn message(self: InvalidReason) []const u8 {
+        return switch (self) {
+            .fee_cap_below_base_fee => "max fee per gas less than block base fee",
+            .tip_above_fee_cap => "max priority fee per gas higher than max fee per gas",
+            .gas_limit_exceeds_block => "transaction gas limit exceeds block gas limit",
+            .init_code_too_large => "max initcode size exceeded",
+            .intrinsic_gas_too_low => "intrinsic gas too low",
+            .nonce_too_high => "nonce too high",
+            .nonce_mismatch => "nonce mismatch",
+            .insufficient_funds => "insufficient funds for gas * price + value",
+            .sender_not_eoa => "sender not an eoa",
+            .set_code_creation => "set code transaction must not be a contract creation",
+        };
+    }
+};
+
+/// Pre-execution transaction validity (EELS `check_transaction`) → the reason
+/// it is invalid, or null if valid. A failing transaction is rejected outright
+/// and leaves the state untouched, so callers must run this before `process`.
+/// `max_fee_cap`/`max_prio` are the raw 1559 fields (for a legacy tx pass
+/// gas_price as the cap and 0 as the priority).
+pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: u256, max_prio: u256) ?InvalidReason {
     // EIP-1559 fee-cap sanity.
-    if (max_fee_cap < env.base_fee) return false;
-    if (max_fee_cap < max_prio) return false;
+    if (max_fee_cap < env.base_fee) return .fee_cap_below_base_fee;
+    if (max_fee_cap < max_prio) return .tip_above_fee_cap;
 
     // The transaction's gas limit may not exceed the block gas limit.
-    if (tx.gas_limit > env.gas_limit) return false;
+    if (tx.gas_limit > env.gas_limit) return .gas_limit_exceeds_block;
 
-    // EIP-3860: a creation transaction's init code is bounded.
-    if (tx.to == null and tx.data.len > vm.MAX_INIT_CODE_SIZE) return false;
+    // EIP-3860 (Shanghai+): a creation transaction's init code is bounded.
+    const eip3860 = env.fork.atLeast(.shanghai);
+    if (eip3860 and tx.to == null and tx.data.len > vm.MAX_INIT_CODE_SIZE) return .init_code_too_large;
+
+    // EIP-7702 (type-4): a set-code transaction must carry at least one
+    // authorization and may not be a contract creation.
+    if (tx.authorizations.len > 0 and tx.to == null) return .set_code_creation;
 
     // Intrinsic gas must fit within the gas limit.
-    const ig = intrinsicGas(tx.data, tx.to == null);
+    const ig = intrinsicGas(tx.data, tx.to == null, eip3860);
     var intrinsic = ig.standard;
     for (tx.access_list) |e| intrinsic += ACCESS_LIST_ADDRESS + ACCESS_LIST_KEY * e.keys.len;
-    if (tx.gas_limit < intrinsic) return false;
+    intrinsic += AUTH_PER_EMPTY_ACCOUNT * tx.authorizations.len;
+    // EIP-7623 (Prague): the gas limit must also cover the calldata floor, since
+    // the transaction is charged at least that much regardless of execution.
+    const required: u64 = if (env.fork.atLeast(.prague)) @max(intrinsic, ig.floor) else intrinsic;
+    if (tx.gas_limit < required) return .intrinsic_gas_too_low;
 
     // Nonce must match exactly, and must leave room to increment (EELS rejects
     // a nonce of U64.MAX_VALUE so sender.nonce + 1 cannot overflow).
-    if (tx.nonce >= std.math.maxInt(u64)) return false;
-    if (state.nonceOf(tx.sender) != tx.nonce) return false;
+    if (tx.nonce >= std.math.maxInt(u64)) return .nonce_too_high;
+    if (state.nonceOf(tx.sender) != tx.nonce) return .nonce_mismatch;
 
     // The sender must be able to cover the worst-case fee plus value. Compute in
     // u512 since gas_limit * max_fee_cap can exceed u256 for adversarial prices.
     const max_gas_fee: u512 = @as(u512, tx.gas_limit) * max_fee_cap + tx.blob_data_fee + tx.value;
-    if (@as(u512, state.balanceOf(tx.sender)) < max_gas_fee) return false;
+    if (@as(u512, state.balanceOf(tx.sender)) < max_gas_fee) return .insufficient_funds;
 
-    // EIP-3607: the sender must be an EOA (no code), unless it carries a valid
-    // EIP-7702 delegation.
+    // EIP-3607: the sender must be an EOA (no code). Prague (EIP-7702) makes one
+    // exception — an account carrying a valid delegation indicator still
+    // originates transactions; pre-Prague, any code disqualifies the sender.
     const code = state.codeOf(tx.sender);
-    if (code.len != 0 and !isValidDelegation(code)) return false;
+    if (code.len != 0) {
+        if (!(env.fork.atLeast(.prague) and isValidDelegation(code))) return .sender_not_eoa;
+    }
 
-    return true;
+    return null;
 }
 
 pub fn process(allocator: std.mem.Allocator, state: *State, env: *const vm.Environment, tx: Tx) Result {
+    return processImpl(allocator, state, env, tx, null);
+}
+
+/// Like `process`, but on success also appends the transaction's logs (deep-
+/// copied from `allocator`) to `logs_out` — the inputs a receipt needs.
+pub fn processWithReceipt(allocator: std.mem.Allocator, state: *State, env: *const vm.Environment, tx: Tx, logs_out: *std.ArrayList(vm.Log)) Result {
+    return processImpl(allocator, state, env, tx, logs_out);
+}
+
+fn processImpl(allocator: std.mem.Allocator, state: *State, env: *const vm.Environment, tx: Tx, logs_out: ?*std.ArrayList(vm.Log)) Result {
     state.beginTx(); // reset access lists / transient / originals / created set
-    const ig = intrinsicGas(tx.data, tx.to == null);
+    const ig = intrinsicGas(tx.data, tx.to == null, env.fork.atLeast(.shanghai));
     var intrinsic = ig.standard;
     for (tx.access_list) |e| intrinsic += ACCESS_LIST_ADDRESS + ACCESS_LIST_KEY * e.keys.len;
 
@@ -130,9 +293,13 @@ pub fn process(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
 
     // EIP-2929 / EIP-3651 pre-warming.
     _ = state.accessAddress(tx.sender);
-    _ = state.accessAddress(env.coinbase);
+    // EIP-3651 (Shanghai+) pre-warms the coinbase; pre-Shanghai it stays cold.
+    if (env.fork.atLeast(.shanghai)) _ = state.accessAddress(env.coinbase);
+    // EIP-2929 pre-warms the precompiles. The active range is fork-dependent:
+    // Cancun ends at KZG (0x0a), Prague adds the BLS set through 0x11.
+    const last_precompile: u8 = if (env.fork.atLeast(.prague)) 0x11 else if (env.fork.atLeast(.cancun)) 0x0a else 0x09;
     var p: u8 = 1;
-    while (p <= 0x11) : (p += 1) { // EIP-2929 warms the precompiles 0x01–0x11
+    while (p <= last_precompile) : (p += 1) {
         var a = state_mod.zero_address;
         a[19] = p;
         _ = state.accessAddress(a);
@@ -142,16 +309,36 @@ pub fn process(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
         for (e.keys) |k| _ = state.accessStorage(e.address, k);
     }
 
+    // EIP-7702 (Prague): apply the type-4 authorizations as delegations. The
+    // code/nonce writes persist regardless of how execution ends; the refund is
+    // added to the (capped) total refund below, also regardless of outcome.
+    intrinsic += AUTH_PER_EMPTY_ACCOUNT * tx.authorizations.len;
+    const auth_refund: u64 = if (tx.authorizations.len > 0)
+        applyDelegations(allocator, state, env, tx.authorizations)
+    else
+        0;
+
     const exec_gas = tx.gas_limit - intrinsic;
 
     var evm: vm.Evm = undefined;
     if (tx.to) |to| {
         _ = state.accessAddress(to);
+        // Follow a delegation indicator at the top level: run the delegate's
+        // code in `to`'s storage context (EIP-7702). `code_address` stays `to`
+        // (not the delegate) so a delegation to a precompile address runs
+        // nothing — EELS disables precompiles for the top-level delegated call.
+        var code = state.codeOf(to);
+        if (isValidDelegation(code)) {
+            var del: Address = undefined;
+            @memcpy(&del, code[3..23]);
+            _ = state.accessAddress(del);
+            code = state.codeOf(del);
+        }
         evm = vm.processMessage(allocator, state, env, .{
             .caller = tx.sender,
             .current_target = to,
             .code_address = to,
-            .code = state.codeOf(to),
+            .code = code,
             .gas = exec_gas,
             .value = tx.value,
             .data = tx.data,
@@ -165,6 +352,7 @@ pub fn process(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
             .code = tx.data,
             .gas = exec_gas,
             .value = tx.value,
+            .trace_type = "CREATE",
         }, null);
     }
     defer evm.deinit();
@@ -172,16 +360,30 @@ pub fn process(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
     const success = evm.halt_error == null and !evm.reverted;
     var gas_used = tx.gas_limit - evm.gas_left;
 
-    // EIP-3529 refund, capped at gas_used / 5.
-    if (success) {
-        var refund: i64 = evm.refund_counter;
+    // Capture logs for the receipt (only a successful tx contributes logs).
+    if (logs_out) |out| if (success) {
+        for (evm.logs.items) |lg| {
+            out.append(allocator, .{
+                .address = lg.address,
+                .topics = allocator.dupe([32]u8, lg.topics) catch @panic("oom"),
+                .data = allocator.dupe(u8, lg.data) catch @panic("oom"),
+            }) catch @panic("oom");
+        }
+    };
+
+    // EIP-3529 refund, capped at gas_used / 5. The EIP-7702 authorization refund
+    // is part of the total and applies even when execution reverts; the EVM's
+    // own (SSTORE/selfdestruct) refund only counts on success.
+    {
+        var refund: i64 = @intCast(auth_refund);
+        if (success) refund += evm.refund_counter;
         if (refund < 0) refund = 0;
         const max_refund: u64 = gas_used / 5;
         const applied: u64 = @min(@as(u64, @intCast(refund)), max_refund);
         gas_used -= applied;
     }
-    // EIP-7623: the transaction pays at least the calldata floor.
-    gas_used = @max(gas_used, ig.floor);
+    // EIP-7623 (Prague): the transaction pays at least the calldata floor.
+    if (env.fork.atLeast(.prague)) gas_used = @max(gas_used, ig.floor);
 
     // Refund the sender the unused gas, and pay the coinbase the priority fee.
     const sender_refund: u256 = @as(u256, tx.gas_limit - gas_used) * tx.gas_price;

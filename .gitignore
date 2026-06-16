@@ -14,6 +14,10 @@ gevm
 evmone
 hive
 py_ecc
+hive-python-api
+execution-apis
+ethereum-package-kurtosis
+devp2p
 
 # Python
 __pycache__/
@@ -24,3 +28,5 @@ ethereum-tests/
 
 # Hive integration test framework (large clone)
 hive/
+zig-out-linux/
+eest-fixtures/

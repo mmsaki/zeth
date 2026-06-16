@@ -26,23 +26,55 @@ Prints gas used, the stack, and memory.
 
 ## Tests
 
-```sh
-make test          # Zig unit tests
-make eels          # TrieTests + a slice of GeneralStateTests, root-checked
-make conformance   # GeneralStateTests (stops at the first failure)
-make hive-tests    # BlockchainTests (stops at the first failure)
-make report        # full sweep of both suites: ✓/✗ graph + pass rate
-```
-
-`make conformance` and `make hive-tests` stop at the first failure (like a
-compiler). Prefix with `ALL=1` to run the whole suite past failures:
+Tests are grouped by **where the fixtures come from**:
 
 ```sh
-ALL=1 make hive-tests
+make test           # unit tests — our own Zig `test {}` blocks (fast inner loop)
+make test-ethereum  # ethereum/tests   — classic EF repo: state + blockchain + trie
+make test-eest      # execution-spec-tests — modern EF fixtures, ALL forks (local)
+make test-hive      # hive — Docker: drives the EEST fixtures at a live zeth over RPC
+make test-all       # everything local (no Docker): the three above
 ```
 
-Official fixtures live under `ethereum-tests/` (gitignored). `ZETH_TRACE=1`
-prints a per-opcode execution trace; `ZETH_DATA=N` runs only data index `N`.
+`test-eest` runs the *same* fixtures hive feeds the client, just locally and far
+faster. Populate them once (extracted from the hive simulator image, ~4 GB):
+
+```sh
+make fixtures-eest
+```
+
+The two fixture runners (`blocktest`, `statetest`) take flags directly:
+
+```sh
+./zig-out/bin/blocktest --all --fork London eest-fixtures/blockchain_tests
+#   --all   run past failures   --fork <name>  one fork only
+#   --import drive the real node pipeline   --trace  per-opcode trace
+```
+
+Without `--all` they stop at the first failure (like a compiler). Run
+`blocktest --help` / `statetest --help` for the full flag list. Fixtures live
+under `ethereum-tests/` and `eest-fixtures/` (both gitignored).
+
+## Running a node / networking
+
+zeth can serve JSON-RPC + the Engine API, persist to disk (`--datadir`), and
+**sync a chain from a real peer over devp2p** (RLPx + eth/69) — verified against
+geth on a Kurtosis devnet (synced 233 blocks; head hash matched geth exactly).
+
+- **[docs/production.md](docs/production.md)** — what works today vs what's left,
+  how to run the node, and an honest production-readiness status. **Read this
+  before running zeth anywhere that matters — it is not yet a mainnet client.**
+- **[docs/kurtosis.md](docs/kurtosis.md)** — stand up a local devnet and test
+  zeth against a real geth/reth node (handshake + header download).
+
+```sh
+# Sync from a peer on startup, persist, then serve JSON-RPC — a syncing node:
+zeth node <genesis.json> --peer=<enode://…> --datadir=DIR --http.addr=HOST:PORT
+
+zeth node <genesis.json> [chain.rlp ...] --datadir=DIR   # import/serve, no peer
+zeth sync <enode://…> <genesis.json> --datadir=DIR       # sync-only into a datadir
+zeth p2p  <enode://…> <networkId> <genesisHash>          # devp2p interop probe
+```
 
 ## Benchmark
 
@@ -63,4 +95,8 @@ alongside Mgas/s throughput.
 | `src/tx.zig` | transaction processing + validation |
 | `src/precompiles.zig` | precompiles (incl. bn254, BLS12-381, KZG) |
 | `src/bn254.zig`, `src/bls12_381.zig` | pairing-friendly curve crypto |
-| `tools/` | conformance runners (`statetest`, `blocktest`, `eels`) |
+| `src/chain.zig` | block-import pipeline + in-memory chain |
+| `src/db.zig`, `src/store.zig` | durable KV store + typed block/state persistence |
+| `src/ecies.zig`, `src/secp.zig`, `src/rlpx.zig`, `src/handshake.zig` | devp2p transport (ECIES, ECDSA, RLPx frames, auth/ack) |
+| `src/eth_proto.zig`, `src/forkid.zig`, `src/peer.zig` | eth/69 messages, EIP-2124 forkid, TCP peer |
+| `tools/` | fixture-test runners (`statetest`, `blocktest`, `eels`) |

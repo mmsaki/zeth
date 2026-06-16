@@ -10,19 +10,21 @@ const state_mod = @import("state.zig");
 const bn254 = @import("bn254.zig");
 const bls = @import("bls12_381.zig");
 const Address = state_mod.Address;
+const Fork = @import("fork.zig").Fork;
 
 pub const Output = struct { data: []u8, gas: u64 };
 
 /// Return the precompile id if `addr` is an implemented precompile, else null.
 /// 0x01–0x09 (classic), 0x0b (BLS12-381 G1ADD). 0x0a (KZG) and the rest of the
 /// BLS set are not yet implemented, so they are not treated as precompiles.
-pub fn idOf(addr: Address) ?u8 {
+pub fn idOf(addr: Address, fork: Fork) ?u8 {
     for (addr[0..19]) |b| if (b != 0) return null;
     const id = addr[19];
+    // 0x01–0x09 are active for every fork we currently target (Cancun+).
     if (id >= 1 and id <= 0x09) return id;
-    if (id == 0x0a) return id; // KZG point evaluation (EIP-4844)
-    // BLS12-381: G1ADD, G1MSM, G2ADD, G2MSM, PAIRING.
-    if (id >= 0x0b and id <= 0x11) return id;
+    if (id == 0x0a) return if (fork.atLeast(.cancun)) id else null; // KZG (EIP-4844)
+    // BLS12-381 (EIP-2537): G1ADD/G1MSM/G2ADD/G2MSM/PAIRING/MAP_FP/MAP_FP2 — Prague.
+    if (id >= 0x0b and id <= 0x11) return if (fork.atLeast(.prague)) id else null;
     return null;
 }
 
@@ -155,9 +157,14 @@ fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?
     const max_len: u512 = @max(base_len, mod_len);
     const w: u512 = (max_len + 7) / 8;
     const mult_complexity: u512 = w * w;
-    // If the multiplication term alone can't be afforded, reject before the
-    // (potentially enormous) iteration-count multiply.
-    if (mult_complexity > @as(u512, gas_available) * 3) return null;
+    // The cost is max(200, mult_complexity * max(iters,1) / 3), so its lower
+    // bound (iters == 1) is floor(mult_complexity / 3). If even that exceeds the
+    // gas available, reject before the (potentially enormous) iteration-count
+    // multiply. Comparing the *floored* term — not `mult_complexity > gas*3` —
+    // avoids rejecting inputs whose true cost is affordable (e.g. a 1024-byte
+    // operand costing exactly floor(16384/3) gas). After this guard passes,
+    // mult_complexity <= 3*gas + 2, so the iteration multiply stays within u512.
+    if (mult_complexity / 3 > gas_available) return null;
     const iters: u512 = blk: {
         const head = modexpExpHead(input, base_len, exp_len);
         const head_bits: u512 = if (head == 0) 0 else 256 - @clz(head);
@@ -206,6 +213,14 @@ fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?
             mulmod(allocator, &result, &result, &result, &mod);
             if (byte & bit != 0) mulmod(allocator, &result, &result, &base, &mod);
         }
+    }
+    // Reduce the initial `1` modulo the modulus for the empty/zero-exponent case
+    // (base**0 == 1, but 1 mod 1 == 0): the loop above never ran, so `result` is
+    // still the unreduced 1. mulmod keeps it reduced whenever the loop executes.
+    {
+        var q = Managed.init(allocator) catch @panic("oom");
+        defer q.deinit();
+        q.divFloor(&result, &result, &mod) catch @panic("oom"); // result %= mod
     }
     writeBigBe(result, out);
     return .{ .data = out, .gas = cost };
@@ -763,11 +778,13 @@ const testing = std.testing;
 
 test "idOf detects precompile range" {
     var a = state_mod.zero_address;
-    try testing.expectEqual(@as(?u8, null), idOf(a));
+    try testing.expectEqual(@as(?u8, null), idOf(a, .prague));
     a[19] = 4;
-    try testing.expectEqual(@as(?u8, 4), idOf(a));
+    try testing.expectEqual(@as(?u8, 4), idOf(a, .prague));
+    // BLS (0x0b) is a precompile on Prague but not on Cancun.
     a[19] = 0x0b;
-    try testing.expectEqual(@as(?u8, null), idOf(a));
+    try testing.expectEqual(@as(?u8, 0x0b), idOf(a, .prague));
+    try testing.expectEqual(@as(?u8, null), idOf(a, .cancun));
 }
 
 test "identity returns input" {
@@ -805,6 +822,24 @@ test "modexp 3^2 mod 5 = 4" {
     defer testing.allocator.free(out.data);
     try testing.expectEqual(@as(usize, 1), out.data.len);
     try testing.expectEqual(@as(u8, 4), out.data[0]);
+}
+
+test "modexp large operand gas boundary (EIP-2565)" {
+    // base_len=0, exp_len=0, mod_len=1024 -> mult_complexity = ceil(1024/8)^2
+    // = 128^2 = 16384, iters = max(0,1) = 1, cost = max(200, 16384/3) = 5461.
+    // Regression: the early-reject guard must use floor(mult/3), not mult>gas*3,
+    // or it spuriously OOGs an input whose true cost is exactly affordable.
+    var input: [96 + 1024]u8 = std.mem.zeroes([96 + 1024]u8);
+    input[64 + 30] = 0x04; // mod_len high byte: 0x0400 = 1024
+    // Exactly enough gas must succeed.
+    const ok = run(testing.allocator, 5, &input, 5461);
+    try testing.expect(ok != null);
+    if (ok) |o| {
+        try testing.expectEqual(@as(u64, 5461), o.gas);
+        testing.allocator.free(o.data);
+    }
+    // One gas short must out-of-gas.
+    try testing.expect(run(testing.allocator, 5, &input, 5460) == null);
 }
 
 test "sha256 of empty" {
