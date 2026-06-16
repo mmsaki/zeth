@@ -22,6 +22,7 @@ pub const rpc = @import("rpc.zig");
 pub const db = @import("db.zig");
 pub const store = @import("store.zig");
 pub const ecies = @import("ecies.zig");
+pub const rlpx = @import("rlpx.zig");
 
 pub const Evm = vm.Evm;
 pub const Op = vm.Op;
