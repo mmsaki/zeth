@@ -36,8 +36,9 @@ pub const ETH_VERSION: u64 = 68;
 /// Split a frame body into its message id and the remaining payload RLP.
 pub fn splitMessage(frame: []const u8) !struct { id: u64, payload: []const u8 } {
     if (frame.len == 0) return error.EmptyMessage;
-    // The id is a single RLP integer: 0x00..0x7f encode as themselves; a small
-    // string header (0x81) wraps a single byte ≥ 0x80.
+    // The id is a single RLP integer: 0 encodes as the empty string 0x80;
+    // 0x01..0x7f encode as themselves; a byte ≥ 0x80 is wrapped as 0x81 ‖ byte.
+    if (frame[0] == 0x80) return .{ .id = 0, .payload = frame[1..] };
     if (frame[0] < 0x80) return .{ .id = frame[0], .payload = frame[1..] };
     if (frame[0] == 0x81 and frame.len >= 2) return .{ .id = frame[1], .payload = frame[2..] };
     return error.BadMessageId;
