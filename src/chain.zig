@@ -28,6 +28,7 @@ fn addr(comptime hex: []const u8) Address {
 }
 
 pub const ImportError = error{
+    InvalidTransaction,
     BadParent,
     StateRootMismatch,
     TransactionsRootMismatch,
@@ -270,8 +271,7 @@ pub const Chain = struct {
             env.blob_versioned_hashes = dt.blob_versioned_hashes;
             const blob_fee: u256 = @as(u256, txmod.GAS_PER_BLOB) * dt.blob_versioned_hashes.len * env.blob_base_fee;
 
-            var logs: std.ArrayList(vm.Log) = .empty;
-            const res = txmod.processWithReceipt(a, self.state, &env, .{
+            const tx = txmod.Tx{
                 .sender = dt.sender,
                 .to = dt.to,
                 .nonce = dt.nonce,
@@ -281,7 +281,15 @@ pub const Chain = struct {
                 .data = dt.data,
                 .access_list = dt.access_list,
                 .blob_data_fee = blob_fee,
-            }, &logs);
+            };
+            // A block is invalid if any transaction is invalid (intrinsic gas,
+            // nonce, balance, fee caps, EIP-3607/3860). The state-test runner
+            // skips such blocks; the Engine API must reject them.
+            if (!txmod.validate(self.state, &env, tx, dt.max_fee, dt.max_priority_fee))
+                return error.InvalidTransaction;
+
+            var logs: std.ArrayList(vm.Log) = .empty;
+            const res = txmod.processWithReceipt(a, self.state, &env, tx, &logs);
             cumulative_gas += res.gas_used;
             receipts.append(a, .{
                 .tx_type = dt.tx_type,
