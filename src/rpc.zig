@@ -65,10 +65,15 @@ fn blockJson(a: std.mem.Allocator, c: *const chain_mod.Chain, number: u64) ?[]co
     p(a, &buf, ",\"miner\":\"{s}\",\"difficulty\":\"{s}\",\"extraData\":\"{s}\"", .{ dataHex(a, &h.coinbase), qHex(a, h.difficulty), dataHex(a, h.extra_data) });
     p(a, &buf, ",\"gasLimit\":\"{s}\",\"gasUsed\":\"{s}\",\"timestamp\":\"{s}\"", .{ qHex(a, h.gas_limit), qHex(a, h.gas_used), qHex(a, h.timestamp) });
     p(a, &buf, ",\"mixHash\":\"{s}\"", .{hash32Hex(a, h.prev_randao)});
+    // Fork-additive fields. EEST's consume-rlp validates the RPC block against a
+    // fork-specific header model, so every field the fork mandates must be
+    // present (Cancun: blob gas + parentBeaconBlockRoot; Prague: requestsHash).
     if (h.base_fee_per_gas) |bf| p(a, &buf, ",\"baseFeePerGas\":\"{s}\"", .{qHex(a, bf)});
     if (h.withdrawals_root) |wr| p(a, &buf, ",\"withdrawalsRoot\":\"{s}\"", .{hash32Hex(a, wr)});
     if (h.blob_gas_used) |g| p(a, &buf, ",\"blobGasUsed\":\"{s}\"", .{qHex(a, g)});
     if (h.excess_blob_gas) |g| p(a, &buf, ",\"excessBlobGas\":\"{s}\"", .{qHex(a, g)});
+    if (h.parent_beacon_block_root) |r| p(a, &buf, ",\"parentBeaconBlockRoot\":\"{s}\"", .{hash32Hex(a, r)});
+    if (h.requests_hash) |r| p(a, &buf, ",\"requestsHash\":\"{s}\"", .{hash32Hex(a, r)});
     buf.appendSlice(a, ",\"transactions\":[],\"uncles\":[]}") catch @panic("oom");
     return buf.items;
 }
