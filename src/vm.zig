@@ -320,6 +320,22 @@ pub const Op = enum(u8) {
     _,
 };
 
+/// The fork that introduced `op`, or null if it has existed since Frontier.
+/// Drives opcode-availability gating: an opcode is an invalid instruction
+/// before its activation fork.
+fn opcodeMinFork(op: Op) ?Fork {
+    return switch (op) {
+        .DELEGATECALL => .homestead,
+        .RETURNDATASIZE, .RETURNDATACOPY, .STATICCALL, .REVERT => .byzantium,
+        .SHL, .SHR, .SAR, .EXTCODEHASH, .CREATE2 => .constantinople,
+        .CHAINID, .SELFBALANCE => .istanbul,
+        .BASEFEE => .london,
+        .PUSH0 => .shanghai,
+        .TLOAD, .TSTORE, .MCOPY, .BLOBHASH, .BLOBBASEFEE => .cancun,
+        else => null,
+    };
+}
+
 /// Block- and transaction-level context shared across an entire message tree.
 pub const Environment = struct {
     fork: Fork = .osaka, // default to the latest fork
@@ -522,6 +538,12 @@ pub const Evm = struct {
             sink.append(self.allocator, .{ .pc = self.pc, .op = self.code[self.pc], .gas = self.gas_left, .depth = self.message.depth, .stack = snap }) catch {};
         }
         const op: Op = @enumFromInt(self.code[self.pc]);
+        // Opcode availability: a fork-introduced opcode is an invalid
+        // instruction before its activation fork (e.g. PUSH0 pre-Shanghai,
+        // BASEFEE pre-London, SHL/CREATE2 pre-Constantinople).
+        if (opcodeMinFork(op)) |mf| {
+            if (!self.env.fork.atLeast(mf)) return error.InvalidOpcode;
+        }
         switch (op) {
             .STOP => {
                 self.running = false;
