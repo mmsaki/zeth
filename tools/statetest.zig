@@ -185,6 +185,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
             .chain_id = 1,
         };
         if (jstr(env_o, "currentRandom")) |r| env.prev_randao = u256FromHex(r);
+        if (jstr(env_o, "currentDifficulty")) |d| env.difficulty = u256FromHex(d);
         // BLOBBASEFEE is the blob gas price for the current excess blob gas,
         // regardless of whether this is a blob transaction.
         env.blob_base_fee = zeth.tx.blobGasPrice(u256FromHex(jstr(env_o, "currentExcessBlobGas") orelse "0x0"), g_fork);
@@ -336,11 +337,26 @@ pub fn main(init: std.process.Init) !void {
     const files = try report.collectJson(gpa, init.io, args[1..]);
     var rep = report.Reporter{ .alloc = gpa, .color = g_color };
     std.debug.print("  ", .{}); // indent the first graph row
-    for (files) |path| {
-        runFile(gpa, init.io, &rep, path);
-        if (g_stop and rep.fail > 0) break; // stop at the first failure
-    }
+    // Run on a thread with a large stack: a fixture can drive the EVM to its
+    // 1024-deep call recursion, which overflows the default main-thread stack.
+    var ctx = RunCtx{ .gpa = gpa, .io = init.io, .rep = &rep, .files = files };
+    const t = try std.Thread.spawn(.{ .stack_size = zeth.vm.NATIVE_STACK_SIZE }, runFilesWorker, .{&ctx});
+    t.join();
 
     const ok = rep.finish("GeneralStateTests");
     if (!ok) return error.ConformanceFailed;
+}
+
+const RunCtx = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    rep: *report.Reporter,
+    files: []const []const u8,
+};
+
+fn runFilesWorker(ctx: *RunCtx) void {
+    for (ctx.files) |path| {
+        runFile(ctx.gpa, ctx.io, ctx.rep, path);
+        if (g_stop and ctx.rep.fail > 0) break; // stop at the first failure
+    }
 }

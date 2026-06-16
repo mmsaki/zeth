@@ -29,6 +29,16 @@ pub const Fork = enum(u8) {
         return @intFromEnum(self) >= @intFromEnum(other);
     }
 
+    /// PoW static block reward in wei (paid to the miner/coinbase). Drops from
+    /// 5 → 3 → 2 ETH across Byzantium/Constantinople; zero once PoS begins.
+    pub fn blockReward(self: Fork) u256 {
+        const ETH: u256 = 1_000_000_000_000_000_000;
+        if (self.atLeast(.paris)) return 0;
+        if (self.atLeast(.constantinople)) return 2 * ETH;
+        if (self.atLeast(.byzantium)) return 3 * ETH;
+        return 5 * ETH;
+    }
+
     /// Resolve a test-fixture network name (e.g. "Cancun", "Prague") to a Fork.
     pub fn fromName(name: []const u8) ?Fork {
         const table = .{

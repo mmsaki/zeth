@@ -143,6 +143,14 @@ pub const STACK_DEPTH_LIMIT: u32 = 1024;
 /// Maximum operand stack size.
 pub const STACK_LIMIT: usize = 1024;
 
+/// Native stack required to execute a transaction. Each EVM call frame recurses
+/// through processMessage→genericCall→callOp→run→step on the native stack, so a
+/// contract reaching the 1024-deep call limit needs far more than the default
+/// thread allowance. Threads that run the EVM (the node's RPC/Engine handlers,
+/// the conformance runners) must be spawned with at least this stack size. The
+/// reservation is virtual; only touched pages are committed.
+pub const NATIVE_STACK_SIZE: usize = 256 * 1024 * 1024;
+
 /// EIP-3860: maximum init-code length (2 * MAX_CODE_SIZE).
 pub const MAX_INIT_CODE_SIZE: u256 = 49152;
 
@@ -320,6 +328,7 @@ pub const Environment = struct {
     number: u64 = 0,
     time: u256 = 0,
     prev_randao: u256 = 0, // post-Merge value behind opcode 0x44
+    difficulty: u256 = 0, // pre-Merge PoW difficulty behind opcode 0x44
     base_fee: u256 = 0,
     blob_base_fee: u256 = 0,
     gas_limit: u64 = 0,
@@ -575,7 +584,8 @@ pub const Evm = struct {
             .COINBASE => try self.pushCtx(Gas.BASE, state_mod.addressToWord(self.env.coinbase)),
             .TIMESTAMP => try self.pushCtx(Gas.BASE, self.env.time),
             .NUMBER => try self.pushCtx(Gas.BASE, self.env.number),
-            .DIFFICULTY => try self.pushCtx(Gas.BASE, self.env.prev_randao),
+            // Opcode 0x44 is DIFFICULTY pre-Merge, PREVRANDAO post-Merge (EIP-4399).
+            .DIFFICULTY => try self.pushCtx(Gas.BASE, if (self.env.fork.atLeast(.paris)) self.env.prev_randao else self.env.difficulty),
             .GASLIMIT => try self.pushCtx(Gas.BASE, self.env.gas_limit),
             .CHAINID => try self.pushCtx(Gas.BASE, self.env.chain_id),
             .SELFBALANCE => try self.selfbalance(),
