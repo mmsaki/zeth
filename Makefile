@@ -5,7 +5,10 @@
 ZIG ?= zig
 ARGS ?=
 
-.PHONY: all build test bench bench-loop conformance eels run fmt fmt-check clean
+.PHONY: all build test bench bench-loop conformance eels run fmt fmt-check clean hive-stage
+
+# Linux target for the hive client image (matches Docker Desktop's platform).
+HIVE_TARGET ?= aarch64-linux-musl
 
 all: build
 
@@ -40,6 +43,15 @@ conformance:
 	$(ZIG) build -Doptimize=ReleaseFast
 	ZETH_ALL=1 ./zig-out/bin/statetest ethereum-tests/GeneralStateTests
 	ZETH_ALL=1 ./zig-out/bin/blocktest ethereum-tests/BlockchainTests
+
+## Cross-compile a static-Linux zeth and stage the hive client adapter into
+## hive/clients/zeth (run `./hive --client zeth --sim ethereum/eels/consume-rlp`).
+hive-stage:
+	$(ZIG) build -Dtarget=$(HIVE_TARGET) -Doptimize=ReleaseFast
+	mkdir -p hive/clients/zeth
+	cp hive-client/Dockerfile hive-client/zeth.sh hive-client/mapper.jq hive-client/enode.sh hive/clients/zeth/
+	cp zig-out/bin/zeth hive/clients/zeth/zeth
+	@echo "staged hive/clients/zeth/ ($(HIVE_TARGET) binary + adapter)"
 
 ## Execute hex bytecode: `make run ARGS="0x6006600701"`.
 run:

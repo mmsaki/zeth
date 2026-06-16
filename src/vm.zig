@@ -642,6 +642,17 @@ pub const Evm = struct {
         self.memory.expand(by) catch return error.OutOfGas;
     }
 
+    /// Read a memory region given raw 256-bit operands. A zero-size region is
+    /// empty and triggers no memory expansion, so its offset is never read nor
+    /// even narrowed to usize — the offset may legally exceed memory size (and
+    /// exceed usize) when size is 0 (e.g. LOG/RETURN/CALL with size 0).
+    fn memRead(self: *Evm, start: u256, size: u256) []u8 {
+        if (size == 0) return &.{};
+        const s: usize = @intCast(start);
+        const n: usize = @intCast(size);
+        return self.memory.data[s .. s + n];
+    }
+
     fn mstore(self: *Evm) VmError!void {
         const start = try self.stack.pop();
         const value = word.toBeBytes32(try self.stack.pop());
@@ -674,12 +685,15 @@ pub const Evm = struct {
     }
 
     /// Copy bytes from `src` (with zero padding past the end) into memory.
-    fn copyToMemory(self: *Evm, src: []const u8, src_start: u256, mem_start: usize, size: usize) void {
+    fn copyToMemory(self: *Evm, src: []const u8, src_start: u256, mem_start: u256, size: u256) void {
+        if (size == 0) return; // no copy, no memory growth — offset never narrowed
+        const ms: usize = @intCast(mem_start);
+        const n: usize = @intCast(size);
         var i: usize = 0;
-        while (i < size) : (i += 1) {
+        while (i < n) : (i += 1) {
             // u512 so a near-2²⁵⁶ source offset can't wrap into a valid index.
             const si: u512 = @as(u512, src_start) + i;
-            self.memory.data[mem_start + i] = if (si < src.len) src[@intCast(si)] else 0;
+            self.memory.data[ms + i] = if (si < src.len) src[@intCast(si)] else 0;
         }
     }
 
@@ -697,7 +711,7 @@ pub const Evm = struct {
             .calldata => self.message.data,
             .code => self.code,
         };
-        self.copyToMemory(src, data_start, @intCast(mem_start), @intCast(size));
+        self.copyToMemory(src, data_start, mem_start, size);
         self.pc += 1;
     }
 
@@ -744,7 +758,7 @@ pub const Evm = struct {
         const words = numWords(size);
         try self.chargeGasWide(@as(u128, self.accessAddressCost(addr)) + Gas.COPY_PER_WORD * words + ext.cost);
         try self.growMemory(ext.expand_by);
-        self.copyToMemory(self.state.codeOf(addr), code_start, @intCast(mem_start), @intCast(size));
+        self.copyToMemory(self.state.codeOf(addr), code_start, mem_start, size);
         self.pc += 1;
     }
 
@@ -772,7 +786,7 @@ pub const Evm = struct {
         // EIP-211: reading past the end of the return-data buffer is illegal.
         if (@as(u512, data_start) + @as(u512, size) > self.return_data.len) return error.OutOfBounds;
         try self.growMemory(ext.expand_by);
-        self.copyToMemory(self.return_data, data_start, @intCast(mem_start), @intCast(size));
+        self.copyToMemory(self.return_data, data_start, mem_start, size);
         self.pc += 1;
     }
 
@@ -901,8 +915,7 @@ pub const Evm = struct {
             return error.StaticStateChange; // LOG mutates state (EIP-214)
         }
 
-        const at: usize = @intCast(mem_start);
-        const data = self.allocator.dupe(u8, self.memory.data[at .. at + @as(usize, @intCast(size))]) catch @panic("out of memory");
+        const data = self.allocator.dupe(u8, self.memRead(mem_start, size)) catch @panic("out of memory");
         self.logs.append(self.allocator, .{
             .address = self.message.current_target,
             .topics = topics,
@@ -944,8 +957,7 @@ pub const Evm = struct {
         const ext = try self.extendMemory(&.{.{ start, size }});
         try self.chargeGasWide(ext.cost);
         try self.growMemory(ext.expand_by);
-        const at: usize = @intCast(start);
-        self.output = self.memory.data[at .. at + @as(usize, @intCast(size))];
+        self.output = self.memRead(start, size);
         self.running = false;
     }
 
@@ -956,8 +968,7 @@ pub const Evm = struct {
         const words = numWords(size);
         try self.chargeGasWide(Gas.KECCAK_BASE + Gas.KECCAK_PER_WORD * words + ext.cost);
         try self.growMemory(ext.expand_by);
-        const at: usize = @intCast(start);
-        const hash = crypto.keccak256(self.memory.data[at .. at + @as(usize, @intCast(size))]);
+        const hash = crypto.keccak256(self.memRead(start, size));
         try self.stack.push(word.fromBeBytes(&hash));
         self.pc += 1;
     }
@@ -980,8 +991,7 @@ pub const Evm = struct {
         self.gas_left -= create_gas;
 
         const sender = self.message.current_target;
-        const at: usize = @intCast(mem_start);
-        const init_code = self.memory.data[at .. at + @as(usize, @intCast(mem_size))];
+        const init_code = self.memRead(mem_start, mem_size);
         const contract = state_mod.computeContractAddress(self.allocator, sender, self.state.nonceOf(sender)) catch @panic("out of memory");
 
         try self.runCreate(sender, contract, endowment, create_gas, init_code);
@@ -1006,8 +1016,7 @@ pub const Evm = struct {
         self.gas_left -= create_gas;
 
         const sender = self.message.current_target;
-        const at: usize = @intCast(mem_start);
-        const init_code = self.memory.data[at .. at + @as(usize, @intCast(mem_size))];
+        const init_code = self.memRead(mem_start, mem_size);
         const contract = computeCreate2Address(sender, &salt, init_code);
 
         try self.runCreate(sender, contract, endowment, create_gas, init_code);
@@ -1119,7 +1128,7 @@ pub const Evm = struct {
                 .is_static = self.is_static or kind == .staticcall,
                 .in_start = in_start,
                 .in_size = in_size,
-                .out_start = @intCast(out_start),
+                .out_start = out_start,
                 .out_size = @intCast(out_size),
             });
         }
@@ -1136,7 +1145,7 @@ pub const Evm = struct {
         is_static: bool,
         in_start: u256,
         in_size: u256,
-        out_start: usize,
+        out_start: u256,
         out_size: usize,
     };
 
@@ -1153,8 +1162,7 @@ pub const Evm = struct {
             try self.stack.push(0);
             return;
         }
-        const at: usize = @intCast(p.in_start);
-        const call_data = self.memory.data[at .. at + @as(usize, @intCast(p.in_size))];
+        const call_data = self.memRead(p.in_start, p.in_size);
         const code = self.state.codeOf(p.code_address);
 
         var child = processMessage(self.allocator, self.state, self.env, .{
@@ -1185,7 +1193,7 @@ pub const Evm = struct {
         // Returned data is available even on revert; copy into the output region.
         self.setReturnData(child.output);
         const n = @min(p.out_size, child.output.len);
-        if (n > 0) self.memory.write(p.out_start, child.output[0..n]);
+        if (n > 0) self.memory.write(@intCast(p.out_start), child.output[0..n]);
     }
 
     fn revert(self: *Evm) VmError!void {
@@ -1194,8 +1202,7 @@ pub const Evm = struct {
         const ext = try self.extendMemory(&.{.{ start, size }});
         try self.chargeGasWide(ext.cost);
         try self.growMemory(ext.expand_by);
-        const at: usize = @intCast(start);
-        self.output = self.memory.data[at .. at + @as(usize, @intCast(size))];
+        self.output = self.memRead(start, size);
         self.running = false;
         self.reverted = true; // reverts state but keeps remaining gas
     }
