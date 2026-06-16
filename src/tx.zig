@@ -193,7 +193,8 @@ fn processImpl(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
 
     // EIP-2929 / EIP-3651 pre-warming.
     _ = state.accessAddress(tx.sender);
-    _ = state.accessAddress(env.coinbase);
+    // EIP-3651 (Shanghai+) pre-warms the coinbase; pre-Shanghai it stays cold.
+    if (env.fork.atLeast(.shanghai)) _ = state.accessAddress(env.coinbase);
     // EIP-2929 pre-warms the precompiles. The active range is fork-dependent:
     // Cancun ends at KZG (0x0a), Prague adds the BLS set through 0x11.
     const last_precompile: u8 = if (env.fork.atLeast(.prague)) 0x11 else if (env.fork.atLeast(.cancun)) 0x0a else 0x09;
