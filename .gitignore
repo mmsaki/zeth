@@ -30,3 +30,5 @@ ethereum-tests/
 hive/
 zig-out-linux/
 eest-fixtures/
+
+.agents/
