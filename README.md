@@ -68,9 +68,12 @@ geth on a Kurtosis devnet (synced 233 blocks; head hash matched geth exactly).
   zeth against a real geth/reth node (handshake + header download).
 
 ```sh
-zeth node <genesis.json> [chain.rlp ...] --datadir=DIR --http.addr=HOST:PORT
-zeth sync <enode://…> <genesis.json>             # full P2P sync from a peer
-zeth p2p  <enode://…> <networkId> <genesisHash>  # devp2p interop probe
+# Sync from a peer on startup, persist, then serve JSON-RPC — a syncing node:
+zeth node <genesis.json> --peer=<enode://…> --datadir=DIR --http.addr=HOST:PORT
+
+zeth node <genesis.json> [chain.rlp ...] --datadir=DIR   # import/serve, no peer
+zeth sync <enode://…> <genesis.json> --datadir=DIR       # sync-only into a datadir
+zeth p2p  <enode://…> <networkId> <genesisHash>          # devp2p interop probe
 ```
 
 ## Benchmark

@@ -60,17 +60,21 @@
 ```sh
 zig build -Doptimize=ReleaseFast
 
-# Serve JSON-RPC (:8545) + Engine API (:8551, JWT) from a genesis, persisting to disk.
-./zig-out/bin/zeth node <genesis.json> [chain.rlp ...] \
+# Sync from a peer on startup, persist to disk, then serve JSON-RPC + Engine API:
+./zig-out/bin/zeth node <genesis.json> \
+    --peer=<enode://…> \
     --datadir=/path/to/data \
     --http.addr=0.0.0.0:8545 \
     --authrpc.addr=0.0.0.0:8551 \
     --authrpc.jwtsecret=/path/to/jwt.hex
 
-# Restart with the same --datadir and no RLP → resumes from disk.
+# Restart with the same --datadir → resumes from disk (re-syncs only new blocks).
 ```
 
-Flags: `--http.addr`, `--authrpc.addr`, `--authrpc.jwtsecret`, `--datadir`.
+Flags: `--peer`, `--http.addr`, `--authrpc.addr`, `--authrpc.jwtsecret`, `--datadir`.
+The genesis you pass must byte-match the network's (the loader reproduces geth's
+genesis header for config-style genesis files). Sync currently catches up to the
+head learned at the handshake; it does not yet follow the live head.
 
 ### As a hive client
 
