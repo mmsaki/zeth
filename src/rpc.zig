@@ -765,8 +765,10 @@ fn newPayload(a: std.mem.Allocator, c: *chain_mod.Chain, id: ?std.json.Value, pa
         return payloadStatus(a, id, "INVALID", null, "block hash mismatch");
     var arena = std.heap.ArenaAllocator.init(c.gpa);
     defer arena.deinit();
+    // On INVALID, latestValidHash is the most recent valid ancestor — our head.
+    const parent = c.head.hash(a) catch std.mem.zeroes([32]u8);
     _ = c.importDecoded(arena.allocator(), built.blk) catch |e|
-        return payloadStatus(a, id, "INVALID", null, @errorName(e));
+        return payloadStatus(a, id, "INVALID", &parent, c.last_error orelse @errorName(e));
     return payloadStatus(a, id, "VALID", &built.hash, null);
 }
 
