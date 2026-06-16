@@ -29,6 +29,7 @@ fn addr(comptime hex: []const u8) Address {
 
 pub const ImportError = error{
     InvalidTransaction,
+    InvalidExcessBlobGas,
     BadParent,
     StateRootMismatch,
     TransactionsRootMismatch,
@@ -243,6 +244,20 @@ pub const Chain = struct {
         if (!std.mem.eql(u8, &h.parent_hash, &parent_hash)) return error.BadParent;
 
         const fork = self.schedule.forkAt(h.timestamp);
+
+        // EIP-4844 (Cancun+): the header's excessBlobGas must equal
+        // max(0, parent_excess + parent_blob_used - target).
+        if (fork.atLeast(.cancun)) {
+            const parent_excess = self.head.excess_blob_gas orelse 0;
+            const parent_used = self.head.blob_gas_used orelse 0;
+            const target = txmod.targetBlobGasPerBlock(fork);
+            const expected: u64 = if (parent_excess + parent_used < target) 0 else parent_excess + parent_used - target;
+            if ((h.excess_blob_gas orelse 0) != expected) {
+                self.last_error = "invalid excess blob gas";
+                return error.InvalidExcessBlobGas;
+            }
+        }
+
         var env = vm.Environment{
             .fork = fork,
             .chain_id = self.chain_id,
