@@ -43,7 +43,7 @@ conformance:
 
 ## Execute hex bytecode: `make run ARGS="0x6006600701"`.
 run:
-	$(ZIG) build run -- $(ARGS)
+	$(ZIG) build run -- run $(ARGS)
 
 ## Format all Zig sources in place.
 fmt:

@@ -35,6 +35,19 @@ var g_single: [1]ForkVariant = undefined;
 var g_fork: zeth.Fork = .prague; // set per-test from the matched network
 var g_check_hash = false; // ZETH_HASH=1: verify block hashes instead of state roots
 var g_check_receipts = false; // ZETH_RECEIPTS=1: also verify receipts root + logs bloom
+var g_import = false; // ZETH_IMPORT=1: drive the real chain.importBlock pipeline from RLP
+
+/// A fork schedule pinned so `forkAt` always returns `f` (every block in a
+/// fixture shares one fork).
+fn scheduleForFork(f: zeth.Fork) zeth.genesis.ForkSchedule {
+    return .{
+        .chain_id = 1,
+        .shanghai_time = if (f.atLeast(.shanghai)) 0 else null,
+        .cancun_time = if (f.atLeast(.cancun)) 0 else null,
+        .prague_time = if (f.atLeast(.prague)) 0 else null,
+        .osaka_time = if (f.atLeast(.osaka)) 0 else null,
+    };
+}
 var g_stop = true; // stop at first failure; ZETH_ALL=1 runs everything
 const Verdict = enum { pass, fail, skip };
 
@@ -557,6 +570,23 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
         }
     }
 
+    // ZETH_IMPORT=1: drive the real node import pipeline (decode → execute →
+    // validate every root + gas + bloom) from each block's RLP, instead of the
+    // JSON-driven state-root-only path.
+    if (g_import) {
+        const gh_json = jobj(obj, "genesisBlockHeader") orelse return .skip;
+        const g = zeth.genesis.Genesis{ .schedule = scheduleForFork(g_fork), .header = headerFromJson(a, gh_json) };
+        var ch = zeth.chain.Chain.initGenesis(a, &st, g) catch return .skip;
+        for (canon.items, 0..) |block, bn| {
+            const raw_hex = jstr(block, "rlp") orelse continue;
+            _ = ch.importBlock(bytesH(a, raw_hex)) catch |err| {
+                rep.failLine("  {s}{s}{s}\n    {s}{s}{s} block {d} import failed: {s}\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET), bn, @errorName(err) });
+                return .fail;
+            };
+        }
+        return .pass;
+    }
+
     for (canon.items, 0..) |block, bn| {
         if (!applyBlock(a, &st, block, block_hashes.items)) {
             rep.failLine("  {s}{s}{s}\n    {s}{s}{s} block {d} post-state root differs:\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET), bn });
@@ -598,6 +628,7 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("ZETH_ALL") != null) g_stop = false;
     if (init.environ_map.get("ZETH_HASH") != null) g_check_hash = true;
     if (init.environ_map.get("ZETH_RECEIPTS") != null) g_check_receipts = true;
+    if (init.environ_map.get("ZETH_IMPORT") != null) g_import = true;
     if (init.environ_map.get("ZETH_FORK")) |f| {
         g_single[0] = .{ .name = f, .fork = zeth.fork.Fork.fromName(f) orelse {
             std.debug.print("unknown fork: {s}\n", .{f});

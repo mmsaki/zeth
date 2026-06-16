@@ -17,6 +17,7 @@ pub const fork = @import("fork.zig");
 pub const block = @import("block.zig");
 pub const transaction = @import("transaction.zig");
 pub const genesis = @import("genesis.zig");
+pub const chain = @import("chain.zig");
 
 pub const Evm = vm.Evm;
 pub const Op = vm.Op;
