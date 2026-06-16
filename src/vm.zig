@@ -227,6 +227,33 @@ pub const Gas = struct {
     pub const SELFDESTRUCT_NEW_ACCOUNT: u64 = 25000;
 };
 
+/// Account-touching opcodes whose pre-Berlin (pre-EIP-2929) gas was a flat,
+/// fork-dependent price. Berlin+ replaces these with warm/cold access; this
+/// table only covers the historical flat costs (EIP-150 / EIP-1884).
+pub const AccountOp = enum {
+    balance, // BALANCE
+    extcode, // EXTCODESIZE / EXTCODECOPY
+    extcodehash, // EXTCODEHASH (introduced Constantinople)
+    call, // CALL / CALLCODE / DELEGATECALL / STATICCALL base access
+
+    /// The flat (pre-Berlin) cost of this opcode at fork `f`.
+    pub fn flatCost(op: AccountOp, f: Fork) u64 {
+        return switch (op) {
+            //                Istanbul(1884)            Tangerine(150)              Frontier
+            .balance => if (f.atLeast(.istanbul)) 700 else if (f.atLeast(.tangerine_whistle)) 400 else 20,
+            .extcode => if (f.atLeast(.tangerine_whistle)) 700 else 20,
+            .extcodehash => if (f.atLeast(.istanbul)) 700 else 400, // Constantinople: 400
+            .call => if (f.atLeast(.tangerine_whistle)) 700 else 40,
+        };
+    }
+};
+
+/// Flat (pre-Berlin) SLOAD cost: EIP-1884 (Istanbul) 800, EIP-150 (Tangerine)
+/// 200, Frontier 50. Berlin+ uses EIP-2929 warm/cold instead.
+fn sloadFlatCost(f: Fork) u64 {
+    return if (f.atLeast(.istanbul)) 800 else if (f.atLeast(.tangerine_whistle)) 200 else 50;
+}
+
 /// EVM opcode encoding. Non-exhaustive so raw bytes with no assigned opcode
 /// fall through to `error.InvalidOpcode`.
 pub const Op = enum(u8) {
@@ -723,7 +750,9 @@ pub const Evm = struct {
         const exponent = try self.stack.pop();
         const bits = if (exponent == 0) 0 else 256 - @clz(exponent);
         const bytes: u64 = (@as(u64, bits) + 7) / 8;
-        try self.chargeGas(Gas.EXP_BASE + Gas.EXP_PER_BYTE * bytes);
+        // EIP-160 (Spurious Dragon) repriced the per-byte cost from 10 to 50.
+        const per_byte: u64 = if (self.env.fork.atLeast(.spurious_dragon)) Gas.EXP_PER_BYTE else 10;
+        try self.chargeGas(Gas.EXP_BASE + per_byte * bytes);
         try self.stack.push(word.exp(base, exponent));
         self.pc += 1;
     }
@@ -864,14 +893,26 @@ pub const Evm = struct {
 
     // --- Environment opcodes that touch state ---
 
-    /// EIP-2929 warm/cold cost for touching `addr`.
+    /// EIP-2929 warm/cold cost for touching `addr` (Berlin+ only).
     inline fn accessAddressCost(self: *Evm, addr: Address) u64 {
         return if (self.state.accessAddress(addr)) Gas.WARM_ACCESS else Gas.COLD_ACCOUNT_ACCESS;
     }
 
+    /// Cost of an account-touching opcode (BALANCE / EXTCODE* / CALL family).
+    /// From Berlin it is EIP-2929 warm/cold; before that it is a flat,
+    /// fork-dependent price (EIP-150 Tangerine and EIP-1884 Istanbul repriced
+    /// these). The account is marked warm regardless — a no-op for pre-Berlin
+    /// metering, but keeps the access set correct across the fork boundary.
+    inline fn accountAccessCost(self: *Evm, addr: Address, op: AccountOp) u64 {
+        const warm = self.state.accessAddress(addr);
+        if (self.env.fork.atLeast(.berlin))
+            return if (warm) Gas.WARM_ACCESS else Gas.COLD_ACCOUNT_ACCESS;
+        return op.flatCost(self.env.fork);
+    }
+
     fn balance(self: *Evm) VmError!void {
         const addr = state_mod.addressFromWord(try self.stack.pop());
-        try self.chargeGas(self.accessAddressCost(addr));
+        try self.chargeGas(self.accountAccessCost(addr, .balance));
         try self.stack.push(self.state.balanceOf(addr));
         self.pc += 1;
     }
@@ -891,7 +932,7 @@ pub const Evm = struct {
 
     fn extcodesize(self: *Evm) VmError!void {
         const addr = state_mod.addressFromWord(try self.stack.pop());
-        try self.chargeGas(self.accessAddressCost(addr));
+        try self.chargeGas(self.accountAccessCost(addr, .extcode));
         try self.stack.push(self.state.codeOf(addr).len);
         self.pc += 1;
     }
@@ -903,7 +944,7 @@ pub const Evm = struct {
         const size = try self.stack.pop();
         const ext = try self.extendMemory(&.{.{ mem_start, size }});
         const words = numWords(size);
-        try self.chargeGasWide(@as(u128, self.accessAddressCost(addr)) + Gas.COPY_PER_WORD * words + ext.cost);
+        try self.chargeGasWide(@as(u128, self.accountAccessCost(addr, .extcode)) + Gas.COPY_PER_WORD * words + ext.cost);
         try self.growMemory(ext.expand_by);
         self.copyToMemory(self.state.codeOf(addr), code_start, mem_start, size);
         self.pc += 1;
@@ -911,7 +952,7 @@ pub const Evm = struct {
 
     fn extcodehash(self: *Evm) VmError!void {
         const addr = state_mod.addressFromWord(try self.stack.pop());
-        try self.chargeGas(self.accessAddressCost(addr));
+        try self.chargeGas(self.accountAccessCost(addr, .extcodehash));
         // Empty or absent accounts hash to 0; otherwise keccak256(code).
         const empty = !self.state.exists(addr) or
             (self.state.nonceOf(addr) == 0 and self.state.balanceOf(addr) == 0 and self.state.codeOf(addr).len == 0);
@@ -967,7 +1008,12 @@ pub const Evm = struct {
     fn sload(self: *Evm) VmError!void {
         const key = try self.stack.pop();
         const target = self.message.current_target;
-        const cost: u64 = if (self.state.accessStorage(target, key)) Gas.WARM_ACCESS else Gas.COLD_STORAGE_ACCESS;
+        const warm = self.state.accessStorage(target, key);
+        // Berlin+ (EIP-2929): warm/cold. Before that, a flat fork-dependent cost.
+        const cost: u64 = if (self.env.fork.atLeast(.berlin))
+            (if (warm) Gas.WARM_ACCESS else Gas.COLD_STORAGE_ACCESS)
+        else
+            sloadFlatCost(self.env.fork);
         try self.chargeGas(cost);
         try self.stack.push(self.state.getStorage(target, key));
         self.pc += 1;
@@ -1136,7 +1182,8 @@ pub const Evm = struct {
         if (eip3860 and mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas;
         if (self.is_static) return error.StaticStateChange;
 
-        const create_gas = self.gas_left - self.gas_left / 64; // EIP-150 63/64
+        // EIP-150 (Tangerine): forward all-but-1/64th; before that, all of it.
+        const create_gas = if (self.env.fork.atLeast(.tangerine_whistle)) self.gas_left - self.gas_left / 64 else self.gas_left;
         self.gas_left -= create_gas;
 
         const sender = self.message.current_target;
@@ -1163,7 +1210,7 @@ pub const Evm = struct {
         if (eip3860 and mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas;
         if (self.is_static) return error.StaticStateChange;
 
-        const create_gas = self.gas_left - self.gas_left / 64; // EIP-150
+        const create_gas = if (self.env.fork.atLeast(.tangerine_whistle)) self.gas_left - self.gas_left / 64 else self.gas_left; // EIP-150
         self.gas_left -= create_gas;
 
         const sender = self.message.current_target;
@@ -1251,7 +1298,7 @@ pub const Evm = struct {
         const transfers_value = (kind == .call or kind == .callcode) and value != 0;
 
         const ext = try self.extendMemory(&.{ .{ in_start, in_size }, .{ out_start, out_size } });
-        const access_gas: u64 = if (self.state.accessAddress(code_address)) Gas.WARM_ACCESS else Gas.COLD_ACCOUNT_ACCESS;
+        const access_gas: u64 = self.accountAccessCost(code_address, .call);
         // EIP-7702: if the target is a delegated EOA, pay an extra cold/warm
         // charge to access the delegate. `genericCall` runs the delegate's code
         // (keeping code_address = the target, which also disables precompiles).
@@ -1268,7 +1315,7 @@ pub const Evm = struct {
         const transfer_gas: u64 = if (transfers_value) Gas.CALL_VALUE else 0;
         const extra_gas: u64 = access_gas + deleg_gas + create_gas + transfer_gas;
 
-        const mcg = messageCallGas(transfers_value, gas_req, self.gas_left, ext.cost, extra_gas);
+        const mcg = messageCallGas(transfers_value, gas_req, self.gas_left, ext.cost, extra_gas, self.env.fork.atLeast(.tangerine_whistle));
         try self.chargeGasWide(mcg.cost + ext.cost);
         try self.growMemory(ext.expand_by);
 
@@ -1578,7 +1625,7 @@ pub fn processCreateMessage(
 /// stipend. `extra_gas` already covers access-list + new-account + transfer.
 const MessageCallGas = struct { cost: u128, sub_call: u64 };
 
-fn messageCallGas(transfers_value: bool, gas_req: u256, gas_left: u64, memory_cost: u128, extra_gas: u64) MessageCallGas {
+fn messageCallGas(transfers_value: bool, gas_req: u256, gas_left: u64, memory_cost: u128, extra_gas: u64, cap_6364: bool) MessageCallGas {
     // The 2300-gas stipend is only granted when value is actually transferred
     // (CALL/CALLCODE with value>0). DELEGATECALL inherits `message.value` but
     // never transfers it, so it must NOT receive the stipend.
@@ -1589,7 +1636,9 @@ fn messageCallGas(transfers_value: bool, gas_req: u256, gas_left: u64, memory_co
     var g: u128 = req;
     if (gas_left >= reserved) {
         const avail: u64 = gas_left - @as(u64, @intCast(reserved));
-        const capped: u128 = avail - avail / 64; // 63/64 rule
+        // EIP-150 (Tangerine): a caller may forward at most all-but-1/64th of
+        // its remaining gas. Before Tangerine the full request could be sent.
+        const capped: u128 = if (cap_6364) avail - avail / 64 else avail;
         g = @min(req, capped);
     }
     const g64: u64 = @intCast(@min(g, @as(u128, std.math.maxInt(u64) - stipend)));
