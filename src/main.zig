@@ -113,6 +113,9 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
 
     var host: []const u8 = "0.0.0.0";
     var port: u16 = 8545;
+    var auth_host: []const u8 = "0.0.0.0";
+    var auth_port: u16 = 8551;
+    var jwt_path: ?[]const u8 = null;
     var genesis_path: ?[]const u8 = null;
     var rlp_files: std.ArrayList([]const u8) = .empty;
     for (args) |arg| {
@@ -122,6 +125,14 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
                 host = hp[0..ci];
                 port = std.fmt.parseInt(u16, hp[ci + 1 ..], 10) catch 8545;
             } else host = hp;
+        } else if (std.mem.startsWith(u8, arg, "--authrpc.addr=")) {
+            const hp = arg["--authrpc.addr=".len..];
+            if (std.mem.lastIndexOfScalar(u8, hp, ':')) |ci| {
+                auth_host = hp[0..ci];
+                auth_port = std.fmt.parseInt(u16, hp[ci + 1 ..], 10) catch 8551;
+            } else auth_host = hp;
+        } else if (std.mem.startsWith(u8, arg, "--authrpc.jwtsecret=")) {
+            jwt_path = arg["--authrpc.jwtsecret=".len..];
         } else if (std.mem.startsWith(u8, arg, "--")) {
             // ignore other flags
         } else if (genesis_path == null) {
@@ -166,36 +177,110 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
     const hh = try ch.head.hash(gpa);
     std.debug.print("zeth node: chainId={d} head=#{d} hash=0x{s}\n", .{ ch.chain_id, ch.head.number, std.fmt.bytesToHex(&hh, .lower) });
 
-    // Serve JSON-RPC.
+    // Engine API on the authrpc port (JWT-authenticated), in a second thread.
+    // (The hive engine simulator drives requests sequentially, so the eth +
+    // engine listeners don't access the chain concurrently in practice.)
+    if (jwt_path) |jp| {
+        const secret = readJwtSecret(gpa, io, jp) catch null;
+        if (secret) |s| {
+            const ctx = try a.create(ServeCtx);
+            ctx.* = .{ .gpa = gpa, .io = io, .ch = &ch, .host = auth_host, .port = auth_port, .jwt = s };
+            _ = std.Thread.spawn(.{}, authServeLoop, .{ctx}) catch |e|
+                std.debug.print("warning: could not start authrpc thread: {s}\n", .{@errorName(e)});
+            std.debug.print("Engine API (JWT) listening on {s}:{d}\n", .{ auth_host, auth_port });
+        }
+    }
+
+    // eth_ JSON-RPC on the http port (no auth) — the main thread.
     var address = try net.IpAddress.parse(host, port);
     var server = try address.listen(io, .{ .reuse_address = true });
     std.debug.print("JSON-RPC listening on {s}:{d}\n", .{ host, port });
     while (true) {
         const stream = server.accept(io) catch continue;
-        serveConn(gpa, io, &ch, stream);
+        serveConn(gpa, io, &ch, null, stream);
         stream.close(io);
     }
 }
 
-/// Serve one connection: a keep-alive loop of HTTP JSON-RPC requests.
-fn serveConn(gpa: std.mem.Allocator, io: std.Io, ch: *zeth.chain.Chain, stream: net.Stream) void {
-    var rbuf: [16 * 1024]u8 = undefined;
-    var wbuf: [16 * 1024]u8 = undefined;
+const ServeCtx = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    ch: *zeth.chain.Chain,
+    host: []const u8,
+    port: u16,
+    jwt: []const u8,
+};
+
+fn authServeLoop(ctx: *ServeCtx) void {
+    var address = net.IpAddress.parse(ctx.host, ctx.port) catch return;
+    var server = address.listen(ctx.io, .{ .reuse_address = true }) catch return;
+    while (true) {
+        const stream = server.accept(ctx.io) catch continue;
+        serveConn(ctx.gpa, ctx.io, ctx.ch, ctx.jwt, stream);
+        stream.close(ctx.io);
+    }
+}
+
+/// Read + hex-decode an HS256 JWT secret file (0x-prefixed or bare hex → 32 bytes).
+fn readJwtSecret(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const raw = try readFile(gpa, io, path);
+    defer gpa.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const hex = if (std.mem.startsWith(u8, trimmed, "0x")) trimmed[2..] else trimmed;
+    const out = try gpa.alloc(u8, hex.len / 2);
+    _ = try std.fmt.hexToBytes(out, hex);
+    return out;
+}
+
+/// Verify an HS256 JWT bearer header against `secret` (HMAC over `header.payload`).
+fn jwtOk(secret: []const u8, auth: ?[]const u8) bool {
+    const hdr = auth orelse return false;
+    const pfx = "Bearer ";
+    if (hdr.len <= pfx.len or !std.mem.startsWith(u8, hdr, pfx)) return false;
+    const tok = std.mem.trim(u8, hdr[pfx.len..], " ");
+    const dot2 = std.mem.lastIndexOfScalar(u8, tok, '.') orelse return false;
+    const signing = tok[0..dot2];
+    const sig_b64 = tok[dot2 + 1 ..];
+    const Dec = std.base64.url_safe_no_pad.Decoder;
+    const sz = Dec.calcSizeForSlice(sig_b64) catch return false;
+    if (sz != 32) return false;
+    var sig: [32]u8 = undefined;
+    Dec.decode(&sig, sig_b64) catch return false;
+    var mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, signing, secret);
+    return std.mem.eql(u8, &mac, &sig);
+}
+
+/// Serve one connection: a keep-alive loop of HTTP JSON-RPC requests. When
+/// `jwt` is set, each request must carry a valid bearer token (Engine API).
+fn serveConn(gpa: std.mem.Allocator, io: std.Io, ch: *zeth.chain.Chain, jwt: ?[]const u8, stream: net.Stream) void {
+    var rbuf: [64 * 1024]u8 = undefined;
+    var wbuf: [64 * 1024]u8 = undefined;
     var sr = stream.reader(io, &rbuf);
     var sw = stream.writer(io, &wbuf);
     var http = std.http.Server.init(&sr.interface, &sw.interface);
     while (true) {
         var req = http.receiveHead() catch return;
+        if (jwt) |secret| {
+            var auth: ?[]const u8 = null;
+            var it = req.iterateHeaders();
+            while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "authorization")) {
+                auth = h.value;
+            };
+            if (!jwtOk(secret, auth)) {
+                req.respond("{\"error\":\"unauthorized\"}", .{ .status = .unauthorized }) catch return;
+                continue;
+            }
+        }
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
         var body_buf: [8 * 1024]u8 = undefined;
         const br = req.readerExpectNone(&body_buf);
         const body = br.allocRemaining(a, std.Io.Limit.limited(16 * 1024 * 1024)) catch "";
-        const resp = if (req.head.method == .POST and body.len > 0)
-            zeth.rpc.handleBody(a, ch, body)
-        else
-            "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":null}";
+        var resp: []const u8 = "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":null}";
+        if (req.head.method == .POST and body.len > 0)
+            resp = zeth.rpc.handleBody(a, ch, body);
         req.respond(resp, .{ .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} }) catch return;
     }
 }
