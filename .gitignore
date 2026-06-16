@@ -16,6 +16,7 @@ hive
 py_ecc
 hive-python-api
 execution-apis
+ethereum-package-kurtosis
 
 # Python
 __pycache__/
