@@ -18,13 +18,14 @@
 | **JSON-RPC** (`eth_*`, `debug_*` traces) + **Engine API** (`engine_*` + JWT) | ✅ usable | hive `rpc-compat` / `consume-engine` |
 | **Persistence** (`--datadir`: snapshot + resume) | ✅ | round-trips genesis state across restart |
 | **devp2p transport** (ECIES, RLPx, eth/69 handshake) | ✅ validated vs geth | see [kurtosis.md](./kurtosis.md) |
-| Peer **header download** (`GetBlockHeaders`) | ✅ | downloads from geth |
+| **P2P full sync** (headers→bodies→execute→validate) | ✅ basic | `zeth sync` synced 233 blocks from geth; head hash matched exactly |
 
 ## What is NOT ready (required before mainnet)
 
-- **Full P2P sync loop.** Header download works; the
-  header→body→execute→persist loop that actually advances the chain from peers
-  is not wired up yet (tracked as the next milestone).
+- **Continuous / live sync.** One-shot batch sync to a fixed head works
+  (`zeth sync`); staying at the head (following new blocks), persisting the
+  synced chain to `--datadir`, and recovering from a peer that drops mid-sync
+  are not done yet.
 - **Peer discovery (discovery v4/v5).** zeth can't *find* peers — you must hand
   it an enode. No DHT, no bootnodes.
 - **Transaction pool / gossip.** No mempool, no tx propagation.
@@ -85,9 +86,9 @@ adapter into `hive/clients/zeth/`. Then, from the hive checkout:
 
 In rough dependency order:
 
-1. **P2P full sync loop** — drive `GetBlockHeaders`→`GetBlockBodies`→
-   `importDecoded`→store over a peer connection; resolve the chain head and
-   follow it. *(next milestone)*
+1. **P2P full sync** — ✅ done (`zeth sync`): header→body→execute→validate from a
+   peer. *Remaining:* persist to `--datadir` during sync, follow the live head,
+   and handle mid-sync peer drops.
 2. **Discovery v4/v5** — find peers without a hardcoded enode.
 3. **Transaction pool + gossip** — accept, validate, propagate, and include txs.
 4. **Multi-peer + reorgs** — peer set, scoring, and robust fork choice.

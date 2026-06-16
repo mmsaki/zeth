@@ -58,7 +58,8 @@ under `ethereum-tests/` and `eest-fixtures/` (both gitignored).
 ## Running a node / networking
 
 zeth can serve JSON-RPC + the Engine API, persist to disk (`--datadir`), and
-speak devp2p (RLPx + eth/69) — its transport is validated against real geth.
+**sync a chain from a real peer over devp2p** (RLPx + eth/69) — verified against
+geth on a Kurtosis devnet (synced 233 blocks; head hash matched geth exactly).
 
 - **[docs/production.md](docs/production.md)** — what works today vs what's left,
   how to run the node, and an honest production-readiness status. **Read this
@@ -68,7 +69,8 @@ speak devp2p (RLPx + eth/69) — its transport is validated against real geth.
 
 ```sh
 zeth node <genesis.json> [chain.rlp ...] --datadir=DIR --http.addr=HOST:PORT
-zeth p2p <enode://…> <networkId> <genesisHash>   # devp2p interop probe
+zeth sync <enode://…> <genesis.json>             # full P2P sync from a peer
+zeth p2p  <enode://…> <networkId> <genesisHash>  # devp2p interop probe
 ```
 
 ## Benchmark
