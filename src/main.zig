@@ -19,17 +19,41 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) return usage(args[0]);
 
+    // Every command that touches the EVM (run/import/node) can recurse to the
+    // 1024-deep call limit, which overflows the default main-thread stack. Run
+    // the whole dispatch on a thread with a large stack and surface its error.
+    var ctx = MainCtx{ .gpa = gpa, .io = init.io, .args = args };
+    const t = try std.Thread.spawn(.{ .stack_size = zeth.vm.NATIVE_STACK_SIZE }, dispatch, .{&ctx});
+    t.join();
+    if (ctx.err) |e| return e;
+}
+
+const MainCtx = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    args: []const []const u8,
+    err: ?anyerror = null,
+};
+
+fn dispatch(ctx: *MainCtx) void {
+    const args = ctx.args;
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "version")) {
         std.debug.print("{s}\n", .{VERSION});
     } else if (std.mem.eql(u8, cmd, "run")) {
-        try runBytecode(gpa, args[2..]);
+        runBytecode(ctx.gpa, args[2..]) catch |e| {
+            ctx.err = e;
+        };
     } else if (std.mem.eql(u8, cmd, "import")) {
-        try importChain(gpa, init.io, args[2..]);
+        importChain(ctx.gpa, ctx.io, args[2..]) catch |e| {
+            ctx.err = e;
+        };
     } else if (std.mem.eql(u8, cmd, "node")) {
-        try nodeServe(gpa, init.io, args[2..]);
+        nodeServe(ctx.gpa, ctx.io, args[2..]) catch |e| {
+            ctx.err = e;
+        };
     } else {
-        return usage(args[0]);
+        ctx.err = usage(args[0]);
     }
 }
 
@@ -185,21 +209,20 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
         if (secret) |s| {
             const ctx = try a.create(ServeCtx);
             ctx.* = .{ .gpa = gpa, .io = io, .ch = &ch, .host = auth_host, .port = auth_port, .jwt = s };
-            _ = std.Thread.spawn(.{}, authServeLoop, .{ctx}) catch |e|
+            _ = std.Thread.spawn(.{ .stack_size = zeth.vm.NATIVE_STACK_SIZE }, serveLoop, .{ctx}) catch |e|
                 std.debug.print("warning: could not start authrpc thread: {s}\n", .{@errorName(e)});
             std.debug.print("Engine API (JWT) listening on {s}:{d}\n", .{ auth_host, auth_port });
         }
     }
 
-    // eth_ JSON-RPC on the http port (no auth) — the main thread.
-    var address = try net.IpAddress.parse(host, port);
-    var server = try address.listen(io, .{ .reuse_address = true });
+    // eth_ JSON-RPC on the http port (no auth). Run on a dedicated thread with a
+    // large stack — serving a request can recurse to the EVM's call-depth limit,
+    // which overflows the default main-thread stack. The main thread then joins.
+    const eth_ctx = try a.create(ServeCtx);
+    eth_ctx.* = .{ .gpa = gpa, .io = io, .ch = &ch, .host = host, .port = port, .jwt = null };
     std.debug.print("JSON-RPC listening on {s}:{d}\n", .{ host, port });
-    while (true) {
-        const stream = server.accept(io) catch continue;
-        serveConn(gpa, io, &ch, null, stream);
-        stream.close(io);
-    }
+    const eth_thread = try std.Thread.spawn(.{ .stack_size = zeth.vm.NATIVE_STACK_SIZE }, serveLoop, .{eth_ctx});
+    eth_thread.join();
 }
 
 const ServeCtx = struct {
@@ -208,10 +231,13 @@ const ServeCtx = struct {
     ch: *zeth.chain.Chain,
     host: []const u8,
     port: u16,
-    jwt: []const u8,
+    jwt: ?[]const u8,
 };
 
-fn authServeLoop(ctx: *ServeCtx) void {
+/// Accept-and-serve loop for one listener. Runs on a thread spawned with a
+/// large stack (zeth.vm.NATIVE_STACK_SIZE) because serving a request can drive
+/// the EVM to its 1024-deep call recursion.
+fn serveLoop(ctx: *ServeCtx) void {
     var address = net.IpAddress.parse(ctx.host, ctx.port) catch return;
     var server = address.listen(ctx.io, .{ .reuse_address = true }) catch return;
     while (true) {
