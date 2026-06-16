@@ -8,6 +8,7 @@ const chain_mod = @import("chain.zig");
 const state_mod = @import("state.zig");
 const block = @import("block.zig");
 const vm = @import("vm.zig");
+const transaction = @import("transaction.zig");
 const Address = state_mod.Address;
 
 const CLIENT_VERSION = "zeth/0.1.0-dev";
@@ -109,6 +110,108 @@ fn execCall(a: std.mem.Allocator, c: *chain_mod.Chain, call: std.json.ObjectMap,
     return .{ .output = out, .success = success, .gas_used = gas - evm.gas_left };
 }
 
+fn parseHash(s: []const u8) ?[32]u8 {
+    const b = if (std.mem.startsWith(u8, s, "0x")) s[2..] else s;
+    if (b.len != 64) return null;
+    var out: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, b) catch return null;
+    return out;
+}
+
+/// Canonical block number for a block hash, or null.
+fn numberByHash(c: *const chain_mod.Chain, hs: []const u8) ?u64 {
+    const want = parseHash(hs) orelse return null;
+    for (c.hashes.items, 0..) |h, n| if (std.mem.eql(u8, &h, &want)) return n;
+    return null;
+}
+
+/// Block-level log index of the first log of tx `index`.
+fn logBase(c: *const chain_mod.Chain, number: u64, index: u32) usize {
+    var base: usize = 0;
+    const txs = c.blockTxs(number);
+    var i: u32 = 0;
+    while (i < index and i < txs.len) : (i += 1) base += txs[i].logs.len;
+    return base;
+}
+
+/// eth_getLogs: scan the block range, emit logs matching the address + topics
+/// filter. Supports a single fromBlock/toBlock range or a blockHash.
+fn getLogs(a: std.mem.Allocator, c: *const chain_mod.Chain, filter: std.json.ObjectMap) []const u8 {
+    var from: u64 = 0;
+    var to: u64 = c.head.number;
+    if (jstr(filter, "blockHash")) |bh| {
+        const n = numberByHash(c, bh) orelse return "[]";
+        from = n;
+        to = n;
+    } else {
+        if (jstr(filter, "fromBlock")) |f| from = resolveBlock(c, f) orelse 0;
+        if (jstr(filter, "toBlock")) |t| to = resolveBlock(c, t) orelse c.head.number;
+    }
+    var buf: std.ArrayList(u8) = .empty;
+    buf.append(a, '[') catch @panic("oom");
+    var first = true;
+    var n = from;
+    while (n <= to and n < c.headers.items.len) : (n += 1) {
+        const bh = c.hashByNumber(n) orelse continue;
+        const txs = c.blockTxs(n);
+        var lidx: usize = 0;
+        for (txs, 0..) |rec, ti| {
+            for (rec.logs) |lg| {
+                if (logMatches(lg, filter)) {
+                    if (!first) buf.append(a, ',') catch @panic("oom");
+                    first = false;
+                    buf.appendSlice(a, logJson(a, lg, bh, n, rec.hash, @intCast(ti), lidx)) catch @panic("oom");
+                }
+                lidx += 1;
+            }
+        }
+    }
+    buf.append(a, ']') catch @panic("oom");
+    return buf.items;
+}
+
+fn addrEqStr(addr: Address, s: []const u8) bool {
+    const want = parseAddr(s) orelse return false;
+    return std.mem.eql(u8, &addr, &want);
+}
+fn topicEqStr(topic: [32]u8, s: []const u8) bool {
+    const want = parseHash(s) orelse return false;
+    return std.mem.eql(u8, &topic, &want);
+}
+
+/// Match a log against a filter's `address` (string | array | absent) and
+/// positional `topics` (string | null | array | absent).
+fn logMatches(lg: vm.Log, filter: std.json.ObjectMap) bool {
+    if (filter.get("address")) |av| switch (av) {
+        .string => |s| if (!addrEqStr(lg.address, s)) return false,
+        .array => |arr| {
+            var any = false;
+            for (arr.items) |e| if (e == .string and addrEqStr(lg.address, e.string)) {
+                any = true;
+            };
+            if (!any) return false;
+        },
+        else => {},
+    };
+    if (filter.get("topics")) |tv| if (tv == .array) {
+        const want = tv.array.items;
+        if (want.len > lg.topics.len) return false;
+        for (want, 0..) |w, i| switch (w) {
+            .null => {},
+            .string => |s| if (!topicEqStr(lg.topics[i], s)) return false,
+            .array => |opts| {
+                var any = false;
+                for (opts.items) |o| if (o == .string and topicEqStr(lg.topics[i], o.string)) {
+                    any = true;
+                };
+                if (!any) return false;
+            },
+            else => {},
+        };
+    };
+    return true;
+}
+
 /// Resolve a block tag/number param to a concrete number against the head.
 fn resolveBlock(c: *const chain_mod.Chain, tag: []const u8) ?u64 {
     if (std.mem.eql(u8, tag, "latest") or std.mem.eql(u8, tag, "pending") or std.mem.eql(u8, tag, "safe") or std.mem.eql(u8, tag, "finalized"))
@@ -118,8 +221,8 @@ fn resolveBlock(c: *const chain_mod.Chain, tag: []const u8) ?u64 {
     return std.fmt.parseInt(u64, b, 16) catch null;
 }
 
-/// JSON for a block by number (header fields + empty tx/uncle lists).
-fn blockJson(a: std.mem.Allocator, c: *const chain_mod.Chain, number: u64) ?[]const u8 {
+/// JSON for a block by number. `full` selects transaction objects vs hashes.
+fn blockJson(a: std.mem.Allocator, c: *const chain_mod.Chain, number: u64, full: bool) ?[]const u8 {
     const h = c.headerByNumber(number) orelse return null;
     const hash = c.hashByNumber(number) orelse return null;
     var buf: std.ArrayList(u8) = .empty;
@@ -138,7 +241,100 @@ fn blockJson(a: std.mem.Allocator, c: *const chain_mod.Chain, number: u64) ?[]co
     if (h.excess_blob_gas) |g| p(a, &buf, ",\"excessBlobGas\":\"{s}\"", .{qHex(a, g)});
     if (h.parent_beacon_block_root) |r| p(a, &buf, ",\"parentBeaconBlockRoot\":\"{s}\"", .{hash32Hex(a, r)});
     if (h.requests_hash) |r| p(a, &buf, ",\"requestsHash\":\"{s}\"", .{hash32Hex(a, r)});
-    buf.appendSlice(a, ",\"transactions\":[],\"uncles\":[]}") catch @panic("oom");
+    p(a, &buf, ",\"size\":\"{s}\"", .{qHex(a, c.sizeByNumber(number))});
+    // Transactions: hashes (full=false) or TransactionInfo objects (full=true).
+    buf.appendSlice(a, ",\"transactions\":[") catch @panic("oom");
+    const txs = c.blockTxs(number);
+    for (txs, 0..) |rec, i| {
+        if (i > 0) buf.append(a, ',') catch @panic("oom");
+        if (full)
+            buf.appendSlice(a, txInfoJson(a, c, rec, number, @intCast(i))) catch @panic("oom")
+        else
+            p(a, &buf, "\"{s}\"", .{hash32Hex(a, rec.hash)});
+    }
+    buf.appendSlice(a, "],\"uncles\":[]}") catch @panic("oom");
+    return buf.items;
+}
+
+/// A signed-transaction RPC object (TransactionInfo) for a retained record.
+fn txInfoJson(a: std.mem.Allocator, c: *const chain_mod.Chain, rec: chain_mod.TxRecord, number: u64, index: u32) []const u8 {
+    const dt = transaction.decode(a, rec.raw) catch return "null";
+    const bh = c.hashByNumber(number) orelse std.mem.zeroes([32]u8);
+    var buf: std.ArrayList(u8) = .empty;
+    p(a, &buf, "{{\"type\":\"0x{x}\",\"hash\":\"{s}\",\"nonce\":\"{s}\"", .{ rec.tx_type, hash32Hex(a, rec.hash), qHex(a, dt.nonce) });
+    p(a, &buf, ",\"blockHash\":\"{s}\",\"blockNumber\":\"{s}\",\"transactionIndex\":\"{s}\"", .{ hash32Hex(a, bh), qHex(a, number), qHex(a, index) });
+    p(a, &buf, ",\"from\":\"{s}\"", .{dataHex(a, &rec.sender)});
+    if (dt.to) |t| p(a, &buf, ",\"to\":\"{s}\"", .{dataHex(a, &t)}) else buf.appendSlice(a, ",\"to\":null") catch @panic("oom");
+    p(a, &buf, ",\"value\":\"{s}\",\"gas\":\"{s}\",\"input\":\"{s}\"", .{ qHex(a, dt.value), qHex(a, dt.gas_limit), dataHex(a, dt.data) });
+    if (dt.chain_id) |cid| p(a, &buf, ",\"chainId\":\"{s}\"", .{qHex(a, cid)});
+    // Fee fields: gasPrice is the effective price for all types; 1559+ add the caps.
+    p(a, &buf, ",\"gasPrice\":\"{s}\"", .{qHex(a, rec.effective_gas_price)});
+    if (rec.tx_type >= 2) {
+        p(a, &buf, ",\"maxFeePerGas\":\"{s}\",\"maxPriorityFeePerGas\":\"{s}\"", .{ qHex(a, dt.max_fee), qHex(a, dt.max_priority_fee) });
+    }
+    if (rec.tx_type >= 1) {
+        buf.appendSlice(a, ",\"accessList\":[") catch @panic("oom");
+        for (dt.access_list, 0..) |e, i| {
+            if (i > 0) buf.append(a, ',') catch @panic("oom");
+            p(a, &buf, "{{\"address\":\"{s}\",\"storageKeys\":[", .{dataHex(a, &e.address)});
+            for (e.keys, 0..) |k, j| {
+                if (j > 0) buf.append(a, ',') catch @panic("oom");
+                var w: [32]u8 = undefined;
+                std.mem.writeInt(u256, &w, k, .big);
+                p(a, &buf, "\"{s}\"", .{hash32Hex(a, w)});
+            }
+            buf.appendSlice(a, "]}") catch @panic("oom");
+        }
+        buf.appendSlice(a, "]") catch @panic("oom");
+    }
+    if (rec.tx_type == 3) {
+        p(a, &buf, ",\"maxFeePerBlobGas\":\"{s}\",\"blobVersionedHashes\":[", .{qHex(a, dt.max_fee_per_blob_gas)});
+        for (dt.blob_versioned_hashes, 0..) |bvh, i| {
+            if (i > 0) buf.append(a, ',') catch @panic("oom");
+            p(a, &buf, "\"{s}\"", .{hash32Hex(a, bvh)});
+        }
+        buf.appendSlice(a, "]") catch @panic("oom");
+    }
+    var rb: [32]u8 = undefined;
+    var sb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &rb, dt.r, .big);
+    std.mem.writeInt(u256, &sb, dt.s, .big);
+    p(a, &buf, ",\"r\":\"{s}\",\"s\":\"{s}\",\"yParity\":\"0x{x}\",\"v\":\"0x{x}\"", .{ hash32Hex(a, rb), hash32Hex(a, sb), dt.y_parity, dt.y_parity });
+    buf.append(a, '}') catch @panic("oom");
+    return buf.items;
+}
+
+/// A ReceiptInfo object for a retained record.
+fn receiptJson(a: std.mem.Allocator, c: *const chain_mod.Chain, rec: chain_mod.TxRecord, number: u64, index: u32, log_base: usize) []const u8 {
+    const bh = c.hashByNumber(number) orelse std.mem.zeroes([32]u8);
+    var buf: std.ArrayList(u8) = .empty;
+    p(a, &buf, "{{\"type\":\"0x{x}\",\"transactionHash\":\"{s}\",\"transactionIndex\":\"{s}\"", .{ rec.tx_type, hash32Hex(a, rec.hash), qHex(a, index) });
+    p(a, &buf, ",\"blockHash\":\"{s}\",\"blockNumber\":\"{s}\",\"from\":\"{s}\"", .{ hash32Hex(a, bh), qHex(a, number), dataHex(a, &rec.sender) });
+    if (rec.to) |t| p(a, &buf, ",\"to\":\"{s}\"", .{dataHex(a, &t)}) else buf.appendSlice(a, ",\"to\":null") catch @panic("oom");
+    p(a, &buf, ",\"cumulativeGasUsed\":\"{s}\",\"gasUsed\":\"{s}\"", .{ qHex(a, rec.cumulative_gas_used), qHex(a, rec.gas_used) });
+    if (rec.contract_address) |ca| p(a, &buf, ",\"contractAddress\":\"{s}\"", .{dataHex(a, &ca)}) else buf.appendSlice(a, ",\"contractAddress\":null") catch @panic("oom");
+    const bloom = block.logsBloom(rec.logs);
+    p(a, &buf, ",\"logsBloom\":\"{s}\",\"status\":\"0x{x}\",\"effectiveGasPrice\":\"{s}\"", .{ dataHex(a, &bloom), @as(u8, if (rec.success) 1 else 0), qHex(a, rec.effective_gas_price) });
+    buf.appendSlice(a, ",\"logs\":[") catch @panic("oom");
+    for (rec.logs, 0..) |lg, li| {
+        if (li > 0) buf.append(a, ',') catch @panic("oom");
+        buf.appendSlice(a, logJson(a, lg, bh, number, rec.hash, index, log_base + li)) catch @panic("oom");
+    }
+    buf.appendSlice(a, "]}") catch @panic("oom");
+    return buf.items;
+}
+
+/// A Log object.
+fn logJson(a: std.mem.Allocator, lg: vm.Log, block_hash: [32]u8, number: u64, tx_hash: [32]u8, tx_index: u32, log_index: usize) []const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    p(a, &buf, "{{\"address\":\"{s}\",\"topics\":[", .{dataHex(a, &lg.address)});
+    for (lg.topics, 0..) |t, i| {
+        if (i > 0) buf.append(a, ',') catch @panic("oom");
+        p(a, &buf, "\"{s}\"", .{hash32Hex(a, t)});
+    }
+    p(a, &buf, "],\"data\":\"{s}\"", .{dataHex(a, lg.data)});
+    p(a, &buf, ",\"blockHash\":\"{s}\",\"blockNumber\":\"{s}\",\"transactionHash\":\"{s}\"", .{ hash32Hex(a, block_hash), qHex(a, number), hash32Hex(a, tx_hash) });
+    p(a, &buf, ",\"transactionIndex\":\"{s}\",\"logIndex\":\"{s}\",\"removed\":false}}", .{ qHex(a, tx_index), qHex(a, log_index) });
     return buf.items;
 }
 
@@ -182,20 +378,26 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
     if (std.mem.eql(u8, method, "eth_chainId")) return okStr(a, id, qHex(a, c.chain_id));
     if (std.mem.eql(u8, method, "eth_blockNumber")) return okStr(a, id, qHex(a, c.head.number));
     if (std.mem.eql(u8, method, "eth_syncing")) return ok(a, id, "false");
+    if (std.mem.eql(u8, method, "eth_coinbase")) return okStr(a, id, dataHex(a, &c.head.coinbase));
+    if (std.mem.eql(u8, method, "eth_accounts")) return ok(a, id, "[]");
+    if (std.mem.eql(u8, method, "eth_maxPriorityFeePerGas")) return okStr(a, id, qHex(a, 1_000_000_000));
+    if (std.mem.eql(u8, method, "eth_gasPrice")) return okStr(a, id, qHex(a, (c.head.base_fee_per_gas orelse 0) + 1_000_000_000));
+    if (std.mem.eql(u8, method, "eth_blobBaseFee")) {
+        const f = c.schedule.forkAt(c.head.timestamp);
+        return okStr(a, id, qHex(a, @import("tx.zig").blobGasPrice(c.head.excess_blob_gas orelse 0, f)));
+    }
 
     if (std.mem.eql(u8, method, "eth_getBlockByNumber")) {
         const tag = strParam(params, 0) orelse return err(a, id, -32602, "invalid params");
+        const full = params.len > 1 and params[1] == .bool and params[1].bool;
         const num = resolveBlock(c, tag) orelse return ok(a, id, "null");
-        return ok(a, id, blockJson(a, c, num) orelse "null");
+        return ok(a, id, blockJson(a, c, num, full) orelse "null");
     }
     if (std.mem.eql(u8, method, "eth_getBlockByHash")) {
         const hs = strParam(params, 0) orelse return err(a, id, -32602, "invalid params");
-        var want: [32]u8 = undefined;
-        const hb = if (std.mem.startsWith(u8, hs, "0x")) hs[2..] else hs;
-        _ = std.fmt.hexToBytes(&want, hb) catch return ok(a, id, "null");
-        for (c.hashes.items, 0..) |h, n| if (std.mem.eql(u8, &h, &want))
-            return ok(a, id, blockJson(a, c, n) orelse "null");
-        return ok(a, id, "null");
+        const full = params.len > 1 and params[1] == .bool and params[1].bool;
+        const num = numberByHash(c, hs) orelse return ok(a, id, "null");
+        return ok(a, id, blockJson(a, c, num, full) orelse "null");
     }
     if (std.mem.eql(u8, method, "eth_getBalance")) {
         const addr = parseAddr(strParam(params, 0) orelse return err(a, id, -32602, "invalid params")) orelse return err(a, id, -32602, "invalid address");
@@ -215,6 +417,61 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
         var word: [32]u8 = undefined;
         std.mem.writeInt(u256, &word, c.state.getStorage(addr, key), .big);
         return okStr(a, id, hash32Hex(a, word));
+    }
+
+    if (std.mem.eql(u8, method, "eth_getTransactionByHash")) {
+        const h = parseHash(strParam(params, 0) orelse return err(a, id, -32602, "invalid params")) orelse return ok(a, id, "null");
+        const loc = c.tx_index.get(h) orelse return ok(a, id, "null");
+        const rec = c.txByHash(h).?;
+        return ok(a, id, txInfoJson(a, c, rec, loc.block_number, loc.index));
+    }
+    if (std.mem.eql(u8, method, "eth_getTransactionByBlockHashAndIndex") or std.mem.eql(u8, method, "eth_getTransactionByBlockNumberAndIndex")) {
+        const num = blk: {
+            const p0 = strParam(params, 0) orelse return err(a, id, -32602, "invalid params");
+            if (std.mem.eql(u8, method, "eth_getTransactionByBlockHashAndIndex"))
+                break :blk (numberByHash(c, p0) orelse return ok(a, id, "null"))
+            else
+                break :blk (resolveBlock(c, p0) orelse return ok(a, id, "null"));
+        };
+        const idx: u32 = @intCast(parseU64(strParam(params, 1) orelse "0x0"));
+        const rec = c.txByBlockIndex(num, idx) orelse return ok(a, id, "null");
+        return ok(a, id, txInfoJson(a, c, rec, num, idx));
+    }
+    if (std.mem.eql(u8, method, "eth_getTransactionReceipt")) {
+        const h = parseHash(strParam(params, 0) orelse return err(a, id, -32602, "invalid params")) orelse return ok(a, id, "null");
+        const loc = c.tx_index.get(h) orelse return ok(a, id, "null");
+        const rec = c.txByHash(h).?;
+        return ok(a, id, receiptJson(a, c, rec, loc.block_number, loc.index, logBase(c, loc.block_number, loc.index)));
+    }
+    if (std.mem.eql(u8, method, "eth_getBlockReceipts")) {
+        const num = resolveBlock(c, strParam(params, 0) orelse return err(a, id, -32602, "invalid params")) orelse return ok(a, id, "null");
+        const txs = c.blockTxs(num);
+        var buf: std.ArrayList(u8) = .empty;
+        buf.append(a, '[') catch @panic("oom");
+        var lbase: usize = 0;
+        for (txs, 0..) |rec, i| {
+            if (i > 0) buf.append(a, ',') catch @panic("oom");
+            buf.appendSlice(a, receiptJson(a, c, rec, num, @intCast(i), lbase)) catch @panic("oom");
+            lbase += rec.logs.len;
+        }
+        buf.append(a, ']') catch @panic("oom");
+        return ok(a, id, buf.items);
+    }
+    if (std.mem.eql(u8, method, "eth_getBlockTransactionCountByHash") or std.mem.eql(u8, method, "eth_getBlockTransactionCountByNumber")) {
+        const p0 = strParam(params, 0) orelse return err(a, id, -32602, "invalid params");
+        const num = if (std.mem.eql(u8, method, "eth_getBlockTransactionCountByHash"))
+            (numberByHash(c, p0) orelse return ok(a, id, "null"))
+        else
+            (resolveBlock(c, p0) orelse return ok(a, id, "null"));
+        if (num >= c.headers.items.len) return ok(a, id, "null");
+        return okStr(a, id, qHex(a, c.blockTxs(num).len));
+    }
+    if (std.mem.eql(u8, method, "eth_getUncleCountByBlockHash") or std.mem.eql(u8, method, "eth_getUncleCountByBlockNumber")) {
+        return okStr(a, id, "0x0"); // post-Merge: no uncles
+    }
+    if (std.mem.eql(u8, method, "eth_getLogs")) {
+        if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
+        return ok(a, id, getLogs(a, c, params[0].object));
     }
 
     if (std.mem.eql(u8, method, "eth_call")) {

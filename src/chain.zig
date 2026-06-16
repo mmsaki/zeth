@@ -39,12 +39,35 @@ pub const ImportError = error{
     OutOfMemory,
 };
 
+/// A mined transaction plus its receipt, retained for the RPC layer.
+pub const TxRecord = struct {
+    hash: [32]u8,
+    raw: []const u8, // EIP-2718 encoding (gpa-owned)
+    sender: Address,
+    to: ?Address,
+    tx_type: u8,
+    nonce: u64,
+    gas_used: u64,
+    cumulative_gas_used: u64,
+    success: bool,
+    contract_address: ?Address,
+    effective_gas_price: u256,
+    logs: []const vm.Log, // gpa-owned (deep)
+};
+const TxLoc = struct { block_number: u64, index: u32 };
+
 pub const Chain = struct {
     gpa: std.mem.Allocator,
     state: *State,
     schedule: genesis_mod.ForkSchedule,
     chain_id: u64,
     head: Header,
+    /// RLP-encoded block size by number (for the `size` RPC field).
+    sizes: std.ArrayList(u64) = .empty,
+    /// Per-block transaction records, indexed by block number (0 = genesis = empty).
+    block_txs: std.ArrayList([]TxRecord) = .empty,
+    /// tx hash → (block number, index) for getTransactionByHash/Receipt.
+    tx_index: std.AutoHashMapUnmanaged([32]u8, TxLoc) = .{},
     /// Canonical headers by block number (index 0 = genesis). Each header's
     /// `extra_data` is owned by `gpa` (the decoded header otherwise lives in a
     /// per-block arena freed when importBlock returns). RPC serves from here.
@@ -61,6 +84,10 @@ pub const Chain = struct {
             .head = g.header,
         };
         try c.pushBlock(g.header, try g.header.hash(gpa));
+        try c.block_txs.append(gpa, &.{}); // genesis has no transactions
+        const genc = try g.header.encode(gpa);
+        defer gpa.free(genc);
+        try c.sizes.append(gpa, genc.len + 4); // header + empty txs/uncles lists
         return c;
     }
 
@@ -68,6 +95,43 @@ pub const Chain = struct {
         for (self.headers.items) |h| self.gpa.free(h.extra_data);
         self.headers.deinit(self.gpa);
         self.hashes.deinit(self.gpa);
+        for (self.block_txs.items) |txs| {
+            for (txs) |*t| {
+                self.gpa.free(t.raw);
+                for (t.logs) |lg| {
+                    self.gpa.free(lg.topics);
+                    self.gpa.free(lg.data);
+                }
+                self.gpa.free(t.logs);
+            }
+            if (txs.len > 0) self.gpa.free(txs);
+        }
+        self.block_txs.deinit(self.gpa);
+        self.sizes.deinit(self.gpa);
+        self.tx_index.deinit(self.gpa);
+    }
+
+    pub fn sizeByNumber(self: *const Chain, number: u64) u64 {
+        if (number >= self.sizes.items.len) return 0;
+        return self.sizes.items[number];
+    }
+
+    /// A transaction record by hash, or null.
+    pub fn txByHash(self: *const Chain, hash: [32]u8) ?TxRecord {
+        const loc = self.tx_index.get(hash) orelse return null;
+        return self.block_txs.items[loc.block_number][loc.index];
+    }
+    /// A transaction record by block number + index, or null.
+    pub fn txByBlockIndex(self: *const Chain, number: u64, index: u32) ?TxRecord {
+        if (number >= self.block_txs.items.len) return null;
+        const txs = self.block_txs.items[number];
+        if (index >= txs.len) return null;
+        return txs[index];
+    }
+    /// All transaction records of a block number.
+    pub fn blockTxs(self: *const Chain, number: u64) []const TxRecord {
+        if (number >= self.block_txs.items.len) return &.{};
+        return self.block_txs.items[number];
     }
 
     /// Adopt a header as the new head, owning its `extra_data` stably.
@@ -123,10 +187,11 @@ pub const Chain = struct {
         if (fork.atLeast(.prague))
             self.systemCall(a, &env, HISTORY_STORAGE, &h.parent_hash);
 
-        // Execute the transactions, accumulating receipts.
+        // Execute the transactions, accumulating receipts + retained records.
         var receipts: std.ArrayList(block.Receipt) = .empty;
+        var records: std.ArrayList(TxRecord) = .empty;
         var cumulative_gas: u64 = 0;
-        for (blk.transactions) |enc| {
+        for (blk.transactions, 0..) |enc, ti| {
             const dt = transaction.decode(a, enc) catch return error.DecodeError;
             const gas_price = dt.effectiveGasPrice(env.base_fee);
             env.gas_price = gas_price;
@@ -153,6 +218,27 @@ pub const Chain = struct {
                 .cumulative_gas_used = cumulative_gas,
                 .logs = logs.items,
             }) catch return error.OutOfMemory;
+
+            // Retain a gpa-owned record for the RPC layer.
+            const contract: ?Address = if (dt.to == null)
+                (state_mod.computeContractAddress(self.gpa, dt.sender, dt.nonce) catch return error.OutOfMemory)
+            else
+                null;
+            records.append(a, .{
+                .hash = crypto.keccak256(enc),
+                .raw = self.gpa.dupe(u8, enc) catch return error.OutOfMemory,
+                .sender = dt.sender,
+                .to = dt.to,
+                .tx_type = dt.tx_type,
+                .nonce = dt.nonce,
+                .gas_used = res.gas_used,
+                .cumulative_gas_used = cumulative_gas,
+                .success = res.success,
+                .contract_address = contract,
+                .effective_gas_price = gas_price,
+                .logs = ownLogs(self.gpa, logs.items),
+            }) catch return error.OutOfMemory;
+            _ = ti;
         }
 
         // Withdrawals (Shanghai+): credit balance, amount is in Gwei.
@@ -177,9 +263,14 @@ pub const Chain = struct {
             if (!std.mem.eql(u8, &got, &wr)) return error.WithdrawalsRootMismatch;
         }
 
-        // Accept: advance head + record the canonical header/hash.
+        // Accept: advance head + record the canonical header/hash + retained txs.
         const bh = h.hash(self.gpa) catch return error.OutOfMemory;
         self.pushBlock(h, bh) catch return error.OutOfMemory;
+        const owned = self.gpa.dupe(TxRecord, records.items) catch return error.OutOfMemory;
+        self.block_txs.append(self.gpa, owned) catch return error.OutOfMemory;
+        self.sizes.append(self.gpa, raw.len) catch return error.OutOfMemory;
+        for (owned, 0..) |r, i|
+            self.tx_index.put(self.gpa, r.hash, .{ .block_number = h.number, .index = @intCast(i) }) catch return error.OutOfMemory;
         return self.head;
     }
 
@@ -200,6 +291,17 @@ pub const Chain = struct {
 
 fn bytesToU256(b: *const [32]u8) u256 {
     return std.mem.readInt(u256, b, .big);
+}
+
+/// Deep-copy a tx's logs into `gpa` so they outlive the per-block arena.
+fn ownLogs(gpa: std.mem.Allocator, logs: []const vm.Log) []const vm.Log {
+    const out = gpa.alloc(vm.Log, logs.len) catch @panic("oom");
+    for (logs, 0..) |lg, i| out[i] = .{
+        .address = lg.address,
+        .topics = gpa.dupe([32]u8, lg.topics) catch @panic("oom"),
+        .data = gpa.dupe(u8, lg.data) catch @panic("oom"),
+    };
+    return out;
 }
 
 const Withdrawal = struct { address: Address, amount: u64 };
