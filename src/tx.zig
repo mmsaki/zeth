@@ -242,7 +242,10 @@ pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: 
     var intrinsic = ig.standard;
     for (tx.access_list) |e| intrinsic += ACCESS_LIST_ADDRESS + ACCESS_LIST_KEY * e.keys.len;
     intrinsic += AUTH_PER_EMPTY_ACCOUNT * tx.authorizations.len;
-    if (tx.gas_limit < intrinsic) return .intrinsic_gas_too_low;
+    // EIP-7623 (Prague): the gas limit must also cover the calldata floor, since
+    // the transaction is charged at least that much regardless of execution.
+    const required: u64 = if (env.fork.atLeast(.prague)) @max(intrinsic, ig.floor) else intrinsic;
+    if (tx.gas_limit < required) return .intrinsic_gas_too_low;
 
     // Nonce must match exactly, and must leave room to increment (EELS rejects
     // a nonce of U64.MAX_VALUE so sender.nonce + 1 cannot overflow).
