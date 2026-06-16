@@ -537,6 +537,15 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap, 
         st.setBalance(env.coinbase, st.balanceOf(env.coinbase) + miner_reward) catch @panic("oom");
     }
 
+    // EIP-7685 (Prague): the withdrawal/consolidation predeploy system calls run
+    // at block end and dequeue their request queues, mutating predeploy storage.
+    // (Deposits and the requests-hash don't affect the state root, so the
+    // JSON-driven path only needs these two calls to match.)
+    if (g_fork.atLeast(.prague)) {
+        systemCall(a, st, &env, "0x00000961Ef480Eb55e80D19ad83579A64c007002", &.{}); // EIP-7002
+        systemCall(a, st, &env, "0x0000BBdDc7CE488642fb579F8B00f3a590007251", &.{}); // EIP-7251
+    }
+
     const got = zeth.trie.stateRoot(a, st);
     var want: [32]u8 = undefined;
     const sr = jstr(header, "stateRoot") orelse return false;
