@@ -45,10 +45,11 @@ pub const Chain = struct {
     schedule: genesis_mod.ForkSchedule,
     chain_id: u64,
     head: Header,
-    /// `head.extra_data` storage, owned by `gpa` (the decoded header lives in a
-    /// per-block arena that is freed when importBlock returns).
-    head_extra: []u8 = &.{},
-    /// Canonical block hashes by number (index 0 = genesis) for the BLOCKHASH opcode.
+    /// Canonical headers by block number (index 0 = genesis). Each header's
+    /// `extra_data` is owned by `gpa` (the decoded header otherwise lives in a
+    /// per-block arena freed when importBlock returns). RPC serves from here.
+    headers: std.ArrayList(Header) = .empty,
+    /// Canonical block hashes by number, for the BLOCKHASH opcode + RPC.
     hashes: std.ArrayList([32]u8) = .empty,
 
     pub fn initGenesis(gpa: std.mem.Allocator, state: *State, g: genesis_mod.Genesis) !Chain {
@@ -59,25 +60,34 @@ pub const Chain = struct {
             .chain_id = g.schedule.chain_id,
             .head = g.header,
         };
-        c.head_extra = try gpa.dupe(u8, g.header.extra_data);
-        c.head.extra_data = c.head_extra;
-        try c.hashes.append(gpa, try c.head.hash(gpa));
+        try c.pushBlock(g.header, try g.header.hash(gpa));
         return c;
     }
 
     pub fn deinit(self: *Chain) void {
+        for (self.headers.items) |h| self.gpa.free(h.extra_data);
+        self.headers.deinit(self.gpa);
         self.hashes.deinit(self.gpa);
-        self.gpa.free(self.head_extra);
     }
 
-    /// Stably adopt a freshly-decoded header as the new head (its `extra_data`
-    /// otherwise dangles once the per-block arena is freed).
-    fn setHead(self: *Chain, h: Header) !void {
-        const extra = try self.gpa.dupe(u8, h.extra_data);
-        self.gpa.free(self.head_extra);
-        self.head_extra = extra;
-        self.head = h;
-        self.head.extra_data = extra;
+    /// Adopt a header as the new head, owning its `extra_data` stably.
+    fn pushBlock(self: *Chain, h: Header, hash: [32]u8) !void {
+        var owned = h;
+        owned.extra_data = try self.gpa.dupe(u8, h.extra_data);
+        try self.headers.append(self.gpa, owned);
+        try self.hashes.append(self.gpa, hash);
+        self.head = owned;
+    }
+
+    /// The canonical header at a block number, or null if beyond the head.
+    pub fn headerByNumber(self: *const Chain, number: u64) ?Header {
+        if (number >= self.headers.items.len) return null;
+        return self.headers.items[number];
+    }
+
+    pub fn hashByNumber(self: *const Chain, number: u64) ?[32]u8 {
+        if (number >= self.hashes.items.len) return null;
+        return self.hashes.items[number];
     }
 
     /// Decode, execute, and validate a block from its RLP. On success the world
@@ -167,10 +177,9 @@ pub const Chain = struct {
             if (!std.mem.eql(u8, &got, &wr)) return error.WithdrawalsRootMismatch;
         }
 
-        // Accept: advance head + record the canonical hash.
+        // Accept: advance head + record the canonical header/hash.
         const bh = h.hash(self.gpa) catch return error.OutOfMemory;
-        self.hashes.append(self.gpa, bh) catch return error.OutOfMemory;
-        self.setHead(h) catch return error.OutOfMemory;
+        self.pushBlock(h, bh) catch return error.OutOfMemory;
         return self.head;
     }
 
