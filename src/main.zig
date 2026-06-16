@@ -140,9 +140,14 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
     var auth_host: []const u8 = "0.0.0.0";
     var auth_port: u16 = 8551;
     var jwt_path: ?[]const u8 = null;
+    var datadir: ?[]const u8 = null;
     var genesis_path: ?[]const u8 = null;
     var rlp_files: std.ArrayList([]const u8) = .empty;
     for (args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--datadir=")) {
+            datadir = arg["--datadir=".len..];
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--http.addr=")) {
             const hp = arg["--http.addr=".len..];
             if (std.mem.lastIndexOfScalar(u8, hp, ':')) |ci| {
@@ -180,8 +185,34 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
     var ch = try zeth.chain.Chain.initGenesis(gpa, &st, g);
     defer ch.deinit();
 
-    // Import any provided RLP block files.
-    for (rlp_files.items) |path| {
+    // Optional on-disk persistence (`--datadir`). Open the store; if it already
+    // holds a head and no RLP files were given, resume from disk instead of
+    // re-importing. Otherwise import the RLP and snapshot the result.
+    var db_opt: ?zeth.db.Db = if (datadir) |dir| try zeth.db.Db.open(gpa, io, dir) else null;
+    defer if (db_opt) |*d| d.close();
+    var store_opt: ?zeth.store.Store = if (db_opt) |*d| zeth.store.Store.init(d) else null;
+
+    var resumed = false;
+    if (store_opt) |*store| {
+        if (rlp_files.items.len == 0) {
+            if (try store.getHead(a)) |head| {
+                var n: u64 = 1;
+                while (n <= head.number) : (n += 1) {
+                    const hash = (try store.getCanonical(a, n)) orelse break;
+                    const henc = (try store.getHeader(a, hash)) orelse break;
+                    defer a.free(henc);
+                    const hdr = zeth.block.headerFromRlp(a, henc) catch break;
+                    try ch.appendResumed(hdr, hash, henc.len + 16);
+                }
+                try store.loadState(gpa, &st);
+                resumed = (ch.head.number == head.number);
+                std.debug.print("resumed from {s}: head=#{d}\n", .{ datadir.?, ch.head.number });
+            }
+        }
+    }
+
+    // Import any provided RLP block files (skipped when resuming from disk).
+    if (!resumed) for (rlp_files.items) |path| {
         const data = readFile(gpa, io, path) catch |e| {
             std.debug.print("warning: cannot read {s}: {s}\n", .{ path, @errorName(e) });
             continue;
@@ -197,7 +228,13 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
                 break;
             };
         }
-    }
+    };
+
+    // Persist the imported chain + state for next time.
+    if (!resumed) if (store_opt) |*store| {
+        ch.persistTo(a, store) catch |e| std.debug.print("warning: persist failed: {s}\n", .{@errorName(e)});
+    };
+
     const hh = try ch.head.hash(gpa);
     std.debug.print("zeth node: chainId={d} head=#{d} hash=0x{s}\n", .{ ch.chain_id, ch.head.number, std.fmt.bytesToHex(&hh, .lower) });
 
