@@ -56,6 +56,10 @@ fn dispatch(ctx: *MainCtx) void {
         p2pConnect(ctx.gpa, ctx.io, args[2..]) catch |e| {
             ctx.err = e;
         };
+    } else if (std.mem.eql(u8, cmd, "sync")) {
+        syncCmd(ctx.gpa, ctx.io, args[2..]) catch |e| {
+            ctx.err = e;
+        };
     } else {
         ctx.err = usage(args[0]);
     }
@@ -190,6 +194,109 @@ fn p2pConnect(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !voi
             else => std.debug.print("← msg id=0x{x} ({d} bytes)\n", .{ msg.id, msg.payload.len }),
         }
     }
+}
+
+/// `zeth sync <enode> <genesis.json>` — load genesis, dial a peer, complete the
+/// eth/69 handshake, then download headers + bodies in batches, execute each
+/// block through the import pipeline, and follow the peer's head. The first real
+/// P2P block sync.
+fn syncCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (args.len < 2) {
+        std.debug.print("usage: zeth sync <enode://...> <genesis.json>\n", .{});
+        return error.MissingArgument;
+    }
+    const enode = try zeth.peer.parseEnode(args[0]);
+
+    // Genesis → state + chain.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gjson = try readFile(gpa, io, args[1]);
+    defer gpa.free(gjson);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, gjson, .{});
+    var st = zeth.State.init(gpa);
+    defer st.deinit();
+    const g = try zeth.genesis.load(a, &st, parsed.value);
+    var ch = try zeth.chain.Chain.initGenesis(gpa, &st, g);
+    defer ch.deinit();
+    const genesis_hash = try ch.head.hash(gpa);
+    const network_id = g.schedule.chain_id;
+    const fid = zeth.forkid.compute(genesis_hash, &.{}, 0);
+    std.debug.print("genesis #0 0x{s} (chainId={d} forkid=0x{s})\n", .{ std.fmt.bytesToHex(&genesis_hash, .lower), network_id, std.fmt.bytesToHex(&fid.hash, .lower) });
+
+    // Dial + RLPx handshake.
+    const priv = zeth.ecies.randomPriv(io);
+    const pub_key = try zeth.ecies.pubFromPriv(priv);
+    const p = try zeth.peer.Peer.dial(gpa, io, enode, priv);
+    defer p.destroy();
+    std.debug.print("✓ connected to {s}:{d}\n", .{ enode.host, enode.port });
+
+    // p2p Hello, then eth/69 Status.
+    try p.sendHello(pub_key);
+    gpa.free(try p.readUntil(gpa, zeth.eth_proto.p2p.hello));
+    const our_status = zeth.eth_proto.Status69{
+        .version = 69,
+        .network_id = network_id,
+        .genesis_hash = genesis_hash,
+        .fork_hash = fid.hash,
+        .fork_next = fid.next,
+        .latest_block_hash = genesis_hash,
+    };
+    {
+        const sp = try our_status.encode(a);
+        try p.writeMessage(zeth.eth_proto.eth.status, sp);
+    }
+    const status_payload = try p.readUntil(gpa, zeth.eth_proto.eth.status);
+    defer gpa.free(status_payload);
+    const peer_status = try zeth.eth_proto.Status69.decode(a, status_payload);
+    const target = peer_status.latest_block;
+    std.debug.print("✓ eth/69 handshake — peer head #{d}\n", .{target});
+
+    // Header → body → execute, in batches, until we reach the peer's head.
+    var reqid: u64 = 1;
+    while (ch.head.number < target) {
+        var batch_arena = std.heap.ArenaAllocator.init(gpa);
+        defer batch_arena.deinit();
+        const ba = batch_arena.allocator();
+
+        const start = ch.head.number + 1;
+        const remaining = target - ch.head.number;
+        const amount: u64 = @min(@as(u64, 192), remaining);
+
+        // GetBlockHeaders.
+        reqid += 1;
+        const hreq = zeth.eth_proto.GetBlockHeaders{ .request_id = reqid, .origin_number = start, .amount = amount };
+        try p.writeMessage(zeth.eth_proto.eth.get_block_headers, try hreq.encode(ba));
+        const hpayload = try p.readUntil(gpa, zeth.eth_proto.eth.block_headers);
+        defer gpa.free(hpayload);
+        const hresp = try zeth.eth_proto.decodeBlockHeaders(ba, hpayload);
+        if (hresp.headers.len == 0) {
+            std.debug.print("peer returned no headers at #{d}; stopping\n", .{start});
+            break;
+        }
+
+        // GetBlockBodies for those headers.
+        var hashes = try ba.alloc([32]u8, hresp.headers.len);
+        for (hresp.headers, 0..) |*h, i| hashes[i] = try h.hash(ba);
+        reqid += 1;
+        try p.writeMessage(zeth.eth_proto.eth.get_block_bodies, try zeth.eth_proto.encodeGetBlockBodies(ba, reqid, hashes));
+        const bpayload = try p.readUntil(gpa, zeth.eth_proto.eth.block_bodies);
+        defer gpa.free(bpayload);
+        const bresp = try zeth.eth_proto.decodeBlockBodies(ba, bpayload);
+
+        const n = @min(hresp.headers.len, bresp.bodies.len);
+        for (0..n) |i| {
+            const blk = try zeth.eth_proto.assembleBlock(ba, hresp.headers[i], bresp.bodies[i]);
+            _ = ch.importBlock(blk) catch |e| {
+                std.debug.print("✗ import failed at #{d}: {s}{s}\n", .{ ch.head.number + 1, @errorName(e), if (ch.last_error) |le| le else "" });
+                return e;
+            };
+        }
+        std.debug.print("  synced → #{d} / {d}\n", .{ ch.head.number, target });
+    }
+
+    const hh = try ch.head.hash(gpa);
+    std.debug.print("✓ sync complete: head #{d} 0x{s}\n", .{ ch.head.number, std.fmt.bytesToHex(&hh, .lower) });
 }
 
 fn usage(prog: []const u8) error{MissingArgument} {
