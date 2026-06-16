@@ -140,12 +140,12 @@ pub const Peer = struct {
         const a = arena.allocator();
         const cap_items = [_][]const u8{
             try rlp.encodeBytes(a, "eth"),
-            try rlp.encodeUint(a, eth_proto.ETH_VERSION),
+            try rlp.encodeUint(a, 69), // negotiate eth/69 (geth no longer offers 68)
         };
         const cap = try rlp.encodeList(a, &cap_items);
         const caps = try rlp.encodeList(a, &[_][]const u8{cap});
         const fields = [_][]const u8{
-            try rlp.encodeUint(a, 5), // p2p protocol version
+            try rlp.encodeUint(a, 4), // p2p protocol version (4 = no snappy)
             try rlp.encodeBytes(a, "zeth/0.1.0"),
             caps,
             try rlp.encodeUint(a, 0), // listen port (0 = not listening)
