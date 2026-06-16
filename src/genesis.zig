@@ -75,15 +75,25 @@ pub const Genesis = struct {
 };
 
 // ── hex helpers (geth genesis quantities are 0x-prefixed) ───────────────────
+// geth genesis quantity fields are `HexOrDecimal` — `0x`-prefixed values are
+// base-16, everything else is base-10 (e.g. `timestamp` and `alloc` balances
+// are commonly decimal).
 fn hU64(s: ?[]const u8) u64 {
     const v = s orelse return 0;
-    const b = if (std.mem.startsWith(u8, v, "0x")) v[2..] else v;
-    return std.fmt.parseInt(u64, b, 16) catch 0;
+    if (std.mem.startsWith(u8, v, "0x")) return std.fmt.parseInt(u64, v[2..], 16) catch 0;
+    return std.fmt.parseInt(u64, v, 10) catch 0;
 }
 fn hU256(s: ?[]const u8) u256 {
     const v = s orelse return 0;
-    const b = if (std.mem.startsWith(u8, v, "0x")) v[2..] else v;
-    return std.fmt.parseInt(u256, b, 16) catch 0;
+    if (std.mem.startsWith(u8, v, "0x")) return std.fmt.parseInt(u256, v[2..], 16) catch 0;
+    return std.fmt.parseInt(u256, v, 10) catch 0;
+}
+/// The 8-byte block nonce: a quantity, right-aligned big-endian (e.g. 0x1234 →
+/// 00 00 00 00 00 00 12 34), unlike a fixed hash field.
+fn nonceBytes(v: u64) [8]u8 {
+    var out: [8]u8 = undefined;
+    std.mem.writeInt(u64, &out, v, .big);
+    return out;
 }
 fn hFixed(comptime N: usize, s: ?[]const u8) [N]u8 {
     var out: [N]u8 = std.mem.zeroes([N]u8);
@@ -173,20 +183,41 @@ pub fn load(a: std.mem.Allocator, st: *State, root: std.json.Value) !Genesis {
         .gas_used = hU64(jstr(obj, "gasUsed")),
         .timestamp = timestamp,
         .extra_data = hBytes(a, jstr(obj, "extraData")),
-        .prev_randao = hFixed(32, jstr(obj, "mixHash")),
-        .nonce = hFixed(8, jstr(obj, "nonce")),
+        .prev_randao = hFixed(32, jstr(obj, "mixHash") orelse jstr(obj, "mixhash")),
+        .nonce = nonceBytes(hU64(jstr(obj, "nonce"))),
     };
-    // Fork-additive trailing fields: include each one exactly when the genesis
-    // JSON carries it. The genesis block's own fork (its header shape) is fixed
-    // by the fixture, and block-based vs timestamp-based activation can place
-    // the genesis at any fork — so the literal fields are authoritative, not a
-    // fork guess. (transactions/receipts/withdrawals roots default to empty.)
-    if (jstr(obj, "baseFeePerGas")) |v| h.base_fee_per_gas = hU256(v);
-    if (jstr(obj, "withdrawalsRoot")) |v| h.withdrawals_root = hFixed(32, v);
-    if (jstr(obj, "blobGasUsed")) |v| h.blob_gas_used = hU64(v);
-    if (jstr(obj, "excessBlobGas")) |v| h.excess_blob_gas = hU64(v);
-    if (jstr(obj, "parentBeaconBlockRoot")) |v| h.parent_beacon_block_root = hFixed(32, v);
-    if (jstr(obj, "requestsHash")) |v| h.requests_hash = hFixed(32, v);
+    // Fork-additive trailing fields. A literal value in the JSON (test fixtures)
+    // is authoritative; otherwise a geth-style *config* genesis implies them from
+    // the fork active at genesis (block 0), exactly as geth computes the genesis
+    // header. (transactions/receipts roots default to empty.)
+    const gfork = sched.forkAt(0, timestamp);
+    if (jstr(obj, "baseFeePerGas")) |v|
+        h.base_fee_per_gas = hU256(v)
+    else if (gfork.atLeast(.london))
+        h.base_fee_per_gas = 1_000_000_000; // EIP-1559 InitialBaseFee (1 gwei)
+    if (jstr(obj, "withdrawalsRoot")) |v|
+        h.withdrawals_root = hFixed(32, v)
+    else if (gfork.atLeast(.shanghai))
+        h.withdrawals_root = trie.EMPTY_TRIE_ROOT;
+    if (jstr(obj, "blobGasUsed")) |v|
+        h.blob_gas_used = hU64(v)
+    else if (gfork.atLeast(.cancun))
+        h.blob_gas_used = 0;
+    if (jstr(obj, "excessBlobGas")) |v|
+        h.excess_blob_gas = hU64(v)
+    else if (gfork.atLeast(.cancun))
+        h.excess_blob_gas = 0;
+    if (jstr(obj, "parentBeaconBlockRoot")) |v|
+        h.parent_beacon_block_root = hFixed(32, v)
+    else if (gfork.atLeast(.cancun))
+        h.parent_beacon_block_root = std.mem.zeroes([32]u8);
+    if (jstr(obj, "requestsHash")) |v|
+        h.requests_hash = hFixed(32, v)
+    else if (gfork.atLeast(.prague)) {
+        var r: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash("", &r, .{}); // empty requests = sha256("")
+        h.requests_hash = r;
+    }
 
     return .{ .schedule = sched, .header = h };
 }
