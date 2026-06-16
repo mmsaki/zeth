@@ -35,6 +35,12 @@ pub fn maxBlobGasPerBlock(fork: Fork) u64 {
     return if (fork.atLeast(.prague)) 1179648 else 786432;
 }
 
+/// Target blob gas per block: Cancun 3 blobs, Prague 6 (EIP-7691). The header's
+/// excessBlobGas must equal max(0, parent_excess + parent_used - target).
+pub fn targetBlobGasPerBlock(fork: Fork) u64 {
+    return (if (fork.atLeast(.prague)) @as(u64, 6) else 3) * GAS_PER_BLOB;
+}
+
 /// EIP-4844 blob base-fee update fraction. EIP-7691 retunes it for Prague.
 fn blobBaseFeeUpdateFraction(fork: Fork) u256 {
     return if (fork.atLeast(.prague)) 5007716 else 3338477;
