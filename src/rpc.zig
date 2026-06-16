@@ -67,7 +67,7 @@ fn hexBytes(a: std.mem.Allocator, s: []const u8) []u8 {
 fn headEnv(c: *const chain_mod.Chain) vm.Environment {
     const h = c.head;
     return .{
-        .fork = c.schedule.forkAt(h.timestamp),
+        .fork = c.schedule.forkAt(h.number, h.timestamp),
         .chain_id = c.chain_id,
         .coinbase = h.coinbase,
         .number = h.number,
@@ -391,7 +391,7 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
     if (std.mem.eql(u8, method, "eth_maxPriorityFeePerGas")) return okStr(a, id, qHex(a, 1_000_000_000));
     if (std.mem.eql(u8, method, "eth_gasPrice")) return okStr(a, id, qHex(a, (c.head.base_fee_per_gas orelse 0) + 1_000_000_000));
     if (std.mem.eql(u8, method, "eth_blobBaseFee")) {
-        const f = c.schedule.forkAt(c.head.timestamp);
+        const f = c.schedule.forkAt(c.head.number, c.head.timestamp);
         return okStr(a, id, qHex(a, @import("tx.zig").blobGasPrice(c.head.excess_blob_gas orelse 0, f)));
     }
 

@@ -132,7 +132,7 @@ pub const Chain = struct {
         var bn: u64 = 1;
         while (bn <= loc.block_number) : (bn += 1) {
             const h = self.headers.items[bn];
-            const fork = self.schedule.forkAt(h.timestamp);
+            const fork = self.schedule.forkAt(h.number, h.timestamp);
             var env = vm.Environment{
                 .fork = fork,
                 .chain_id = self.chain_id,
@@ -243,7 +243,7 @@ pub const Chain = struct {
         const parent_hash = self.head.hash(self.gpa) catch return error.OutOfMemory;
         if (!std.mem.eql(u8, &h.parent_hash, &parent_hash)) return error.BadParent;
 
-        const fork = self.schedule.forkAt(h.timestamp);
+        const fork = self.schedule.forkAt(h.number, h.timestamp);
 
         // EIP-4844 (Cancun+): the header's excessBlobGas must equal
         // max(0, parent_excess + parent_blob_used - target).
