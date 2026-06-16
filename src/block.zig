@@ -194,9 +194,15 @@ pub const Receipt = struct {
     success: bool,
     cumulative_gas_used: u64,
     logs: []const vm.Log,
+    /// Pre-Byzantium (before EIP-658), the receipt's first field is the
+    /// intermediate post-transaction state root, not a status code. When set,
+    /// it is encoded in place of `status`.
+    post_state: ?[32]u8 = null,
 
-    /// The post-Byzantium receipt body RLP: `[status, cumulativeGas, bloom, logs]`.
-    /// For a typed receipt the caller prepends the type byte (see `encode`).
+    /// The receipt body RLP: `[status|postStateRoot, cumulativeGas, bloom, logs]`
+    /// — a status code (0/1) from Byzantium (EIP-658) on, the post-transaction
+    /// state root before that. For a typed receipt the caller prepends the type
+    /// byte (see `encode`).
     fn bodyRlp(self: *const Receipt, a: std.mem.Allocator) ![]u8 {
         var log_items: std.ArrayList([]const u8) = .empty;
         for (self.logs) |lg| {
@@ -210,8 +216,12 @@ pub const Receipt = struct {
             try log_items.append(a, try rlp.encodeList(a, &fields));
         }
         const bloom = logsBloom(self.logs);
+        const status_or_root: []const u8 = if (self.post_state) |ps|
+            try rlp.encodeBytes(a, &ps)
+        else
+            try rlp.encodeUint(a, if (self.success) 1 else 0);
         const body = [_][]const u8{
-            try rlp.encodeUint(a, if (self.success) 1 else 0),
+            status_or_root,
             try rlp.encodeUint(a, self.cumulative_gas_used),
             try rlp.encodeBytes(a, &bloom),
             try rlp.encodeList(a, log_items.items),

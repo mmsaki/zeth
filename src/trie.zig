@@ -185,8 +185,10 @@ pub fn storageRoot(allocator: std.mem.Allocator, storage: anytype) [32]u8 {
 }
 
 /// World-state root: secured trie of address → RLP([nonce, balance,
-/// storageRoot, codeHash]). Fully-empty accounts (EIP-161) are excluded.
-pub fn stateRoot(allocator: std.mem.Allocator, st: *const state_mod.State) [32]u8 {
+/// storageRoot, codeHash]). When `prune_empty` is set (EIP-161, Spurious
+/// Dragon+), fully-empty accounts are excluded; before that fork an existing
+/// empty account is kept in the trie.
+pub fn stateRoot(allocator: std.mem.Allocator, st: *const state_mod.State, prune_empty: bool) [32]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -195,7 +197,7 @@ pub fn stateRoot(allocator: std.mem.Allocator, st: *const state_mod.State) [32]u
     var it = st.accounts.iterator();
     while (it.next()) |entry| {
         const acc = entry.value_ptr;
-        if (acc.nonce == 0 and acc.balance == 0 and acc.code.len == 0) continue; // empty
+        if (prune_empty and acc.nonce == 0 and acc.balance == 0 and acc.code.len == 0) continue; // empty
         const s_root = storageRoot(a, acc.storage);
         const code_hash = crypto.keccak256(acc.code);
 
