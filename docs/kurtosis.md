@@ -80,10 +80,35 @@ Expected output — a full handshake and a header download:
 ✓ downloaded headers from a real peer over devp2p
 ```
 
-`zeth p2p` is a **connectivity probe**, not a full sync — it validates the
-transport (ECIES → RLPx frames + MAC → Hello → eth/69 Status with a matching
-EIP-2124 forkid → `GetBlockHeaders`/`BlockHeaders`). The forkid for an
-all-at-genesis devnet is `CRC32(genesis_hash)`.
+`zeth p2p` is a **connectivity probe** — it validates the transport (ECIES →
+RLPx frames + MAC → Hello → eth/69 Status with a matching EIP-2124 forkid →
+`GetBlockHeaders`/`BlockHeaders`). The forkid for an all-at-genesis devnet is
+`CRC32(genesis_hash)`.
+
+## 3b. Full sync from the peer
+
+To actually download and execute the chain, point `zeth sync` at the same enode
+with the devnet's genesis (extract it from the geth container):
+
+```sh
+docker exec <geth-container> cat /network-configs/genesis.json > /tmp/devnet-genesis.json
+./zig-out/bin/zeth sync "$DIAL" /tmp/devnet-genesis.json
+```
+
+```
+genesis #0 0xe0dc4d42…  (chainId=3151908 forkid=0xf7650e8e)
+✓ connected …
+✓ eth/69 handshake — peer head #233
+  synced → #192 / 233
+  synced → #233 / 233
+✓ sync complete: head #233 0x249ef8069d…
+```
+
+zeth downloads headers+bodies in batches and runs every block through the full
+import pipeline (state/tx/receipt/bloom/gas validation). The synced head hash
+will match the peer's block at that height — confirm with
+`eth_getBlockByNumber`. (zeth's genesis must byte-match the peer's, which is why
+the same `genesis.json` is used; see the genesis fixes in `src/genesis.zig`.)
 
 ## 4. Tear down
 
