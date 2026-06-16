@@ -91,6 +91,22 @@ fn jarr(o: std.json.ObjectMap, k: []const u8) ?[]std.json.Value {
     return if (v == .array) v.array.items else null;
 }
 
+/// A field from a block's `blockHeader` (e.g. "hash", "parentHash").
+fn hdrStr(block: std.json.ObjectMap, k: []const u8) ?[]const u8 {
+    const hdr = jobj(block, "blockHeader") orelse return null;
+    return jstr(hdr, k);
+}
+
+/// Find the block in `blocks[]` whose header hash equals `hash`.
+fn findBlock(blocks: []std.json.Value, hash: []const u8) ?std.json.ObjectMap {
+    for (blocks) |b_v| {
+        if (b_v != .object) continue;
+        const h = hdrStr(b_v.object, "hash") orelse continue;
+        if (std.ascii.eqlIgnoreCase(h, hash)) return b_v.object;
+    }
+    return null;
+}
+
 fn loadPre(a: std.mem.Allocator, st: *zeth.State, pre: std.json.ObjectMap) void {
     var it = pre.iterator();
     while (it.next()) |e| {
@@ -328,12 +344,34 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
         }
     }
 
-    for (blocks, 0..) |b_v, bn| {
-        if (b_v != .object) continue;
-        const block = b_v.object;
-        // Blocks expected to be rejected are skipped (state unchanged).
-        if (block.get("expectException") != null) continue;
-        if (block.get("blockHeader") == null) continue;
+    // Determine the canonical chain. Multi-chain tests include side-chain blocks
+    // in `blocks[]` that lose the reorg — their transactions must NOT count toward
+    // the post state. Walk `parentHash` from `lastblockhash` back to genesis to
+    // recover only the winning branch; for a single linear chain this is exactly
+    // the array order.
+    const genesis_hash: ?[]const u8 = if (jobj(obj, "genesisBlockHeader")) |gh| jstr(gh, "hash") else null;
+    var canon: std.ArrayList(std.json.ObjectMap) = .empty;
+    if (jstr(obj, "lastblockhash")) |last| {
+        var cur = last;
+        while (true) {
+            if (genesis_hash) |gh| if (std.ascii.eqlIgnoreCase(cur, gh)) break;
+            const blk = findBlock(blocks, cur) orelse break;
+            canon.append(a, blk) catch @panic("oom");
+            cur = hdrStr(blk, "parentHash") orelse break;
+        }
+        std.mem.reverse(std.json.ObjectMap, canon.items); // genesis-first
+    } else {
+        // No canonical head given: apply every valid block in array order.
+        for (blocks) |b_v| {
+            if (b_v != .object) continue;
+            const block = b_v.object;
+            if (block.get("expectException") != null) continue;
+            if (block.get("blockHeader") == null) continue;
+            canon.append(a, block) catch @panic("oom");
+        }
+    }
+
+    for (canon.items, 0..) |block, bn| {
         if (!applyBlock(a, &st, block, block_hashes.items)) {
             rep.failLine("  {s}{s}{s}\n    {s}{s}{s} block {d} post-state root differs:\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET), bn });
             if (jobj(obj, "postState")) |ps| diffState(rep, &st, ps);
