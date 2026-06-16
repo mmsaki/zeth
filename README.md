@@ -55,6 +55,22 @@ Without `--all` they stop at the first failure (like a compiler). Run
 `blocktest --help` / `statetest --help` for the full flag list. Fixtures live
 under `ethereum-tests/` and `eest-fixtures/` (both gitignored).
 
+## Running a node / networking
+
+zeth can serve JSON-RPC + the Engine API, persist to disk (`--datadir`), and
+speak devp2p (RLPx + eth/69) — its transport is validated against real geth.
+
+- **[docs/production.md](docs/production.md)** — what works today vs what's left,
+  how to run the node, and an honest production-readiness status. **Read this
+  before running zeth anywhere that matters — it is not yet a mainnet client.**
+- **[docs/kurtosis.md](docs/kurtosis.md)** — stand up a local devnet and test
+  zeth against a real geth/reth node (handshake + header download).
+
+```sh
+zeth node <genesis.json> [chain.rlp ...] --datadir=DIR --http.addr=HOST:PORT
+zeth p2p <enode://…> <networkId> <genesisHash>   # devp2p interop probe
+```
+
 ## Benchmark
 
 ```sh
@@ -74,4 +90,8 @@ alongside Mgas/s throughput.
 | `src/tx.zig` | transaction processing + validation |
 | `src/precompiles.zig` | precompiles (incl. bn254, BLS12-381, KZG) |
 | `src/bn254.zig`, `src/bls12_381.zig` | pairing-friendly curve crypto |
+| `src/chain.zig` | block-import pipeline + in-memory chain |
+| `src/db.zig`, `src/store.zig` | durable KV store + typed block/state persistence |
+| `src/ecies.zig`, `src/secp.zig`, `src/rlpx.zig`, `src/handshake.zig` | devp2p transport (ECIES, ECDSA, RLPx frames, auth/ack) |
+| `src/eth_proto.zig`, `src/forkid.zig`, `src/peer.zig` | eth/69 messages, EIP-2124 forkid, TCP peer |
 | `tools/` | fixture-test runners (`statetest`, `blocktest`, `eels`) |
