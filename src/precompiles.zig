@@ -10,19 +10,21 @@ const state_mod = @import("state.zig");
 const bn254 = @import("bn254.zig");
 const bls = @import("bls12_381.zig");
 const Address = state_mod.Address;
+const Fork = @import("fork.zig").Fork;
 
 pub const Output = struct { data: []u8, gas: u64 };
 
 /// Return the precompile id if `addr` is an implemented precompile, else null.
 /// 0x01–0x09 (classic), 0x0b (BLS12-381 G1ADD). 0x0a (KZG) and the rest of the
 /// BLS set are not yet implemented, so they are not treated as precompiles.
-pub fn idOf(addr: Address) ?u8 {
+pub fn idOf(addr: Address, fork: Fork) ?u8 {
     for (addr[0..19]) |b| if (b != 0) return null;
     const id = addr[19];
+    // 0x01–0x09 are active for every fork we currently target (Cancun+).
     if (id >= 1 and id <= 0x09) return id;
-    if (id == 0x0a) return id; // KZG point evaluation (EIP-4844)
-    // BLS12-381: G1ADD, G1MSM, G2ADD, G2MSM, PAIRING.
-    if (id >= 0x0b and id <= 0x11) return id;
+    if (id == 0x0a) return if (fork.atLeast(.cancun)) id else null; // KZG (EIP-4844)
+    // BLS12-381 (EIP-2537): G1ADD/G1MSM/G2ADD/G2MSM/PAIRING/MAP_FP/MAP_FP2 — Prague.
+    if (id >= 0x0b and id <= 0x11) return if (fork.atLeast(.prague)) id else null;
     return null;
 }
 
@@ -763,11 +765,13 @@ const testing = std.testing;
 
 test "idOf detects precompile range" {
     var a = state_mod.zero_address;
-    try testing.expectEqual(@as(?u8, null), idOf(a));
+    try testing.expectEqual(@as(?u8, null), idOf(a, .prague));
     a[19] = 4;
-    try testing.expectEqual(@as(?u8, 4), idOf(a));
+    try testing.expectEqual(@as(?u8, 4), idOf(a, .prague));
+    // BLS (0x0b) is a precompile on Prague but not on Cancun.
     a[19] = 0x0b;
-    try testing.expectEqual(@as(?u8, null), idOf(a));
+    try testing.expectEqual(@as(?u8, 0x0b), idOf(a, .prague));
+    try testing.expectEqual(@as(?u8, null), idOf(a, .cancun));
 }
 
 test "identity returns input" {

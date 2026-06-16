@@ -9,6 +9,7 @@ const vm = @import("vm.zig");
 const state_mod = @import("state.zig");
 const Address = state_mod.Address;
 const State = state_mod.State;
+const Fork = @import("fork.zig").Fork;
 
 pub const AccessEntry = struct { address: Address, keys: []const u256 };
 
@@ -27,20 +28,30 @@ pub const Tx = struct {
 };
 
 pub const GAS_PER_BLOB: u64 = 1 << 17; // 131072
-pub const MAX_BLOB_GAS_PER_BLOCK: u64 = 1179648; // Prague: 9 blobs
-const BLOB_BASE_FEE_UPDATE_FRACTION: u256 = 5007716;
+
+/// Max blob gas a block may carry: Cancun allows 6 blobs, Prague raises it to 9
+/// (EIP-7691).
+pub fn maxBlobGasPerBlock(fork: Fork) u64 {
+    return if (fork.atLeast(.prague)) 1179648 else 786432;
+}
+
+/// EIP-4844 blob base-fee update fraction. EIP-7691 retunes it for Prague.
+fn blobBaseFeeUpdateFraction(fork: Fork) u256 {
+    return if (fork.atLeast(.prague)) 5007716 else 3338477;
+}
 
 /// `taylor_exponential(1, excess_blob_gas, fraction)` — the EIP-4844 blob gas
 /// price (a fake-exponential approximation).
-pub fn blobGasPrice(excess_blob_gas: u256) u256 {
+pub fn blobGasPrice(excess_blob_gas: u256, fork: Fork) u256 {
+    const fraction = blobBaseFeeUpdateFraction(fork);
     var output: u256 = 0;
-    var numerator_accum: u256 = BLOB_BASE_FEE_UPDATE_FRACTION; // factor(1) × denominator
+    var numerator_accum: u256 = fraction; // factor(1) × denominator
     var i: u256 = 1;
     while (numerator_accum > 0) : (i += 1) {
         output += numerator_accum;
-        numerator_accum = (numerator_accum * excess_blob_gas) / (BLOB_BASE_FEE_UPDATE_FRACTION * i);
+        numerator_accum = (numerator_accum * excess_blob_gas) / (fraction * i);
     }
-    return output / BLOB_BASE_FEE_UPDATE_FRACTION;
+    return output / fraction;
 }
 
 const ACCESS_LIST_ADDRESS: u64 = 2400;
@@ -107,15 +118,28 @@ pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: 
     const max_gas_fee: u512 = @as(u512, tx.gas_limit) * max_fee_cap + tx.blob_data_fee + tx.value;
     if (@as(u512, state.balanceOf(tx.sender)) < max_gas_fee) return false;
 
-    // EIP-3607: the sender must be an EOA (no code), unless it carries a valid
-    // EIP-7702 delegation.
+    // EIP-3607: the sender must be an EOA (no code). Prague (EIP-7702) makes one
+    // exception — an account carrying a valid delegation indicator still
+    // originates transactions; pre-Prague, any code disqualifies the sender.
     const code = state.codeOf(tx.sender);
-    if (code.len != 0 and !isValidDelegation(code)) return false;
+    if (code.len != 0) {
+        if (!(env.fork.atLeast(.prague) and isValidDelegation(code))) return false;
+    }
 
     return true;
 }
 
 pub fn process(allocator: std.mem.Allocator, state: *State, env: *const vm.Environment, tx: Tx) Result {
+    return processImpl(allocator, state, env, tx, null);
+}
+
+/// Like `process`, but on success also appends the transaction's logs (deep-
+/// copied from `allocator`) to `logs_out` — the inputs a receipt needs.
+pub fn processWithReceipt(allocator: std.mem.Allocator, state: *State, env: *const vm.Environment, tx: Tx, logs_out: *std.ArrayList(vm.Log)) Result {
+    return processImpl(allocator, state, env, tx, logs_out);
+}
+
+fn processImpl(allocator: std.mem.Allocator, state: *State, env: *const vm.Environment, tx: Tx, logs_out: ?*std.ArrayList(vm.Log)) Result {
     state.beginTx(); // reset access lists / transient / originals / created set
     const ig = intrinsicGas(tx.data, tx.to == null);
     var intrinsic = ig.standard;
@@ -131,8 +155,11 @@ pub fn process(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
     // EIP-2929 / EIP-3651 pre-warming.
     _ = state.accessAddress(tx.sender);
     _ = state.accessAddress(env.coinbase);
+    // EIP-2929 pre-warms the precompiles. The active range is fork-dependent:
+    // Cancun ends at KZG (0x0a), Prague adds the BLS set through 0x11.
+    const last_precompile: u8 = if (env.fork.atLeast(.prague)) 0x11 else if (env.fork.atLeast(.cancun)) 0x0a else 0x09;
     var p: u8 = 1;
-    while (p <= 0x11) : (p += 1) { // EIP-2929 warms the precompiles 0x01–0x11
+    while (p <= last_precompile) : (p += 1) {
         var a = state_mod.zero_address;
         a[19] = p;
         _ = state.accessAddress(a);
@@ -172,6 +199,17 @@ pub fn process(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
     const success = evm.halt_error == null and !evm.reverted;
     var gas_used = tx.gas_limit - evm.gas_left;
 
+    // Capture logs for the receipt (only a successful tx contributes logs).
+    if (logs_out) |out| if (success) {
+        for (evm.logs.items) |lg| {
+            out.append(allocator, .{
+                .address = lg.address,
+                .topics = allocator.dupe([32]u8, lg.topics) catch @panic("oom"),
+                .data = allocator.dupe(u8, lg.data) catch @panic("oom"),
+            }) catch @panic("oom");
+        }
+    };
+
     // EIP-3529 refund, capped at gas_used / 5.
     if (success) {
         var refund: i64 = evm.refund_counter;
@@ -180,8 +218,8 @@ pub fn process(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
         const applied: u64 = @min(@as(u64, @intCast(refund)), max_refund);
         gas_used -= applied;
     }
-    // EIP-7623: the transaction pays at least the calldata floor.
-    gas_used = @max(gas_used, ig.floor);
+    // EIP-7623 (Prague): the transaction pays at least the calldata floor.
+    if (env.fork.atLeast(.prague)) gas_used = @max(gas_used, ig.floor);
 
     // Refund the sender the unused gas, and pay the coinbase the priority fee.
     const sender_refund: u256 = @as(u256, tx.gas_limit - gas_used) * tx.gas_price;

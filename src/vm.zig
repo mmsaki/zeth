@@ -18,6 +18,8 @@ const word = @import("word.zig");
 const crypto = @import("crypto.zig");
 const state_mod = @import("state.zig");
 const precompiles = @import("precompiles.zig");
+const fork_mod = @import("fork.zig");
+pub const Fork = fork_mod.Fork;
 
 /// When true, every executed opcode is printed (depth/pc/op/gas) — a debug
 /// trace for chasing conformance failures. Toggled via ZETH_TRACE in the runners.
@@ -203,6 +205,7 @@ pub const Op = enum(u8) {
 
 /// Block- and transaction-level context shared across an entire message tree.
 pub const Environment = struct {
+    fork: Fork = .osaka, // default to the latest fork
     chain_id: u64 = 1,
     coinbase: Address = state_mod.zero_address,
     number: u64 = 0,
@@ -1303,7 +1306,7 @@ pub fn processMessage(
 
     // Precompiled contracts (0x01–0x0a) run natively instead of the bytecode.
     if (message.code_address) |ca| {
-        if (precompiles.idOf(ca)) |id| {
+        if (precompiles.idOf(ca, env.fork)) |id| {
             if (precompiles.run(allocator, id, message.data, frame.gas_left)) |res| {
                 frame.gas_left -= res.gas;
                 frame.output = res.data;

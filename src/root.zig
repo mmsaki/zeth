@@ -13,6 +13,10 @@ pub const rlp = @import("rlp.zig");
 pub const trie = @import("trie.zig");
 pub const tx = @import("tx.zig");
 pub const precompiles = @import("precompiles.zig");
+pub const fork = @import("fork.zig");
+pub const block = @import("block.zig");
+pub const transaction = @import("transaction.zig");
+pub const genesis = @import("genesis.zig");
 
 pub const Evm = vm.Evm;
 pub const Op = vm.Op;
@@ -21,6 +25,7 @@ pub const Environment = vm.Environment;
 pub const Message = vm.Message;
 pub const State = state.State;
 pub const Address = state.Address;
+pub const Fork = fork.Fork;
 
 test {
     // Pull in the unit tests of every module.
