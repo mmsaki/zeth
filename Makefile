@@ -5,7 +5,7 @@
 ZIG ?= zig
 ARGS ?=
 
-.PHONY: all build test bench bench-loop conformance hive-tests report eels run fmt fmt-check clean
+.PHONY: all build test bench bench-loop conformance eels run fmt fmt-check clean
 
 all: build
 
@@ -32,19 +32,11 @@ eels:
 	$(ZIG) build -Doptimize=ReleaseFast
 	bash scripts/eels.sh
 
-## GeneralStateTests: stop at the first failure (default). ALL=1 for full sweep.
-## The runner walks the directory itself and renders a ✓/✗ graph + failures.
+## Conformance: the full sweep of BOTH suites across every supported fork
+## (Cancun + Prague), rendered as a ✓/✗ graph + pass rate. This is THE test
+## command. Scope to one fork with ZETH_FORK=<name>; stop at the first failure
+## by dropping ZETH_ALL (e.g. run the binary directly for bisecting).
 conformance:
-	$(ZIG) build -Doptimize=ReleaseFast
-	$(if $(ALL),ZETH_ALL=1 )./zig-out/bin/statetest ethereum-tests/GeneralStateTests
-
-## BlockchainTests (the hive on-ramp): stop at first failure. ALL=1 for full sweep.
-hive-tests:
-	$(ZIG) build -Doptimize=ReleaseFast
-	$(if $(ALL),ZETH_ALL=1 )./zig-out/bin/blocktest ethereum-tests/BlockchainTests
-
-## Full report: run EVERYTHING (both suites) with the ✓/✗ graph + % pass.
-report:
 	$(ZIG) build -Doptimize=ReleaseFast
 	ZETH_ALL=1 ./zig-out/bin/statetest ethereum-tests/GeneralStateTests
 	ZETH_ALL=1 ./zig-out/bin/blocktest ethereum-tests/BlockchainTests
