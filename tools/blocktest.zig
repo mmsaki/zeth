@@ -644,10 +644,26 @@ pub fn main(init: std.process.Init) !void {
     const files = try report.collectJson(gpa, init.io, args[1..]);
     var rep = report.Reporter{ .alloc = gpa, .color = g_color };
     std.debug.print("  ", .{});
-    for (files) |path| {
-        runFile(gpa, init.io, &rep, path);
-        if (g_stop and rep.fail > 0) break;
-    }
+    // The EVM maps each call frame onto a native stack frame, so a fixture that
+    // recurses to the 1024-deep call limit needs far more stack than the default
+    // main-thread allowance. Run the suite on a thread with a large stack.
+    var ctx = RunCtx{ .gpa = gpa, .io = init.io, .rep = &rep, .files = files };
+    const t = try std.Thread.spawn(.{ .stack_size = zeth.vm.NATIVE_STACK_SIZE }, runFilesWorker, .{&ctx});
+    t.join();
     const ok = rep.finish("BlockchainTests");
     if (!ok) return error.ConformanceFailed;
+}
+
+const RunCtx = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    rep: *report.Reporter,
+    files: []const []const u8,
+};
+
+fn runFilesWorker(ctx: *RunCtx) void {
+    for (ctx.files) |path| {
+        runFile(ctx.gpa, ctx.io, ctx.rep, path);
+        if (g_stop and ctx.rep.fail > 0) break;
+    }
 }

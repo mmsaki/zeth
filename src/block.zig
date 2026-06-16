@@ -96,6 +96,8 @@ pub const Block = struct {
     /// Raw RLP encodings of each withdrawal — the withdrawals-trie values.
     withdrawals: []const []const u8,
     has_withdrawals: bool,
+    /// Ommer (uncle) headers — pre-Merge only; empty post-Merge.
+    ommers: []const Header = &.{},
 };
 
 /// Decode a full block RLP (`[header, transactions, ommers, withdrawals?]`).
@@ -117,11 +119,19 @@ pub fn decodeBlock(a: std.mem.Allocator, raw: []const u8) !Block {
         };
     }
 
+    // Ommers (uncle headers) live at index 2; decode each for block rewards.
+    var ommers: []Header = &.{};
+    if (parts.len >= 3) {
+        const ommer_spans = try rlp.listSpans(a, parts[2]);
+        ommers = try a.alloc(Header, ommer_spans.len);
+        for (ommer_spans, 0..) |span, i| ommers[i] = try headerFromRlp(a, span);
+    }
+
     var withdrawals: []const []const u8 = &.{};
     const has_w = parts.len >= 4;
     if (has_w) withdrawals = try rlp.listSpans(a, parts[3]);
 
-    return .{ .header = header, .transactions = txs, .withdrawals = withdrawals, .has_withdrawals = has_w };
+    return .{ .header = header, .transactions = txs, .withdrawals = withdrawals, .has_withdrawals = has_w, .ommers = ommers };
 }
 
 /// Reconstruct a Header from its RLP encoding.

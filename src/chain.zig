@@ -142,6 +142,7 @@ pub const Chain = struct {
                 .gas_limit = h.gas_limit,
                 .base_fee = h.base_fee_per_gas orelse 0,
                 .prev_randao = bytesToU256(&h.prev_randao),
+                .difficulty = h.difficulty,
                 .block_hashes = self.hashes.items[0..bn],
                 .blob_base_fee = txmod.blobGasPrice(h.excess_blob_gas orelse 0, fork),
             };
@@ -267,6 +268,7 @@ pub const Chain = struct {
             .gas_limit = h.gas_limit,
             .base_fee = h.base_fee_per_gas orelse 0,
             .prev_randao = bytesToU256(&h.prev_randao),
+            .difficulty = h.difficulty,
             .block_hashes = self.hashes.items,
             .blob_base_fee = txmod.blobGasPrice(h.excess_blob_gas orelse 0, fork),
         };
@@ -344,6 +346,21 @@ pub const Chain = struct {
         for (blk.withdrawals) |w_enc| {
             const wd = decodeWithdrawal(a, w_enc) catch return error.DecodeError;
             self.state.setBalance(wd.address, self.state.balanceOf(wd.address) + @as(u256, wd.amount) * 1_000_000_000) catch return error.OutOfMemory;
+        }
+
+        // PoW block rewards (pre-Merge): pay the miner the static reward plus a
+        // 1/32 nephew bonus per ommer, and pay each ommer miner a stale-depth
+        // share. Post-Merge `blockReward()` is zero, so this is a no-op.
+        const reward = fork.blockReward();
+        if (reward > 0) {
+            for (blk.ommers) |ommer| {
+                // (ommer.number + 8 - block.number) * reward / 8
+                const num: u256 = @as(u256, ommer.number) + 8 - @as(u256, h.number);
+                const ommer_reward = num * reward / 8;
+                self.state.setBalance(ommer.coinbase, self.state.balanceOf(ommer.coinbase) + ommer_reward) catch return error.OutOfMemory;
+            }
+            const miner_reward = reward + @as(u256, blk.ommers.len) * (reward / 32);
+            self.state.setBalance(h.coinbase, self.state.balanceOf(h.coinbase) + miner_reward) catch return error.OutOfMemory;
         }
 
         // Validate the execution result against the header (the consensus checks).
