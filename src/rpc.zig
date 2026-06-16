@@ -507,7 +507,43 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
         return okStr(a, id, qHex(a, intrinsic + hi));
     }
 
+    if (std.mem.eql(u8, method, "debug_traceCall")) {
+        if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
+        var sink: std.ArrayList(vm.StructLog) = .empty;
+        vm.trace_sink = &sink;
+        const r = execCall(a, c, params[0].object, 30_000_000);
+        vm.trace_sink = null;
+        return ok(a, id, traceResultJson(a, sink.items, r.gas_used, r.success, r.output));
+    }
+    if (std.mem.eql(u8, method, "debug_traceTransaction")) {
+        const h = parseHash(strParam(params, 0) orelse return err(a, id, -32602, "invalid params")) orelse return ok(a, id, "null");
+        var sink: std.ArrayList(vm.StructLog) = .empty;
+        const tr = c.traceTransaction(a, h, &sink) orelse return ok(a, id, "null");
+        return ok(a, id, traceResultJson(a, sink.items, tr.gas_used, tr.success, tr.output));
+    }
+
     return err(a, id, -32601, "method not found");
+}
+
+/// geth debug trace result: { gas, failed, returnValue, structLogs: [...] }.
+fn traceResultJson(a: std.mem.Allocator, logs: []const vm.StructLog, gas_used: u64, success: bool, output: []const u8) []const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    const ret = dataHex(a, output); // "0x...."; geth's returnValue is bare hex
+    p(a, &buf, "{{\"gas\":{d},\"failed\":{s},\"returnValue\":\"{s}\",\"structLogs\":[", .{ gas_used, if (success) "false" else "true", ret[2..] });
+    for (logs, 0..) |lg, i| {
+        if (i > 0) buf.append(a, ',') catch @panic("oom");
+        // gasCost ≈ gas drop to the next step (flat across frames).
+        const next_gas: u64 = if (i + 1 < logs.len) logs[i + 1].gas else lg.gas;
+        const gas_cost: u64 = if (lg.gas >= next_gas) lg.gas - next_gas else 0;
+        p(a, &buf, "{{\"pc\":{d},\"op\":\"{s}\",\"gas\":{d},\"gasCost\":{d},\"depth\":{d},\"stack\":[", .{ lg.pc, vm.opName(lg.op), lg.gas, gas_cost, lg.depth + 1 });
+        for (lg.stack, 0..) |s, j| {
+            if (j > 0) buf.append(a, ',') catch @panic("oom");
+            p(a, &buf, "\"0x{x}\"", .{s});
+        }
+        buf.appendSlice(a, "]}") catch @panic("oom");
+    }
+    buf.appendSlice(a, "]}") catch @panic("oom");
+    return buf.items;
 }
 
 /// Handle a raw request body (single object or batch array) → response JSON.

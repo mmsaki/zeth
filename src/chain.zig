@@ -68,6 +68,9 @@ pub const Chain = struct {
     block_txs: std.ArrayList([]TxRecord) = .empty,
     /// tx hash → (block number, index) for getTransactionByHash/Receipt.
     tx_index: std.AutoHashMapUnmanaged([32]u8, TxLoc) = .{},
+    /// A clone of the genesis world state, retained so debug_traceTransaction
+    /// can replay the chain up to a target transaction.
+    genesis_state: ?State = null,
     /// Canonical headers by block number (index 0 = genesis). Each header's
     /// `extra_data` is owned by `gpa` (the decoded header otherwise lives in a
     /// per-block arena freed when importBlock returns). RPC serves from here.
@@ -88,6 +91,7 @@ pub const Chain = struct {
         const genc = try g.header.encode(gpa);
         defer gpa.free(genc);
         try c.sizes.append(gpa, genc.len + 4); // header + empty txs/uncles lists
+        c.genesis_state = try state.clone(); // retained for debug_traceTransaction
         return c;
     }
 
@@ -109,6 +113,63 @@ pub const Chain = struct {
         self.block_txs.deinit(self.gpa);
         self.sizes.deinit(self.gpa);
         self.tx_index.deinit(self.gpa);
+        if (self.genesis_state) |*gs| gs.deinit();
+    }
+
+    pub const TraceResult = struct { gas_used: u64, success: bool, output: []const u8 };
+
+    /// Replay the chain on a fresh genesis-state clone up to `hash`, capturing
+    /// the target transaction's opcode trace into `sink` (debug_traceTransaction).
+    pub fn traceTransaction(self: *Chain, a: std.mem.Allocator, hash: [32]u8, sink: *std.ArrayList(vm.StructLog)) ?TraceResult {
+        const loc = self.tx_index.get(hash) orelse return null;
+        var st = (self.genesis_state orelse return null).clone() catch return null;
+        defer st.deinit();
+
+        var bn: u64 = 1;
+        while (bn <= loc.block_number) : (bn += 1) {
+            const h = self.headers.items[bn];
+            const fork = self.schedule.forkAt(h.timestamp);
+            var env = vm.Environment{
+                .fork = fork,
+                .chain_id = self.chain_id,
+                .coinbase = h.coinbase,
+                .number = h.number,
+                .time = h.timestamp,
+                .gas_limit = h.gas_limit,
+                .base_fee = h.base_fee_per_gas orelse 0,
+                .prev_randao = bytesToU256(&h.prev_randao),
+                .block_hashes = self.hashes.items[0..bn],
+                .blob_base_fee = txmod.blobGasPrice(h.excess_blob_gas orelse 0, fork),
+            };
+            if (fork.atLeast(.cancun)) if (h.parent_beacon_block_root) |r| self.systemCall(a, &env, BEACON_ROOTS, &r);
+            if (fork.atLeast(.prague)) self.systemCall(a, &env, HISTORY_STORAGE, &h.parent_hash);
+
+            for (self.block_txs.items[bn], 0..) |rec, i| {
+                const dt = transaction.decode(a, rec.raw) catch return null;
+                env.gas_price = rec.effective_gas_price;
+                env.origin = dt.sender;
+                env.blob_versioned_hashes = dt.blob_versioned_hashes;
+                const blob_fee: u256 = @as(u256, txmod.GAS_PER_BLOB) * dt.blob_versioned_hashes.len * env.blob_base_fee;
+                const target = bn == loc.block_number and i == loc.index;
+                if (target) vm.trace_sink = sink;
+                const res = txmod.process(a, &st, &env, .{
+                    .sender = dt.sender,
+                    .to = dt.to,
+                    .nonce = dt.nonce,
+                    .gas_limit = dt.gas_limit,
+                    .gas_price = rec.effective_gas_price,
+                    .value = dt.value,
+                    .data = dt.data,
+                    .access_list = dt.access_list,
+                    .blob_data_fee = blob_fee,
+                });
+                if (target) {
+                    vm.trace_sink = null;
+                    return .{ .gas_used = res.gas_used, .success = res.success, .output = "" };
+                }
+            }
+        }
+        return null;
     }
 
     pub fn sizeByNumber(self: *const Chain, number: u64) u64 {
