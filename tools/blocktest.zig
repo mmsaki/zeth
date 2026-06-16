@@ -27,8 +27,22 @@ const ForkVariant = struct { name: []const u8, fork: zeth.Fork };
 /// Forks we run by default — a fixture is run if its `network` is one of these.
 /// Override with ZETH_FORK=<name>.
 const DEFAULT_FORKS = [_]ForkVariant{
+    .{ .name = "Frontier", .fork = .frontier },
+    .{ .name = "Homestead", .fork = .homestead },
+    .{ .name = "EIP150", .fork = .tangerine_whistle },
+    .{ .name = "EIP158", .fork = .spurious_dragon },
+    .{ .name = "Byzantium", .fork = .byzantium },
+    .{ .name = "Constantinople", .fork = .constantinople },
+    .{ .name = "ConstantinopleFix", .fork = .petersburg },
+    .{ .name = "Istanbul", .fork = .istanbul },
+    .{ .name = "Berlin", .fork = .berlin },
+    .{ .name = "London", .fork = .london },
+    .{ .name = "Paris", .fork = .paris },
+    .{ .name = "Merge", .fork = .paris },
+    .{ .name = "Shanghai", .fork = .shanghai },
     .{ .name = "Cancun", .fork = .cancun },
     .{ .name = "Prague", .fork = .prague },
+    .{ .name = "Osaka", .fork = .osaka },
 };
 var g_forks: []const ForkVariant = &DEFAULT_FORKS;
 var g_single: [1]ForkVariant = undefined;
@@ -372,6 +386,7 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap, 
         .gas_limit = u64H(jstr(header, "gasLimit") orelse "0x0"),
         .base_fee = base_fee,
         .prev_randao = u256H(jstr(header, "mixHash") orelse "0x0"),
+        .difficulty = u256H(jstr(header, "difficulty") orelse "0x0"),
         .chain_id = 1,
         .block_hashes = block_hashes, // [genesis, block1, …] for the BLOCKHASH opcode
     };
@@ -480,6 +495,24 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap, 
             const gwei = u256H(jstr(w, "amount") orelse "0x0");
             st.setBalance(addr, st.balanceOf(addr) + gwei * 1_000_000_000) catch @panic("oom");
         }
+    }
+
+    // PoW block rewards (pre-Merge): miner gets the static reward + a 1/32
+    // nephew bonus per ommer; each ommer miner gets a stale-depth share. Mirrors
+    // chain.importDecoded; blockReward() is zero post-Merge so this is a no-op.
+    const reward = g_fork.blockReward();
+    if (reward > 0) {
+        const uncles = jarr(block, "uncleHeaders") orelse &.{};
+        for (uncles) |u_v| {
+            if (u_v != .object) continue;
+            const u = u_v.object;
+            const ucb = addrH(jstr(u, "coinbase") orelse continue);
+            const unum = u256H(jstr(u, "number") orelse "0x0");
+            const ommer_reward = (unum + 8 - @as(u256, env.number)) * reward / 8;
+            st.setBalance(ucb, st.balanceOf(ucb) + ommer_reward) catch @panic("oom");
+        }
+        const miner_reward = reward + @as(u256, uncles.len) * (reward / 32);
+        st.setBalance(env.coinbase, st.balanceOf(env.coinbase) + miner_reward) catch @panic("oom");
     }
 
     const got = zeth.trie.stateRoot(a, st);
@@ -619,6 +652,27 @@ fn runFile(gpa: std.mem.Allocator, io: std.Io, rep: *report.Reporter, path: []co
     }
 }
 
+const USAGE =
+    \\usage: blocktest [flags] <fixture.json | dir> ...
+    \\
+    \\flags:
+    \\  --all            run every fixture (don't stop at the first failure)
+    \\  --fork <name>    run only fixtures for this fork (e.g. --fork London)
+    \\  --import         drive the real node import pipeline (chain.importBlock)
+    \\  --receipts       also check the receipts root + logs bloom
+    \\  --hash           check header RLP via the block hash (skip execution)
+    \\  --trace          print an opcode trace
+;
+
+/// Pin the runner to a single fork (used by `--fork`/ZETH_FORK).
+fn setSingleFork(name: []const u8) !void {
+    g_single[0] = .{ .name = name, .fork = zeth.fork.Fork.fromName(name) orelse {
+        std.debug.print("unknown fork: {s}\n", .{name});
+        return error.MissingArgument;
+    } };
+    g_forks = &g_single;
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -629,19 +683,49 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("ZETH_HASH") != null) g_check_hash = true;
     if (init.environ_map.get("ZETH_RECEIPTS") != null) g_check_receipts = true;
     if (init.environ_map.get("ZETH_IMPORT") != null) g_import = true;
-    if (init.environ_map.get("ZETH_FORK")) |f| {
-        g_single[0] = .{ .name = f, .fork = zeth.fork.Fork.fromName(f) orelse {
-            std.debug.print("unknown fork: {s}\n", .{f});
+    if (init.environ_map.get("ZETH_FORK")) |f| setSingleFork(f) catch return error.MissingArgument;
+
+    // CLI flags (preferred; env vars above remain a silent fallback). Remaining
+    // args are fixture paths.
+    var paths: std.ArrayList([]const u8) = .empty;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--all")) {
+            g_stop = false;
+        } else if (std.mem.eql(u8, arg, "--import")) {
+            g_import = true;
+        } else if (std.mem.eql(u8, arg, "--receipts")) {
+            g_check_receipts = true;
+        } else if (std.mem.eql(u8, arg, "--hash")) {
+            g_check_hash = true;
+        } else if (std.mem.eql(u8, arg, "--trace")) {
+            zeth.vm.trace_enabled = true;
+        } else if (std.mem.eql(u8, arg, "--fork")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("--fork requires a name (e.g. --fork London)\n", .{});
+                return error.MissingArgument;
+            }
+            setSingleFork(args[i]) catch return error.MissingArgument;
+        } else if (std.mem.startsWith(u8, arg, "--fork=")) {
+            setSingleFork(arg["--fork=".len..]) catch return error.MissingArgument;
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            std.debug.print("{s}\n", .{USAGE});
+            return;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("unknown flag: {s}\n{s}\n", .{ arg, USAGE });
             return error.MissingArgument;
-        } };
-        g_forks = &g_single;
+        } else {
+            paths.append(gpa, arg) catch return error.OutOfMemory;
+        }
     }
-    if (args.len < 2) {
-        std.debug.print("usage: blocktest <fixture.json | dir> ...\n", .{});
+    if (paths.items.len == 0) {
+        std.debug.print("{s}\n", .{USAGE});
         return error.MissingArgument;
     }
 
-    const files = try report.collectJson(gpa, init.io, args[1..]);
+    const files = try report.collectJson(gpa, init.io, paths.items);
     var rep = report.Reporter{ .alloc = gpa, .color = g_color };
     std.debug.print("  ", .{});
     // The EVM maps each call frame onto a native stack frame, so a fixture that

@@ -314,6 +314,25 @@ fn runFile(gpa: std.mem.Allocator, io: std.Io, rep: *report.Reporter, path: []co
     }
 }
 
+const USAGE =
+    \\usage: statetest [flags] <fixture.json | dir> ...
+    \\
+    \\flags:
+    \\  --all            run every fixture (don't stop at the first failure)
+    \\  --fork <name>    run only fixtures for this fork (e.g. --fork London)
+    \\  --data <n>       run only the transaction with this data index
+    \\  --trace          print an opcode trace
+;
+
+/// Pin the runner to a single fork (used by `--fork`/ZETH_FORK).
+fn setSingleFork(name: []const u8) !void {
+    g_single[0] = .{ .name = name, .fork = zeth.fork.Fork.fromName(name) orelse {
+        std.debug.print("unknown fork: {s}\n", .{name});
+        return error.MissingArgument;
+    } };
+    g_forks = &g_single;
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -322,19 +341,45 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("ZETH_TRACE") != null) zeth.vm.trace_enabled = true;
     if (init.environ_map.get("ZETH_ALL") != null) g_stop = false; // run past failures
     if (init.environ_map.get("ZETH_DATA")) |d| g_data_filter = std.fmt.parseInt(usize, d, 10) catch null;
-    if (init.environ_map.get("ZETH_FORK")) |f| {
-        g_single[0] = .{ .name = f, .fork = zeth.fork.Fork.fromName(f) orelse {
-            std.debug.print("unknown fork: {s}\n", .{f});
+    if (init.environ_map.get("ZETH_FORK")) |f| setSingleFork(f) catch return error.MissingArgument;
+
+    // CLI flags (preferred; env vars above remain a silent fallback). Remaining
+    // args are fixture paths.
+    var paths: std.ArrayList([]const u8) = .empty;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--all")) {
+            g_stop = false;
+        } else if (std.mem.eql(u8, arg, "--trace")) {
+            zeth.vm.trace_enabled = true;
+        } else if (std.mem.eql(u8, arg, "--fork")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("--fork requires a name (e.g. --fork London)\n", .{});
+                return error.MissingArgument;
+            }
+            setSingleFork(args[i]) catch return error.MissingArgument;
+        } else if (std.mem.startsWith(u8, arg, "--fork=")) {
+            setSingleFork(arg["--fork=".len..]) catch return error.MissingArgument;
+        } else if (std.mem.startsWith(u8, arg, "--data=")) {
+            g_data_filter = std.fmt.parseInt(usize, arg["--data=".len..], 10) catch null;
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            std.debug.print("{s}\n", .{USAGE});
+            return;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("unknown flag: {s}\n{s}\n", .{ arg, USAGE });
             return error.MissingArgument;
-        } };
-        g_forks = &g_single;
+        } else {
+            paths.append(gpa, arg) catch return error.OutOfMemory;
+        }
     }
-    if (args.len < 2) {
-        std.debug.print("usage: statetest <fixture.json | dir> ...\n", .{});
+    if (paths.items.len == 0) {
+        std.debug.print("{s}\n", .{USAGE});
         return error.MissingArgument;
     }
 
-    const files = try report.collectJson(gpa, init.io, args[1..]);
+    const files = try report.collectJson(gpa, init.io, paths.items);
     var rep = report.Reporter{ .alloc = gpa, .color = g_color };
     std.debug.print("  ", .{}); // indent the first graph row
     // Run on a thread with a large stack: a fixture can drive the EVM to its
