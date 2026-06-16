@@ -157,9 +157,14 @@ fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?
     const max_len: u512 = @max(base_len, mod_len);
     const w: u512 = (max_len + 7) / 8;
     const mult_complexity: u512 = w * w;
-    // If the multiplication term alone can't be afforded, reject before the
-    // (potentially enormous) iteration-count multiply.
-    if (mult_complexity > @as(u512, gas_available) * 3) return null;
+    // The cost is max(200, mult_complexity * max(iters,1) / 3), so its lower
+    // bound (iters == 1) is floor(mult_complexity / 3). If even that exceeds the
+    // gas available, reject before the (potentially enormous) iteration-count
+    // multiply. Comparing the *floored* term — not `mult_complexity > gas*3` —
+    // avoids rejecting inputs whose true cost is affordable (e.g. a 1024-byte
+    // operand costing exactly floor(16384/3) gas). After this guard passes,
+    // mult_complexity <= 3*gas + 2, so the iteration multiply stays within u512.
+    if (mult_complexity / 3 > gas_available) return null;
     const iters: u512 = blk: {
         const head = modexpExpHead(input, base_len, exp_len);
         const head_bits: u512 = if (head == 0) 0 else 256 - @clz(head);
@@ -809,6 +814,24 @@ test "modexp 3^2 mod 5 = 4" {
     defer testing.allocator.free(out.data);
     try testing.expectEqual(@as(usize, 1), out.data.len);
     try testing.expectEqual(@as(u8, 4), out.data[0]);
+}
+
+test "modexp large operand gas boundary (EIP-2565)" {
+    // base_len=0, exp_len=0, mod_len=1024 -> mult_complexity = ceil(1024/8)^2
+    // = 128^2 = 16384, iters = max(0,1) = 1, cost = max(200, 16384/3) = 5461.
+    // Regression: the early-reject guard must use floor(mult/3), not mult>gas*3,
+    // or it spuriously OOGs an input whose true cost is exactly affordable.
+    var input: [96 + 1024]u8 = std.mem.zeroes([96 + 1024]u8);
+    input[64 + 30] = 0x04; // mod_len high byte: 0x0400 = 1024
+    // Exactly enough gas must succeed.
+    const ok = run(testing.allocator, 5, &input, 5461);
+    try testing.expect(ok != null);
+    if (ok) |o| {
+        try testing.expectEqual(@as(u64, 5461), o.gas);
+        testing.allocator.free(o.data);
+    }
+    // One gas short must out-of-gas.
+    try testing.expect(run(testing.allocator, 5, &input, 5460) == null);
 }
 
 test "sha256 of empty" {
