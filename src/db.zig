@@ -144,6 +144,18 @@ pub const Db = struct {
     pub fn flush(self: *Db) !void {
         try self.file.sync(self.io);
     }
+
+    /// Iterate the live keys (order unspecified). Keys are borrowed from the
+    /// index — valid until the next put/del. Fetch values with `get`.
+    pub const KeyIterator = struct {
+        inner: std.StringHashMapUnmanaged(Entry).KeyIterator,
+        pub fn next(self: *KeyIterator) ?[]const u8 {
+            return if (self.inner.next()) |k| k.* else null;
+        }
+    };
+    pub fn keys(self: *const Db) KeyIterator {
+        return .{ .inner = self.index.keyIterator() };
+    }
 };
 
 // ── tests ───────────────────────────────────────────────────────────────────
