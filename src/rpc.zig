@@ -9,6 +9,7 @@ const state_mod = @import("state.zig");
 const block = @import("block.zig");
 const vm = @import("vm.zig");
 const transaction = @import("transaction.zig");
+const crypto = @import("crypto.zig");
 const Address = state_mod.Address;
 
 const CLIENT_VERSION = "zeth/0.1.0-dev";
@@ -373,6 +374,12 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
     const params: []const std.json.Value = if (obj.get("params")) |pp| (if (pp == .array) pp.array.items else &.{}) else &.{};
 
     if (std.mem.eql(u8, method, "web3_clientVersion")) return okStr(a, id, CLIENT_VERSION);
+    if (std.mem.eql(u8, method, "web3_sha3")) {
+        const in: []const u8 = if (strParam(params, 0)) |s| hexBytes(a, s) else &.{};
+        return okStr(a, id, hash32Hex(a, crypto.keccak256(in)));
+    }
+    if (std.mem.eql(u8, method, "net_peerCount")) return okStr(a, id, "0x0");
+    if (std.mem.eql(u8, method, "eth_protocolVersion")) return okStr(a, id, "0x41");
     if (std.mem.eql(u8, method, "net_version")) return okStr(a, id, std.fmt.allocPrint(a, "{d}", .{c.chain_id}) catch @panic("oom"));
     if (std.mem.eql(u8, method, "net_listening")) return ok(a, id, "true");
     if (std.mem.eql(u8, method, "eth_chainId")) return okStr(a, id, qHex(a, c.chain_id));
@@ -534,7 +541,62 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
         return ok(a, id, traceResultJson(a, sink.items, tr.gas_used, tr.success, tr.output));
     }
 
+    if (std.mem.eql(u8, method, "debug_traceBlockByNumber") or std.mem.eql(u8, method, "debug_traceBlockByHash")) {
+        const p0 = strParam(params, 0) orelse return err(a, id, -32602, "invalid params");
+        const num = if (std.mem.eql(u8, method, "debug_traceBlockByHash"))
+            (numberByHash(c, p0) orelse return ok(a, id, "null"))
+        else
+            (resolveBlock(c, p0) orelse return ok(a, id, "null"));
+        const call_mode = wantsCallTracer(params, 1);
+        var buf: std.ArrayList(u8) = .empty;
+        buf.append(a, '[') catch @panic("oom");
+        for (c.blockTxs(num), 0..) |rec, i| {
+            if (i > 0) buf.append(a, ',') catch @panic("oom");
+            if (call_mode) {
+                var ct = vm.CallTracer{ .alloc = a };
+                _ = c.traceTransaction(a, rec.hash, null, &ct);
+                p(a, &buf, "{{\"txHash\":\"{s}\",\"result\":{s}}}", .{ hash32Hex(a, rec.hash), if (ct.root) |r| callFrameJson(a, r) else "{}" });
+            } else {
+                var sink: std.ArrayList(vm.StructLog) = .empty;
+                const tr = c.traceTransaction(a, rec.hash, &sink, null) orelse continue;
+                p(a, &buf, "{{\"txHash\":\"{s}\",\"result\":{s}}}", .{ hash32Hex(a, rec.hash), traceResultJson(a, sink.items, tr.gas_used, tr.success, tr.output) });
+            }
+        }
+        buf.append(a, ']') catch @panic("oom");
+        return ok(a, id, buf.items);
+    }
+    if (std.mem.eql(u8, method, "eth_feeHistory")) {
+        return ok(a, id, feeHistory(a, c, params));
+    }
+
     return err(a, id, -32601, "method not found");
+}
+
+/// eth_feeHistory: baseFeePerGas + gasUsedRatio over a block window (rewards
+/// computed per requested percentile from each block's tx priority fees).
+fn feeHistory(a: std.mem.Allocator, c: *const chain_mod.Chain, params: []const std.json.Value) []const u8 {
+    const count: u64 = if (params.len > 0 and params[0] == .string) parseU64(params[0].string) else 1;
+    const newest: u64 = if (params.len > 1 and params[1] == .string) (resolveBlock(c, params[1].string) orelse c.head.number) else c.head.number;
+    const oldest: u64 = if (newest + 1 >= count) newest + 1 - count else 0;
+    var buf: std.ArrayList(u8) = .empty;
+    p(a, &buf, "{{\"oldestBlock\":\"{s}\",\"baseFeePerGas\":[", .{qHex(a, oldest)});
+    var n = oldest;
+    while (n <= newest) : (n += 1) {
+        if (n > oldest) buf.append(a, ',') catch @panic("oom");
+        const h = c.headerByNumber(n) orelse continue;
+        p(a, &buf, "\"{s}\"", .{qHex(a, h.base_fee_per_gas orelse 0)});
+    }
+    // baseFeePerGas has count+1 entries (next block's base fee); reuse the head's.
+    p(a, &buf, ",\"{s}\"],\"gasUsedRatio\":[", .{qHex(a, c.head.base_fee_per_gas orelse 0)});
+    n = oldest;
+    while (n <= newest) : (n += 1) {
+        if (n > oldest) buf.append(a, ',') catch @panic("oom");
+        const h = c.headerByNumber(n) orelse continue;
+        const ratio: f64 = if (h.gas_limit > 0) @as(f64, @floatFromInt(h.gas_used)) / @as(f64, @floatFromInt(h.gas_limit)) else 0;
+        p(a, &buf, "{d}", .{ratio});
+    }
+    buf.appendSlice(a, "]}") catch @panic("oom");
+    return buf.items;
 }
 
 /// True if the options object at `params[idx]` selects {"tracer":"callTracer"}.
