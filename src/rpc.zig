@@ -509,6 +509,13 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
 
     if (std.mem.eql(u8, method, "debug_traceCall")) {
         if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
+        if (wantsCallTracer(params, 2)) {
+            var ct = vm.CallTracer{ .alloc = a };
+            vm.call_tracer = &ct;
+            _ = execCall(a, c, params[0].object, 30_000_000);
+            vm.call_tracer = null;
+            return ok(a, id, if (ct.root) |r| callFrameJson(a, r) else "{}");
+        }
         var sink: std.ArrayList(vm.StructLog) = .empty;
         vm.trace_sink = &sink;
         const r = execCall(a, c, params[0].object, 30_000_000);
@@ -517,12 +524,44 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
     }
     if (std.mem.eql(u8, method, "debug_traceTransaction")) {
         const h = parseHash(strParam(params, 0) orelse return err(a, id, -32602, "invalid params")) orelse return ok(a, id, "null");
+        if (wantsCallTracer(params, 1)) {
+            var ct = vm.CallTracer{ .alloc = a };
+            _ = c.traceTransaction(a, h, null, &ct) orelse return ok(a, id, "null");
+            return ok(a, id, if (ct.root) |r| callFrameJson(a, r) else "{}");
+        }
         var sink: std.ArrayList(vm.StructLog) = .empty;
-        const tr = c.traceTransaction(a, h, &sink) orelse return ok(a, id, "null");
+        const tr = c.traceTransaction(a, h, &sink, null) orelse return ok(a, id, "null");
         return ok(a, id, traceResultJson(a, sink.items, tr.gas_used, tr.success, tr.output));
     }
 
     return err(a, id, -32601, "method not found");
+}
+
+/// True if the options object at `params[idx]` selects {"tracer":"callTracer"}.
+fn wantsCallTracer(params: []const std.json.Value, idx: usize) bool {
+    if (idx >= params.len or params[idx] != .object) return false;
+    const t = params[idx].object.get("tracer") orelse return false;
+    return t == .string and std.mem.eql(u8, t.string, "callTracer");
+}
+
+/// A geth callTracer frame (the data Foundry renders as its trace tree).
+fn callFrameJson(a: std.mem.Allocator, f: *const vm.CallFrame) []const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    p(a, &buf, "{{\"type\":\"{s}\",\"from\":\"{s}\",\"to\":\"{s}\"", .{ f.typ, dataHex(a, &f.from), dataHex(a, &f.to) });
+    if (f.value != 0) p(a, &buf, ",\"value\":\"{s}\"", .{qHex(a, f.value)});
+    p(a, &buf, ",\"gas\":\"{s}\",\"gasUsed\":\"{s}\"", .{ qHex(a, f.gas), qHex(a, f.gas_used) });
+    p(a, &buf, ",\"input\":\"{s}\",\"output\":\"{s}\"", .{ dataHex(a, f.input), dataHex(a, f.output) });
+    if (f.err) |e| p(a, &buf, ",\"error\":\"{s}\"", .{e});
+    if (f.calls.items.len > 0) {
+        buf.appendSlice(a, ",\"calls\":[") catch @panic("oom");
+        for (f.calls.items, 0..) |child, i| {
+            if (i > 0) buf.append(a, ',') catch @panic("oom");
+            buf.appendSlice(a, callFrameJson(a, child)) catch @panic("oom");
+        }
+        buf.append(a, ']') catch @panic("oom");
+    }
+    buf.append(a, '}') catch @panic("oom");
+    return buf.items;
 }
 
 /// geth debug trace result: { gas, failed, returnValue, structLogs: [...] }.
