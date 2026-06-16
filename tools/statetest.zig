@@ -5,7 +5,8 @@
 //!   statetest <fixture.json> [more.json ...]
 
 const std = @import("std");
-const zeth = @import("zetherum");
+const zeth = @import("zeth");
+const report = @import("report.zig");
 
 const Address = zeth.state.Address;
 
@@ -101,9 +102,9 @@ fn loadPre(a: std.mem.Allocator, st: *zeth.State, pre: std.json.ObjectMap) void 
     }
 }
 
-/// Print the accounts/slots where our post-state differs from the fixture's
+/// Buffer the accounts/slots where our post-state differs from the fixture's
 /// expected post-state — localizes which account a failing test got wrong.
-fn diffState(st: *zeth.State, post: std.json.ObjectMap) void {
+fn diffState(rep: *report.Reporter, st: *zeth.State, post: std.json.ObjectMap) void {
     var it = post.iterator();
     while (it.next()) |e| {
         if (e.value_ptr.* != .object) continue;
@@ -112,17 +113,17 @@ fn diffState(st: *zeth.State, post: std.json.ObjectMap) void {
         const exp = e.value_ptr.object;
         const wb = u256FromHex(jstr(exp, "balance") orelse "0x0");
         const gb = st.balanceOf(addr);
-        if (gb != wb) std.debug.print("      {s}{s} balance got {d} want {d}{s}\n", .{ clr(DIM), tag, gb, wb, clr(RESET) });
+        if (gb != wb) rep.failLine("      {s} balance got {d} want {d}\n", .{ tag, gb, wb });
         const wn = u64FromHex(jstr(exp, "nonce") orelse "0x0");
         const gn = st.nonceOf(addr);
-        if (gn != wn) std.debug.print("      {s}{s} nonce got {d} want {d}{s}\n", .{ clr(DIM), tag, gn, wn, clr(RESET) });
+        if (gn != wn) rep.failLine("      {s} nonce got {d} want {d}\n", .{ tag, gn, wn });
         if (exp.get("storage")) |sto| if (sto == .object) {
             var sit = sto.object.iterator();
             while (sit.next()) |s| if (s.value_ptr.* == .string) {
                 const key = u256FromHex(s.key_ptr.*);
                 const wv = u256FromHex(s.value_ptr.string);
                 const gv = st.getStorage(addr, key);
-                if (gv != wv) std.debug.print("      {s}{s} slot {x} got {x} want {x}{s}\n", .{ clr(DIM), tag, key, gv, wv, clr(RESET) });
+                if (gv != wv) rep.failLine("      {s} slot {x} got {x} want {x}\n", .{ tag, key, gv, wv });
             };
         };
     }
@@ -133,7 +134,7 @@ fn jint(o: std.json.ObjectMap, key: []const u8) ?usize {
     return if (v == .integer) @intCast(v.integer) else null;
 }
 
-fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap, idx: usize, count: usize) Verdict {
+fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name: []const u8, obj: std.json.ObjectMap) Verdict {
     const post = jobj(obj, "post") orelse return .skip;
     const entries_v = post.get(FORK) orelse return .skip; // no Prague vector
     if (entries_v != .array) return .skip;
@@ -173,31 +174,54 @@ fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap, id
             .chain_id = 1,
         };
         if (jstr(env_o, "currentRandom")) |r| env.prev_randao = u256FromHex(r);
+        // BLOBBASEFEE is the blob gas price for the current excess blob gas,
+        // regardless of whether this is a blob transaction.
+        env.blob_base_fee = zeth.tx.blobGasPrice(u256FromHex(jstr(env_o, "currentExcessBlobGas") orelse "0x0"));
 
-        // Effective gas price (legacy gasPrice or 1559 fee market).
+        // Effective gas price (legacy gasPrice or 1559 fee market), plus the raw
+        // fee cap / priority used for pre-execution validation.
         var gas_price: u256 = undefined;
+        var max_fee_cap: u256 = undefined;
+        var max_prio: u256 = 0;
         if (jstr(tx_o, "gasPrice")) |gp| {
             gas_price = u256FromHex(gp);
+            max_fee_cap = gas_price;
         } else {
             const max_fee = u256FromHex(jstr(tx_o, "maxFeePerGas") orelse return .skip);
-            const max_prio = u256FromHex(jstr(tx_o, "maxPriorityFeePerGas") orelse "0x0");
+            max_prio = u256FromHex(jstr(tx_o, "maxPriorityFeePerGas") orelse "0x0");
             gas_price = @min(max_fee, base_fee + max_prio);
+            max_fee_cap = max_fee;
         }
         env.gas_price = gas_price;
 
-        // EIP-4844 blob transaction: compute the (burned) blob data fee and
-        // expose the versioned hashes + blob base fee to the EVM.
+        // EIP-4844 blob transaction: compute the (burned) blob data fee, expose
+        // the versioned hashes + blob base fee, and validate the blob fields.
         var blob_data_fee: u256 = 0;
-        if (jarr(tx_o, "blobVersionedHashes")) |bh| {
+        var blob_ok = true;
+        if (tx_o.get("maxFeePerBlobGas") != null or tx_o.get("blobVersionedHashes") != null) {
             const excess = u256FromHex(jstr(env_o, "currentExcessBlobGas") orelse "0x0");
             const price = zeth.tx.blobGasPrice(excess);
+            const max_fee_per_blob_gas = u256FromHex(jstr(tx_o, "maxFeePerBlobGas") orelse "0x0");
             env.blob_base_fee = price;
-            blob_data_fee = @as(u256, zeth.tx.GAS_PER_BLOB) * bh.len * price;
+            const bh = jarr(tx_o, "blobVersionedHashes");
+            const blob_count: usize = if (bh) |x| x.len else 0;
+            blob_data_fee = @as(u256, zeth.tx.GAS_PER_BLOB) * blob_count * price;
+
+            // EIP-4844 validity: non-empty, version 0x01, fee cap, blob-gas limit,
+            // and blob txs may not be contract creations.
+            if (blob_count == 0) blob_ok = false;
+            if (max_fee_per_blob_gas < price) blob_ok = false;
+            if (@as(u256, zeth.tx.GAS_PER_BLOB) * blob_count > zeth.tx.MAX_BLOB_GAS_PER_BLOCK) blob_ok = false;
+            if (jstr(tx_o, "to")) |t| {
+                if (t.len == 0 or std.mem.eql(u8, t, "0x")) blob_ok = false;
+            } else blob_ok = false;
+
             var hashes = std.ArrayList([32]u8).empty;
-            for (bh) |h| if (h == .string) {
+            if (bh) |hs| for (hs) |h| if (h == .string) {
                 var hh: [32]u8 = undefined;
-                const hs = if (std.mem.startsWith(u8, h.string, "0x")) h.string[2..] else h.string;
-                _ = std.fmt.hexToBytes(&hh, hs) catch {};
+                const s = if (std.mem.startsWith(u8, h.string, "0x")) h.string[2..] else h.string;
+                _ = std.fmt.hexToBytes(&hh, s) catch {};
+                if (hh[0] != 0x01) blob_ok = false; // VERSIONED_HASH_VERSION_KZG
                 hashes.append(a, hh) catch @panic("oom");
             };
             env.blob_versioned_hashes = hashes.items;
@@ -234,7 +258,10 @@ fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap, id
             .blob_data_fee = blob_data_fee,
         };
 
-        _ = zeth.tx.process(a, &st, &env, tx);
+        // Reject invalid transactions outright (state stays at the pre-state).
+        if (blob_ok and zeth.tx.validate(&st, &env, tx, max_fee_cap, max_prio)) {
+            _ = zeth.tx.process(a, &st, &env, tx);
+        }
         const got = zeth.trie.stateRoot(a, &st);
 
         var want: [32]u8 = undefined;
@@ -243,40 +270,34 @@ fn runTest(gpa: std.mem.Allocator, name: []const u8, obj: std.json.ObjectMap, id
 
         if (!std.mem.eql(u8, &got, &want)) {
             result = .fail;
-            std.debug.print("  {s}{d}/{d}{s} {s}...{s}FAIL{s} (d{d}g{d}v{d})\n", .{ clr(DIM), idx, count, clr(RESET), shortName(name), clr(RED), clr(RESET), di, gi, vi });
+            rep.failLine("  {s}{s}{s}\n    {s}{s}{s} (d{d}g{d}v{d})\n", .{ clr(DIM), path, clr(RESET), clr(RED), shortName(name), clr(RESET), di, gi, vi });
             // Diff against the fixture's expected post accounts to localize the bug.
-            if (jobj(entry, "state")) |post_state| diffState(&st, post_state);
+            if (jobj(entry, "state")) |post_state| diffState(rep, &st, post_state);
             break;
         }
     }
-    if (result == .pass)
-        std.debug.print("  {s}{d}/{d}{s} {s}...{s}OK{s}\n", .{ clr(DIM), idx, count, clr(RESET), shortName(name), clr(GREEN), clr(RESET) });
     return result;
 }
 
-fn runFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) Tally {
-    var t = Tally{};
-    const content = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return t;
+fn runFile(gpa: std.mem.Allocator, io: std.Io, rep: *report.Reporter, path: []const u8) void {
+    const content = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return;
     defer gpa.free(content);
-    var parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch return t;
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch return;
     defer parsed.deinit();
+    if (parsed.value != .object) return;
 
-    std.debug.print("{s}{s}{s}\n", .{ clr(DIM), path, clr(RESET) });
-    var idx: usize = 0;
-    const count = parsed.value.object.count();
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
-        idx += 1;
-        switch (runTest(gpa, entry.key_ptr.*, entry.value_ptr.object, idx, count)) {
-            .pass => t.pass += 1,
+        if (entry.value_ptr.* != .object) continue;
+        switch (runTest(gpa, rep, path, entry.key_ptr.*, entry.value_ptr.object)) {
+            .pass => rep.passed(),
             .fail => {
-                t.fail += 1;
-                if (g_stop) break;
+                rep.failed();
+                if (g_stop) return;
             },
-            .skip => t.skip += 1,
+            .skip => rep.skipped(),
         }
     }
-    return t;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -288,24 +309,18 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("ZETH_ALL") != null) g_stop = false; // run past failures
     if (init.environ_map.get("ZETH_DATA")) |d| g_data_filter = std.fmt.parseInt(usize, d, 10) catch null;
     if (args.len < 2) {
-        std.debug.print("usage: statetest <fixture.json> ...\n", .{});
+        std.debug.print("usage: statetest <fixture.json | dir> ...\n", .{});
         return error.MissingArgument;
     }
 
-    var total = Tally{};
-    for (args[1..]) |path| {
-        const t = runFile(gpa, init.io, path);
-        total.pass += t.pass;
-        total.fail += t.fail;
-        total.skip += t.skip;
-        if (g_stop and total.fail > 0) break; // stop at the first failure
+    const files = try report.collectJson(gpa, init.io, args[1..]);
+    var rep = report.Reporter{ .alloc = gpa, .color = g_color };
+    std.debug.print("  ", .{}); // indent the first graph row
+    for (files) |path| {
+        runFile(gpa, init.io, &rep, path);
+        if (g_stop and rep.fail > 0) break; // stop at the first failure
     }
 
-    const ok = total.fail == 0;
-    std.debug.print("\n{s}{s}{d} passed{s}, {s}{d} failed{s}, {s}{d} skipped{s}\n", .{
-        clr(BOLD),                                     if (ok) clr(GREEN) else clr(RED), total.pass, clr(RESET),
-        (if (total.fail == 0) clr(DIM) else clr(RED)), total.fail,                       clr(RESET), clr(YELLOW),
-        total.skip,                                    clr(RESET),
-    });
+    const ok = rep.finish("GeneralStateTests");
     if (!ok) return error.ConformanceFailed;
 }

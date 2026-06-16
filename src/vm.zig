@@ -1,6 +1,6 @@
 //! A faithful Zig port of the Prague-fork EVM (latest mainnet) from the
-//! Ethereum execution-specs, plus Osaka's CLZ. It implements the complete
-//! opcode set — arithmetic, comparison, bitwise (incl. SHL/SHR/SAR/CLZ),
+//! Ethereum execution-specs It implements the complete
+//! opcode set — arithmetic, comparison, bitwise (incl. SHL/SHR/SAR),
 //! KECCAK, environment & block context (incl. RETURNDATA*, CHAINID,
 //! SELFBALANCE, BASEFEE, BLOBHASH/BLOBBASEFEE, PUSH0), account storage with the
 //! EIP-2929 access-list and EIP-2200/3529 SSTORE accounting, EIP-1153 transient
@@ -32,6 +32,9 @@ pub const STACK_DEPTH_LIMIT: u32 = 1024;
 /// Maximum operand stack size.
 pub const STACK_LIMIT: usize = 1024;
 
+/// EIP-3860: maximum init-code length (2 * MAX_CODE_SIZE).
+pub const MAX_INIT_CODE_SIZE: u256 = 49152;
+
 /// Upper bound on addressable memory. Real execution runs out of gas long
 /// before reaching this (memory cost is quadratic); we use it to reject
 /// absurd offsets without overflowing the gas math.
@@ -57,6 +60,7 @@ pub const VmError = error{
     InvalidOpcode,
     StaticStateChange,
     OutOfBounds,
+    AddressCollision,
 };
 
 /// Static gas costs, ported from `prague/vm/gas.py` (the latest mainnet fork).
@@ -134,7 +138,6 @@ pub const Op = enum(u8) {
     SHL = 0x1B,
     SHR = 0x1C,
     SAR = 0x1D,
-    CLZ = 0x1E, // Osaka
 
     KECCAK = 0x20,
 
@@ -428,7 +431,6 @@ pub const Evm = struct {
             .SHL => try self.binOp(Gas.VERY_LOW, word.shl),
             .SHR => try self.binOp(Gas.VERY_LOW, word.shr),
             .SAR => try self.binOp(Gas.VERY_LOW, word.sar),
-            .CLZ => try self.unOp(Gas.LOW, word.clz),
 
             .KECCAK => try self.keccak(),
 
@@ -672,7 +674,8 @@ pub const Evm = struct {
     fn copyToMemory(self: *Evm, src: []const u8, src_start: u256, mem_start: usize, size: usize) void {
         var i: usize = 0;
         while (i < size) : (i += 1) {
-            const si: u256 = src_start + i;
+            // u512 so a near-2²⁵⁶ source offset can't wrap into a valid index.
+            const si: u512 = @as(u512, src_start) + i;
             self.memory.data[mem_start + i] = if (si < src.len) src[@intCast(si)] else 0;
         }
     }
@@ -967,6 +970,7 @@ pub const Evm = struct {
         // EIP-3860 init-code word cost (CREATE2 additionally hashes the code).
         try self.chargeGasWide(Gas.CREATE_BASE + Gas.CODE_INIT_PER_WORD * word_count + ext.cost);
         try self.growMemory(ext.expand_by);
+        if (mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas; // EIP-3860
         if (self.is_static) return error.StaticStateChange;
 
         const create_gas = self.gas_left - self.gas_left / 64; // EIP-150 63/64
@@ -992,6 +996,7 @@ pub const Evm = struct {
         try self.chargeGasWide(Gas.CREATE_BASE + Gas.KECCAK_PER_WORD * words +
             Gas.CODE_INIT_PER_WORD * words + ext.cost);
         try self.growMemory(ext.expand_by);
+        if (mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas; // EIP-3860
         if (self.is_static) return error.StaticStateChange;
 
         const create_gas = self.gas_left - self.gas_left / 64; // EIP-150
@@ -1020,6 +1025,7 @@ pub const Evm = struct {
         }
         if (self.state.hasCodeOrNonce(contract) or self.state.hasStorage(contract)) {
             self.state.incrementNonce(sender) catch @panic("out of memory");
+            self.setReturnData(&.{}); // an address collision exposes no return data
             try self.stack.push(0);
             return;
         }
@@ -1047,6 +1053,7 @@ pub const Evm = struct {
             try self.stack.push(0);
         } else {
             self.incorporateSuccess(&child);
+            self.setReturnData(&.{}); // a successful create exposes no return data
             try self.stack.push(state_mod.addressToWord(contract));
         }
     }
@@ -1329,6 +1336,17 @@ pub fn processCreateMessage(
     message: Message,
     parent: ?*Evm,
 ) Evm {
+    // EIP-684 address collision: if the target already holds code, a non-zero
+    // nonce, or storage, creation aborts and consumes all gas. (The CREATE/
+    // CREATE2 opcode path pre-checks this; this guards the transaction-level
+    // create that calls in directly.)
+    if (state.hasCodeOrNonce(message.current_target) or state.hasStorage(message.current_target)) {
+        var frame = newFrame(allocator, state, env, message, 0, parent);
+        frame.halt_error = error.AddressCollision;
+        frame.running = false;
+        return frame;
+    }
+
     // Snapshot so the nonce bump (and all creation effects) revert on failure.
     var snapshot = state.clone() catch @panic("out of memory");
     // EIP-6780: record the address as created this tx (shared, not rolled back)
