@@ -18,10 +18,121 @@ const word = @import("word.zig");
 const crypto = @import("crypto.zig");
 const state_mod = @import("state.zig");
 const precompiles = @import("precompiles.zig");
+const fork_mod = @import("fork.zig");
+pub const Fork = fork_mod.Fork;
 
 /// When true, every executed opcode is printed (depth/pc/op/gas) — a debug
 /// trace for chasing conformance failures. Toggled via ZETH_TRACE in the runners.
 pub var trace_enabled: bool = false;
+
+/// The mnemonic for an opcode byte (for structLog `op` fields).
+pub fn opName(op: u8) []const u8 {
+    return switch (op) {
+        0x00 => "STOP",        0x01 => "ADD",         0x02 => "MUL",         0x03 => "SUB",
+        0x04 => "DIV",         0x05 => "SDIV",        0x06 => "MOD",         0x07 => "SMOD",
+        0x08 => "ADDMOD",      0x09 => "MULMOD",      0x0a => "EXP",         0x0b => "SIGNEXTEND",
+        0x10 => "LT",          0x11 => "GT",          0x12 => "SLT",         0x13 => "SGT",
+        0x14 => "EQ",          0x15 => "ISZERO",      0x16 => "AND",         0x17 => "OR",
+        0x18 => "XOR",         0x19 => "NOT",         0x1a => "BYTE",        0x1b => "SHL",
+        0x1c => "SHR",         0x1d => "SAR",         0x20 => "KECCAK256",
+        0x30 => "ADDRESS",     0x31 => "BALANCE",     0x32 => "ORIGIN",      0x33 => "CALLER",
+        0x34 => "CALLVALUE",   0x35 => "CALLDATALOAD",0x36 => "CALLDATASIZE",0x37 => "CALLDATACOPY",
+        0x38 => "CODESIZE",    0x39 => "CODECOPY",    0x3a => "GASPRICE",    0x3b => "EXTCODESIZE",
+        0x3c => "EXTCODECOPY", 0x3d => "RETURNDATASIZE",0x3e => "RETURNDATACOPY",0x3f => "EXTCODEHASH",
+        0x40 => "BLOCKHASH",   0x41 => "COINBASE",    0x42 => "TIMESTAMP",   0x43 => "NUMBER",
+        0x44 => "PREVRANDAO",  0x45 => "GASLIMIT",    0x46 => "CHAINID",     0x47 => "SELFBALANCE",
+        0x48 => "BASEFEE",     0x49 => "BLOBHASH",    0x4a => "BLOBBASEFEE",
+        0x50 => "POP",         0x51 => "MLOAD",       0x52 => "MSTORE",      0x53 => "MSTORE8",
+        0x54 => "SLOAD",       0x55 => "SSTORE",      0x56 => "JUMP",        0x57 => "JUMPI",
+        0x58 => "PC",          0x59 => "MSIZE",       0x5a => "GAS",         0x5b => "JUMPDEST",
+        0x5c => "TLOAD",       0x5d => "TSTORE",      0x5e => "MCOPY",       0x5f => "PUSH0",
+        0x60...0x7f => PUSH_NAMES[op - 0x60],
+        0x80...0x8f => DUP_NAMES[op - 0x80],
+        0x90...0x9f => SWAP_NAMES[op - 0x90],
+        0xa0...0xa4 => LOG_NAMES[op - 0xa0],
+        0xf0 => "CREATE",      0xf1 => "CALL",        0xf2 => "CALLCODE",    0xf3 => "RETURN",
+        0xf4 => "DELEGATECALL",0xf5 => "CREATE2",     0xfa => "STATICCALL",  0xfd => "REVERT",
+        0xfe => "INVALID",     0xff => "SELFDESTRUCT",
+        else => "UNKNOWN",
+    };
+}
+const PUSH_NAMES = blk: {
+    var n: [32][]const u8 = undefined;
+    for (0..32) |i| n[i] = std.fmt.comptimePrint("PUSH{d}", .{i + 1});
+    break :blk n;
+};
+const DUP_NAMES = blk: {
+    var n: [16][]const u8 = undefined;
+    for (0..16) |i| n[i] = std.fmt.comptimePrint("DUP{d}", .{i + 1});
+    break :blk n;
+};
+const SWAP_NAMES = blk: {
+    var n: [16][]const u8 = undefined;
+    for (0..16) |i| n[i] = std.fmt.comptimePrint("SWAP{d}", .{i + 1});
+    break :blk n;
+};
+const LOG_NAMES = [_][]const u8{ "LOG0", "LOG1", "LOG2", "LOG3", "LOG4" };
+
+/// One captured EVM step (geth structLog shape, sans the optional memory/storage).
+pub const StructLog = struct {
+    pc: usize,
+    op: u8,
+    gas: u64,
+    depth: u32,
+    stack: []const u256, // snapshot, allocated from the frame allocator
+};
+
+/// When set, every executed opcode appends a `StructLog` here (across all call
+/// frames). Used by debug_traceTransaction/traceCall. Single-threaded.
+pub var trace_sink: ?*std.ArrayList(StructLog) = null;
+
+/// A call-frame in the geth `callTracer` tree (also the data Foundry renders).
+pub const CallFrame = struct {
+    typ: []const u8, // CALL / STATICCALL / DELEGATECALL / CALLCODE / CREATE / CREATE2
+    from: Address,
+    to: Address,
+    value: u256,
+    gas: u64,
+    gas_used: u64 = 0,
+    input: []const u8 = &.{},
+    output: []const u8 = &.{},
+    err: ?[]const u8 = null,
+    calls: std.ArrayList(*CallFrame) = .empty,
+};
+
+/// Builds the call-frame tree as the EVM enters/exits messages.
+pub const CallTracer = struct {
+    alloc: std.mem.Allocator,
+    root: ?*CallFrame = null,
+    stack: std.ArrayList(*CallFrame) = .empty,
+
+    pub fn enter(self: *CallTracer, typ: []const u8, from: Address, to: Address, value: u256, gas: u64, input: []const u8) void {
+        const f = self.alloc.create(CallFrame) catch return;
+        f.* = .{ .typ = typ, .from = from, .to = to, .value = value, .gas = gas, .input = self.alloc.dupe(u8, input) catch &.{} };
+        if (self.stack.items.len > 0)
+            self.stack.items[self.stack.items.len - 1].calls.append(self.alloc, f) catch {}
+        else
+            self.root = f;
+        self.stack.append(self.alloc, f) catch {};
+    }
+    pub fn exit(self: *CallTracer, gas_used: u64, output: []const u8, err: ?[]const u8) void {
+        if (self.stack.items.len == 0) return;
+        const f = self.stack.items[self.stack.items.len - 1];
+        self.stack.items.len -= 1;
+        f.gas_used = gas_used;
+        f.output = self.alloc.dupe(u8, output) catch &.{};
+        f.err = err;
+    }
+};
+
+/// When set, the EVM records the call-frame tree here (debug callTracer).
+pub var call_tracer: ?*CallTracer = null;
+
+fn frameError(frame: *const Evm) ?[]const u8 {
+    if (frame.halt_error) |e| return @errorName(e);
+    if (frame.reverted) return "execution reverted";
+    return null;
+}
 
 const Address = state_mod.Address;
 const State = state_mod.State;
@@ -31,6 +142,14 @@ pub const STACK_DEPTH_LIMIT: u32 = 1024;
 
 /// Maximum operand stack size.
 pub const STACK_LIMIT: usize = 1024;
+
+/// Native stack required to execute a transaction. Each EVM call frame recurses
+/// through processMessage→genericCall→callOp→run→step on the native stack, so a
+/// contract reaching the 1024-deep call limit needs far more than the default
+/// thread allowance. Threads that run the EVM (the node's RPC/Engine handlers,
+/// the conformance runners) must be spawned with at least this stack size. The
+/// reservation is virtual; only touched pages are committed.
+pub const NATIVE_STACK_SIZE: usize = 256 * 1024 * 1024;
 
 /// EIP-3860: maximum init-code length (2 * MAX_CODE_SIZE).
 pub const MAX_INIT_CODE_SIZE: u256 = 49152;
@@ -201,13 +320,31 @@ pub const Op = enum(u8) {
     _,
 };
 
+/// The fork that introduced `op`, or null if it has existed since Frontier.
+/// Drives opcode-availability gating: an opcode is an invalid instruction
+/// before its activation fork.
+fn opcodeMinFork(op: Op) ?Fork {
+    return switch (op) {
+        .DELEGATECALL => .homestead,
+        .RETURNDATASIZE, .RETURNDATACOPY, .STATICCALL, .REVERT => .byzantium,
+        .SHL, .SHR, .SAR, .EXTCODEHASH, .CREATE2 => .constantinople,
+        .CHAINID, .SELFBALANCE => .istanbul,
+        .BASEFEE => .london,
+        .PUSH0 => .shanghai,
+        .TLOAD, .TSTORE, .MCOPY, .BLOBHASH, .BLOBBASEFEE => .cancun,
+        else => null,
+    };
+}
+
 /// Block- and transaction-level context shared across an entire message tree.
 pub const Environment = struct {
+    fork: Fork = .osaka, // default to the latest fork
     chain_id: u64 = 1,
     coinbase: Address = state_mod.zero_address,
     number: u64 = 0,
     time: u256 = 0,
     prev_randao: u256 = 0, // post-Merge value behind opcode 0x44
+    difficulty: u256 = 0, // pre-Merge PoW difficulty behind opcode 0x44
     base_fee: u256 = 0,
     blob_base_fee: u256 = 0,
     gas_limit: u64 = 0,
@@ -230,6 +367,8 @@ pub const Message = struct {
     depth: u32 = 0,
     is_static: bool = false,
     should_transfer_value: bool = true,
+    /// Call-frame type for the callTracer (CALL by default; set by CALL/CREATE sites).
+    trace_type: []const u8 = "CALL",
 };
 
 /// An emitted log entry. `topics` and `data` are heap-owned by the frame that
@@ -394,7 +533,17 @@ pub const Evm = struct {
     inline fn step(self: *Evm) VmError!void {
         self.op_count += 1;
         if (trace_enabled) std.debug.print("d{d} pc={d:>4} op=0x{x:0>2} gas={d:>9} stack={d}\n", .{ self.message.depth, self.pc, self.code[self.pc], self.gas_left, self.stack.len });
+        if (trace_sink) |sink| {
+            const snap = self.allocator.dupe(u256, self.stack.items[0..self.stack.len]) catch &.{};
+            sink.append(self.allocator, .{ .pc = self.pc, .op = self.code[self.pc], .gas = self.gas_left, .depth = self.message.depth, .stack = snap }) catch {};
+        }
         const op: Op = @enumFromInt(self.code[self.pc]);
+        // Opcode availability: a fork-introduced opcode is an invalid
+        // instruction before its activation fork (e.g. PUSH0 pre-Shanghai,
+        // BASEFEE pre-London, SHL/CREATE2 pre-Constantinople).
+        if (opcodeMinFork(op)) |mf| {
+            if (!self.env.fork.atLeast(mf)) return error.InvalidOpcode;
+        }
         switch (op) {
             .STOP => {
                 self.running = false;
@@ -457,7 +606,8 @@ pub const Evm = struct {
             .COINBASE => try self.pushCtx(Gas.BASE, state_mod.addressToWord(self.env.coinbase)),
             .TIMESTAMP => try self.pushCtx(Gas.BASE, self.env.time),
             .NUMBER => try self.pushCtx(Gas.BASE, self.env.number),
-            .DIFFICULTY => try self.pushCtx(Gas.BASE, self.env.prev_randao),
+            // Opcode 0x44 is DIFFICULTY pre-Merge, PREVRANDAO post-Merge (EIP-4399).
+            .DIFFICULTY => try self.pushCtx(Gas.BASE, if (self.env.fork.atLeast(.paris)) self.env.prev_randao else self.env.difficulty),
             .GASLIMIT => try self.pushCtx(Gas.BASE, self.env.gas_limit),
             .CHAINID => try self.pushCtx(Gas.BASE, self.env.chain_id),
             .SELFBALANCE => try self.selfbalance(),
@@ -639,6 +789,17 @@ pub const Evm = struct {
         self.memory.expand(by) catch return error.OutOfGas;
     }
 
+    /// Read a memory region given raw 256-bit operands. A zero-size region is
+    /// empty and triggers no memory expansion, so its offset is never read nor
+    /// even narrowed to usize — the offset may legally exceed memory size (and
+    /// exceed usize) when size is 0 (e.g. LOG/RETURN/CALL with size 0).
+    fn memRead(self: *Evm, start: u256, size: u256) []u8 {
+        if (size == 0) return &.{};
+        const s: usize = @intCast(start);
+        const n: usize = @intCast(size);
+        return self.memory.data[s .. s + n];
+    }
+
     fn mstore(self: *Evm) VmError!void {
         const start = try self.stack.pop();
         const value = word.toBeBytes32(try self.stack.pop());
@@ -671,12 +832,15 @@ pub const Evm = struct {
     }
 
     /// Copy bytes from `src` (with zero padding past the end) into memory.
-    fn copyToMemory(self: *Evm, src: []const u8, src_start: u256, mem_start: usize, size: usize) void {
+    fn copyToMemory(self: *Evm, src: []const u8, src_start: u256, mem_start: u256, size: u256) void {
+        if (size == 0) return; // no copy, no memory growth — offset never narrowed
+        const ms: usize = @intCast(mem_start);
+        const n: usize = @intCast(size);
         var i: usize = 0;
-        while (i < size) : (i += 1) {
+        while (i < n) : (i += 1) {
             // u512 so a near-2²⁵⁶ source offset can't wrap into a valid index.
             const si: u512 = @as(u512, src_start) + i;
-            self.memory.data[mem_start + i] = if (si < src.len) src[@intCast(si)] else 0;
+            self.memory.data[ms + i] = if (si < src.len) src[@intCast(si)] else 0;
         }
     }
 
@@ -694,7 +858,7 @@ pub const Evm = struct {
             .calldata => self.message.data,
             .code => self.code,
         };
-        self.copyToMemory(src, data_start, @intCast(mem_start), @intCast(size));
+        self.copyToMemory(src, data_start, mem_start, size);
         self.pc += 1;
     }
 
@@ -741,7 +905,7 @@ pub const Evm = struct {
         const words = numWords(size);
         try self.chargeGasWide(@as(u128, self.accessAddressCost(addr)) + Gas.COPY_PER_WORD * words + ext.cost);
         try self.growMemory(ext.expand_by);
-        self.copyToMemory(self.state.codeOf(addr), code_start, @intCast(mem_start), @intCast(size));
+        self.copyToMemory(self.state.codeOf(addr), code_start, mem_start, size);
         self.pc += 1;
     }
 
@@ -769,7 +933,7 @@ pub const Evm = struct {
         // EIP-211: reading past the end of the return-data buffer is illegal.
         if (@as(u512, data_start) + @as(u512, size) > self.return_data.len) return error.OutOfBounds;
         try self.growMemory(ext.expand_by);
-        self.copyToMemory(self.return_data, data_start, @intCast(mem_start), @intCast(size));
+        self.copyToMemory(self.return_data, data_start, mem_start, size);
         self.pc += 1;
     }
 
@@ -898,8 +1062,7 @@ pub const Evm = struct {
             return error.StaticStateChange; // LOG mutates state (EIP-214)
         }
 
-        const at: usize = @intCast(mem_start);
-        const data = self.allocator.dupe(u8, self.memory.data[at .. at + @as(usize, @intCast(size))]) catch @panic("out of memory");
+        const data = self.allocator.dupe(u8, self.memRead(mem_start, size)) catch @panic("out of memory");
         self.logs.append(self.allocator, .{
             .address = self.message.current_target,
             .topics = topics,
@@ -941,8 +1104,7 @@ pub const Evm = struct {
         const ext = try self.extendMemory(&.{.{ start, size }});
         try self.chargeGasWide(ext.cost);
         try self.growMemory(ext.expand_by);
-        const at: usize = @intCast(start);
-        self.output = self.memory.data[at .. at + @as(usize, @intCast(size))];
+        self.output = self.memRead(start, size);
         self.running = false;
     }
 
@@ -953,8 +1115,7 @@ pub const Evm = struct {
         const words = numWords(size);
         try self.chargeGasWide(Gas.KECCAK_BASE + Gas.KECCAK_PER_WORD * words + ext.cost);
         try self.growMemory(ext.expand_by);
-        const at: usize = @intCast(start);
-        const hash = crypto.keccak256(self.memory.data[at .. at + @as(usize, @intCast(size))]);
+        const hash = crypto.keccak256(self.memRead(start, size));
         try self.stack.push(word.fromBeBytes(&hash));
         self.pc += 1;
     }
@@ -967,21 +1128,22 @@ pub const Evm = struct {
         const mem_size = try self.stack.pop();
         const ext = try self.extendMemory(&.{.{ mem_start, mem_size }});
         const word_count = numWords(mem_size);
-        // EIP-3860 init-code word cost (CREATE2 additionally hashes the code).
-        try self.chargeGasWide(Gas.CREATE_BASE + Gas.CODE_INIT_PER_WORD * word_count + ext.cost);
+        // EIP-3860 (Shanghai+): init-code word cost + size limit.
+        const eip3860 = self.env.fork.atLeast(.shanghai);
+        const init_cost: u64 = if (eip3860) Gas.CODE_INIT_PER_WORD * word_count else 0;
+        try self.chargeGasWide(Gas.CREATE_BASE + init_cost + ext.cost);
         try self.growMemory(ext.expand_by);
-        if (mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas; // EIP-3860
+        if (eip3860 and mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas;
         if (self.is_static) return error.StaticStateChange;
 
         const create_gas = self.gas_left - self.gas_left / 64; // EIP-150 63/64
         self.gas_left -= create_gas;
 
         const sender = self.message.current_target;
-        const at: usize = @intCast(mem_start);
-        const init_code = self.memory.data[at .. at + @as(usize, @intCast(mem_size))];
+        const init_code = self.memRead(mem_start, mem_size);
         const contract = state_mod.computeContractAddress(self.allocator, sender, self.state.nonceOf(sender)) catch @panic("out of memory");
 
-        try self.runCreate(sender, contract, endowment, create_gas, init_code);
+        try self.runCreate(sender, contract, endowment, create_gas, init_code, "CREATE");
         self.pc += 1;
     }
 
@@ -992,27 +1154,28 @@ pub const Evm = struct {
         const salt = word.toBeBytes32(try self.stack.pop());
         const ext = try self.extendMemory(&.{.{ mem_start, mem_size }});
         const words = numWords(mem_size);
-        // CREATE2 also pays to hash the init code (KECCAK per-word).
-        try self.chargeGasWide(Gas.CREATE_BASE + Gas.KECCAK_PER_WORD * words +
-            Gas.CODE_INIT_PER_WORD * words + ext.cost);
+        // CREATE2 always pays to hash the init code (KECCAK per-word, since
+        // Constantinople); EIP-3860 (Shanghai+) adds the init-code word cost + limit.
+        const eip3860 = self.env.fork.atLeast(.shanghai);
+        const init_cost: u64 = if (eip3860) Gas.CODE_INIT_PER_WORD * words else 0;
+        try self.chargeGasWide(Gas.CREATE_BASE + Gas.KECCAK_PER_WORD * words + init_cost + ext.cost);
         try self.growMemory(ext.expand_by);
-        if (mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas; // EIP-3860
+        if (eip3860 and mem_size > MAX_INIT_CODE_SIZE) return error.OutOfGas;
         if (self.is_static) return error.StaticStateChange;
 
         const create_gas = self.gas_left - self.gas_left / 64; // EIP-150
         self.gas_left -= create_gas;
 
         const sender = self.message.current_target;
-        const at: usize = @intCast(mem_start);
-        const init_code = self.memory.data[at .. at + @as(usize, @intCast(mem_size))];
+        const init_code = self.memRead(mem_start, mem_size);
         const contract = computeCreate2Address(sender, &salt, init_code);
 
-        try self.runCreate(sender, contract, endowment, create_gas, init_code);
+        try self.runCreate(sender, contract, endowment, create_gas, init_code, "CREATE2");
         self.pc += 1;
     }
 
     /// Shared CREATE/CREATE2 body: collision checks, child execution, result.
-    fn runCreate(self: *Evm, sender: Address, contract: Address, endowment: u256, create_gas: u64, init_code: []const u8) VmError!void {
+    fn runCreate(self: *Evm, sender: Address, contract: Address, endowment: u256, create_gas: u64, init_code: []const u8, trace_type: []const u8) VmError!void {
         const sender_balance = self.state.balanceOf(sender);
         const sender_nonce = self.state.nonceOf(sender);
         _ = self.state.accessAddress(contract); // warm the new address (EIP-2929)
@@ -1040,6 +1203,7 @@ pub const Evm = struct {
             .data = &.{},
             .code = init_code,
             .depth = self.message.depth + 1,
+            .trace_type = trace_type,
         }, self);
         defer child.deinit();
 
@@ -1088,9 +1252,21 @@ pub const Evm = struct {
 
         const ext = try self.extendMemory(&.{ .{ in_start, in_size }, .{ out_start, out_size } });
         const access_gas: u64 = if (self.state.accessAddress(code_address)) Gas.WARM_ACCESS else Gas.COLD_ACCOUNT_ACCESS;
+        // EIP-7702: if the target is a delegated EOA, pay an extra cold/warm
+        // charge to access the delegate. `genericCall` runs the delegate's code
+        // (keeping code_address = the target, which also disables precompiles).
+        var deleg_gas: u64 = 0;
+        if (self.env.fork.atLeast(.prague)) {
+            const tcode = self.state.codeOf(code_address);
+            if (tcode.len == 23 and tcode[0] == 0xef and tcode[1] == 0x01 and tcode[2] == 0x00) {
+                var del: Address = undefined;
+                @memcpy(&del, tcode[3..23]);
+                deleg_gas = if (self.state.accessAddress(del)) Gas.WARM_ACCESS else Gas.COLD_ACCOUNT_ACCESS;
+            }
+        }
         const create_gas: u64 = if (kind == .call and value != 0 and !self.accountAlive(to)) Gas.NEW_ACCOUNT else 0;
         const transfer_gas: u64 = if (transfers_value) Gas.CALL_VALUE else 0;
-        const extra_gas: u64 = access_gas + create_gas + transfer_gas;
+        const extra_gas: u64 = access_gas + deleg_gas + create_gas + transfer_gas;
 
         const mcg = messageCallGas(transfers_value, gas_req, self.gas_left, ext.cost, extra_gas);
         try self.chargeGasWide(mcg.cost + ext.cost);
@@ -1116,8 +1292,14 @@ pub const Evm = struct {
                 .is_static = self.is_static or kind == .staticcall,
                 .in_start = in_start,
                 .in_size = in_size,
-                .out_start = @intCast(out_start),
+                .out_start = out_start,
                 .out_size = @intCast(out_size),
+                .trace_type = switch (kind) {
+                    .call => "CALL",
+                    .callcode => "CALLCODE",
+                    .delegatecall => "DELEGATECALL",
+                    .staticcall => "STATICCALL",
+                },
             });
         }
         self.pc += 1;
@@ -1133,8 +1315,9 @@ pub const Evm = struct {
         is_static: bool,
         in_start: u256,
         in_size: u256,
-        out_start: usize,
+        out_start: u256,
         out_size: usize,
+        trace_type: []const u8 = "CALL",
     };
 
     /// Replace `return_data` with an owned copy of `bytes`.
@@ -1150,9 +1333,16 @@ pub const Evm = struct {
             try self.stack.push(0);
             return;
         }
-        const at: usize = @intCast(p.in_start);
-        const call_data = self.memory.data[at .. at + @as(usize, @intCast(p.in_size))];
-        const code = self.state.codeOf(p.code_address);
+        const call_data = self.memRead(p.in_start, p.in_size);
+        // EIP-7702: follow a delegation indicator — execute the delegate's code
+        // in the target's context. `code_address` stays the target so precompile
+        // dispatch is suppressed (a delegation to a precompile runs nothing).
+        var code = self.state.codeOf(p.code_address);
+        if (self.env.fork.atLeast(.prague) and code.len == 23 and code[0] == 0xef and code[1] == 0x01 and code[2] == 0x00) {
+            var del: Address = undefined;
+            @memcpy(&del, code[3..23]);
+            code = self.state.codeOf(del);
+        }
 
         var child = processMessage(self.allocator, self.state, self.env, .{
             .caller = p.caller,
@@ -1165,6 +1355,7 @@ pub const Evm = struct {
             .depth = self.message.depth + 1,
             .is_static = p.is_static,
             .should_transfer_value = p.should_transfer_value,
+            .trace_type = p.trace_type,
         }, self);
         defer child.deinit();
 
@@ -1182,7 +1373,7 @@ pub const Evm = struct {
         // Returned data is available even on revert; copy into the output region.
         self.setReturnData(child.output);
         const n = @min(p.out_size, child.output.len);
-        if (n > 0) self.memory.write(p.out_start, child.output[0..n]);
+        if (n > 0) self.memory.write(@intCast(p.out_start), child.output[0..n]);
     }
 
     fn revert(self: *Evm) VmError!void {
@@ -1191,8 +1382,7 @@ pub const Evm = struct {
         const ext = try self.extendMemory(&.{.{ start, size }});
         try self.chargeGasWide(ext.cost);
         try self.growMemory(ext.expand_by);
-        const at: usize = @intCast(start);
-        self.output = self.memory.data[at .. at + @as(usize, @intCast(size))];
+        self.output = self.memRead(start, size);
         self.running = false;
         self.reverted = true; // reverts state but keeps remaining gas
     }
@@ -1237,9 +1427,10 @@ pub const Evm = struct {
             self.state.setBalance(originator, 0) catch @panic("out of memory");
         }
 
-        // EIP-6780: only actually delete the account (and burn its balance) if it
-        // was created in this same transaction.
-        if (self.state.wasCreatedThisTx(originator)) {
+        // EIP-6780 (Cancun+): only delete the account (and burn its balance) if it
+        // was created in this same transaction. Pre-Cancun, SELFDESTRUCT always
+        // deletes.
+        if (!self.env.fork.atLeast(.cancun) or self.state.wasCreatedThisTx(originator)) {
             self.state.setBalance(originator, 0) catch @panic("out of memory");
             self.accounts_to_delete.put(self.allocator, originator, {}) catch @panic("out of memory");
         }
@@ -1294,6 +1485,8 @@ pub fn processMessage(
         frame.gas_left = 0;
         return frame;
     }
+    if (call_tracer) |t| t.enter(message.trace_type, message.caller, message.current_target, message.value, message.gas, message.data);
+    defer if (call_tracer) |t| t.exit(message.gas - frame.gas_left, frame.output, frameError(&frame));
 
     var snapshot = state.clone() catch @panic("out of memory");
     state.touch(message.current_target) catch @panic("out of memory");
@@ -1303,7 +1496,7 @@ pub fn processMessage(
 
     // Precompiled contracts (0x01–0x0a) run natively instead of the bytecode.
     if (message.code_address) |ca| {
-        if (precompiles.idOf(ca)) |id| {
+        if (precompiles.idOf(ca, env.fork)) |id| {
             if (precompiles.run(allocator, id, message.data, frame.gas_left)) |res| {
                 frame.gas_left -= res.gas;
                 frame.output = res.data;
