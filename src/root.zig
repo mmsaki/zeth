@@ -25,6 +25,7 @@ pub const ecies = @import("ecies.zig");
 pub const secp = @import("secp.zig");
 pub const rlpx = @import("rlpx.zig");
 pub const handshake = @import("handshake.zig");
+pub const eth_proto = @import("eth_proto.zig");
 
 pub const Evm = vm.Evm;
 pub const Op = vm.Op;
