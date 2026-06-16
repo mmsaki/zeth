@@ -204,6 +204,7 @@ pub const Chain = struct {
                     .value = dt.value,
                     .data = dt.data,
                     .access_list = dt.access_list,
+                    .authorizations = dt.authorizations,
                     .blob_data_fee = blob_fee,
                 });
                 if (target) {
@@ -360,6 +361,7 @@ pub const Chain = struct {
                 .value = dt.value,
                 .data = dt.data,
                 .access_list = dt.access_list,
+                .authorizations = dt.authorizations,
                 .blob_data_fee = blob_fee,
             };
             // A block is invalid if any transaction is invalid (intrinsic gas,
