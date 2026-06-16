@@ -206,6 +206,10 @@ fn syncCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
         return error.MissingArgument;
     }
     const enode = try zeth.peer.parseEnode(args[0]);
+    var datadir: ?[]const u8 = null;
+    for (args[2..]) |arg| {
+        if (std.mem.startsWith(u8, arg, "--datadir=")) datadir = arg["--datadir=".len..];
+    }
 
     // Genesis → state + chain.
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -223,6 +227,25 @@ fn syncCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const network_id = g.schedule.chain_id;
     const fid = zeth.forkid.compute(genesis_hash, &.{}, 0);
     std.debug.print("genesis #0 0x{s} (chainId={d} forkid=0x{s})\n", .{ std.fmt.bytesToHex(&genesis_hash, .lower), network_id, std.fmt.bytesToHex(&fid.hash, .lower) });
+
+    // Optional persistence: open the store and resume from a prior sync so we
+    // only download what's new.
+    var db_opt: ?zeth.db.Db = if (datadir) |dir| try zeth.db.Db.open(gpa, io, dir) else null;
+    defer if (db_opt) |*d| d.close();
+    var store_opt: ?zeth.store.Store = if (db_opt) |*d| zeth.store.Store.init(d) else null;
+    if (store_opt) |*store| {
+        if (try store.getHead(a)) |head| {
+            var n: u64 = 1;
+            while (n <= head.number) : (n += 1) {
+                const hash = (try store.getCanonical(a, n)) orelse break;
+                const henc = (try store.getHeader(a, hash)) orelse break;
+                const hdr = zeth.block.headerFromRlp(a, henc) catch break;
+                try ch.appendResumed(hdr, hash, henc.len + 16);
+            }
+            try store.loadState(gpa, &st);
+            std.debug.print("resumed from {s}: head #{d}\n", .{ datadir.?, ch.head.number });
+        }
+    }
 
     // Dial + RLPx handshake.
     const priv = zeth.ecies.randomPriv(io);
@@ -293,6 +316,11 @@ fn syncCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
             };
         }
         std.debug.print("  synced → #{d} / {d}\n", .{ ch.head.number, target });
+    }
+
+    if (store_opt) |*store| {
+        try ch.persistTo(a, store);
+        std.debug.print("persisted to {s}\n", .{datadir.?});
     }
 
     const hh = try ch.head.hash(gpa);
