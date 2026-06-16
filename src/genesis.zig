@@ -117,7 +117,6 @@ pub fn load(a: std.mem.Allocator, st: *State, root: std.json.Value) !Genesis {
     };
 
     const timestamp = hU64(jstr(obj, "timestamp"));
-    const fork = sched.forkAt(timestamp);
 
     var h = block.Header{
         .coinbase = hFixed(20, jstr(obj, "coinbase")),
@@ -125,21 +124,23 @@ pub fn load(a: std.mem.Allocator, st: *State, root: std.json.Value) !Genesis {
         .difficulty = hU256(jstr(obj, "difficulty")),
         .number = 0,
         .gas_limit = hU64(jstr(obj, "gasLimit")),
-        .gas_used = 0,
+        .gas_used = hU64(jstr(obj, "gasUsed")),
         .timestamp = timestamp,
         .extra_data = hBytes(a, jstr(obj, "extraData")),
         .prev_randao = hFixed(32, jstr(obj, "mixHash")),
         .nonce = hFixed(8, jstr(obj, "nonce")),
     };
-    // Fork-additive trailing fields (empty roots at genesis).
-    if (fork.atLeast(.london)) h.base_fee_per_gas = hU256(jstr(obj, "baseFeePerGas"));
-    if (fork.atLeast(.shanghai)) h.withdrawals_root = trie.EMPTY_TRIE_ROOT;
-    if (fork.atLeast(.cancun)) {
-        h.blob_gas_used = hU64(jstr(obj, "blobGasUsed"));
-        h.excess_blob_gas = hU64(jstr(obj, "excessBlobGas"));
-        h.parent_beacon_block_root = hFixed(32, jstr(obj, "parentBeaconBlockRoot"));
-    }
-    if (fork.atLeast(.prague)) h.requests_hash = EMPTY_REQUESTS_HASH;
+    // Fork-additive trailing fields: include each one exactly when the genesis
+    // JSON carries it. The genesis block's own fork (its header shape) is fixed
+    // by the fixture, and block-based vs timestamp-based activation can place
+    // the genesis at any fork — so the literal fields are authoritative, not a
+    // fork guess. (transactions/receipts/withdrawals roots default to empty.)
+    if (jstr(obj, "baseFeePerGas")) |v| h.base_fee_per_gas = hU256(v);
+    if (jstr(obj, "withdrawalsRoot")) |v| h.withdrawals_root = hFixed(32, v);
+    if (jstr(obj, "blobGasUsed")) |v| h.blob_gas_used = hU64(v);
+    if (jstr(obj, "excessBlobGas")) |v| h.excess_blob_gas = hU64(v);
+    if (jstr(obj, "parentBeaconBlockRoot")) |v| h.parent_beacon_block_root = hFixed(32, v);
+    if (jstr(obj, "requestsHash")) |v| h.requests_hash = hFixed(32, v);
 
     return .{ .schedule = sched, .header = h };
 }
@@ -159,6 +160,11 @@ test "load minimal genesis: alloc, schedule, header shape" {
         \\  "timestamp": "0x0",
         \\  "extraData": "0x",
         \\  "baseFeePerGas": "0x7",
+        \\  "withdrawalsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+        \\  "blobGasUsed": "0x0",
+        \\  "excessBlobGas": "0x0",
+        \\  "parentBeaconBlockRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        \\  "requestsHash": "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         \\  "alloc": {
         \\    "a94f5374fce5edbc8e2a8697c15331677e6ebf0b": { "balance": "0x09184e72a000" }
         \\  }
