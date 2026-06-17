@@ -528,8 +528,8 @@ pub fn verifyRangeProof(
     // The LEFT edge is the requested `origin` (usually an exclusion boundary,
     // i.e. lastKey+1 from the prior chunk, not an actual key); the RIGHT edge is
     // the last returned key.
-    const first = bytesToNibblesTerm(a, origin[0..], false); // hex path (no terminator)
-    const last = bytesToNibblesTerm(a, keys[keys.len - 1][0..], false);
+    const first = bytesToNibblesTerm(a, origin[0..], true); // hex path, terminated (geth keybytesToHex)
+    const last = bytesToNibblesTerm(a, keys[keys.len - 1][0..], true);
 
     // Index proof nodes by hash, then reconstruct the two edge paths.
     var by_hash = std.AutoHashMap([32]u8, rlp.Item).init(a);
@@ -662,49 +662,103 @@ fn resolveChild(a: std.mem.Allocator, by_hash: *std.AutoHashMap([32]u8, rlp.Item
     }
 }
 
-/// Remove every node strictly between `left` and `right` paths. Returns true if
-/// the whole trie became empty (the range spans everything).
+/// Compare edge path `edge[pos..]` against a short node's `key` (bounded to the
+/// key length), as geth does: -1 if the edge sorts before the key, 0 equal, +1 after.
+fn cmpAt(edge: []const u8, pos: usize, key: []const u8) i8 {
+    const slice = if (edge.len - pos < key.len) edge[pos..] else edge[pos .. pos + key.len];
+    return switch (std.mem.order(u8, slice, key)) {
+        .lt => -1,
+        .eq => 0,
+        .gt => 1,
+    };
+}
+
+/// Nil the child of `parent` reached by nibble `idx` (parent is a full node at a
+/// fork; the short-parent case can't arise for canonical tries but is handled).
+fn nilChild(parent: *RNode, idx: u8) void {
+    switch (parent.*) {
+        .full => |f| f.ch[idx] = .nil,
+        .short => |s| s.val = .nil,
+        else => {},
+    }
+}
+
+/// Remove every node strictly between the `left` and `right` edge paths (hex,
+/// terminated). Faithful port of geth's trie.unsetInternal — walk to the fork
+/// point, then handle the short-node (five scenarios) or full-node fork. Returns
+/// true if the range spans the whole (sub)trie (caller resets the root to empty).
 fn unsetInternal(a: std.mem.Allocator, np: *RNode, left: []const u8, right: []const u8) !bool {
     var pos: usize = 0;
-    var cur = np;
-    while (true) {
+    var parent: ?*RNode = null;
+    var cur: *RNode = np;
+    var sfl: i8 = 0; // short-fork indicator for the left edge
+    var sfr: i8 = 0; // …and the right edge
+
+    findfork: while (true) {
         switch (cur.*) {
             .short => |s| {
-                if (isLeafKey(s.key)) {
-                    // Leaf at the fork: both edges terminate here → range is all of it.
-                    cur.* = .nil;
-                    return true;
-                }
-                if (pos + s.key.len > left.len or pos + s.key.len > right.len) return error.RangeInvalid;
-                const lmatch = std.mem.eql(u8, left[pos .. pos + s.key.len], s.key);
-                const rmatch = std.mem.eql(u8, right[pos .. pos + s.key.len], s.key);
-                if (lmatch and rmatch) {
-                    pos += s.key.len;
-                    cur = &s.val;
-                    continue;
-                }
-                // The edges diverge inside this extension → everything under it is
-                // in range; drop the whole subtrie.
-                cur.* = .nil;
-                return true;
+                sfl = cmpAt(left, pos, s.key);
+                sfr = cmpAt(right, pos, s.key);
+                if (sfl != 0 or sfr != 0) break :findfork; // fork is this short node
+                parent = cur;
+                pos += s.key.len;
+                cur = &s.val;
             },
             .full => |f| {
                 const ln = left[pos];
                 const rn = right[pos];
-                if (ln == rn) {
-                    pos += 1;
-                    cur = &f.ch[ln];
-                    continue;
-                }
-                // Fork: clear children strictly between the two edges.
-                var i: usize = @as(usize, ln) + 1;
-                while (i < rn) : (i += 1) f.ch[i] = .nil;
-                unsetSide(a, &f.ch[ln], left, pos + 1, false); // keep left edge, drop its right
-                unsetSide(a, &f.ch[rn], right, pos + 1, true); // keep right edge, drop its left
-                return false;
+                // Fork if the edges take different children, or either child is empty.
+                if (ln != rn or f.ch[ln] == .nil or f.ch[rn] == .nil) break :findfork;
+                parent = cur;
+                pos += 1;
+                cur = &f.ch[ln];
             },
             else => return error.RangeInvalid,
         }
+    }
+
+    switch (cur.*) {
+        .short => |s| {
+            if (sfl == -1 and sfr == -1) return error.RangeInvalid; // both proofs left of path
+            if (sfl == 1 and sfr == 1) return error.RangeInvalid; // both right of path
+            if (sfl != 0 and sfr != 0) {
+                // Left proof less, right proof greater → unset the whole short node.
+                if (parent == null) return true;
+                nilChild(parent.?, left[pos - 1]);
+                return false;
+            }
+            if (sfr != 0) {
+                // Right proof diverges; left proof points at the short node.
+                if (isLeafKey(s.key)) {
+                    if (parent == null) return true;
+                    nilChild(parent.?, left[pos - 1]);
+                    return false;
+                }
+                unsetSide(a, &s.val, left, pos + s.key.len, false);
+                return false;
+            }
+            if (sfl != 0) {
+                // Left proof diverges; right proof points at the short node.
+                if (isLeafKey(s.key)) {
+                    if (parent == null) return true;
+                    nilChild(parent.?, right[pos - 1]);
+                    return false;
+                }
+                unsetSide(a, &s.val, right, pos + s.key.len, true);
+                return false;
+            }
+            return false;
+        },
+        .full => |f| {
+            const ln = left[pos];
+            const rn = right[pos];
+            var i: usize = @as(usize, ln) + 1;
+            while (i < rn) : (i += 1) f.ch[i] = .nil; // clear children strictly between
+            unsetSide(a, &f.ch[ln], left, pos + 1, false); // keep left edge, drop its right
+            unsetSide(a, &f.ch[rn], right, pos + 1, true); // keep right edge, drop its left
+            return false;
+        },
+        else => return error.RangeInvalid,
     }
 }
 
@@ -721,7 +775,8 @@ fn unsetSide(a: std.mem.Allocator, np: *RNode, key: []const u8, pos: usize, drop
             } else {
                 var i: usize = @as(usize, k) + 1;
                 while (i < 16) : (i += 1) f.ch[i] = .nil;
-                f.ch[16] = .nil; // the value at this node is left-of nothing → keep? see note
+                // (geth leaves the value slot untouched; for fixed-length snap keys
+                // it's always empty anyway.)
             }
             unsetSide(a, &f.ch[k], key, pos + 1, dropLeft);
         },
@@ -733,7 +788,13 @@ fn unsetSide(a: std.mem.Allocator, np: *RNode, key: []const u8, pos: usize, drop
             if (pos + s.key.len <= key.len and std.mem.eql(u8, key[pos .. pos + s.key.len], s.key)) {
                 unsetSide(a, &s.val, key, pos + s.key.len, dropLeft);
             } else {
-                np.* = .nil; // diverging extension on the dropped side
+                // Diverging extension (a non-existent branch off the edge). Per geth
+                // `unset`: drop it only if it lies *inside* the range, otherwise keep
+                // it with its cached hash. Right edge (dropLeft): in range iff its key
+                // sorts before the path; left edge: iff it sorts after.
+                const ord = std.mem.order(u8, s.key, key[pos..]);
+                const in_range = if (dropLeft) ord == .lt else ord == .gt;
+                if (in_range) np.* = .nil;
             }
         },
         .hash, .value => np.* = .nil,
