@@ -580,14 +580,18 @@ fn snapDemo(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
 /// next steps).
 fn snapSync(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     if (args.len < 4) {
-        std.debug.print("usage: zeth snap-sync <enode://...> <networkId> <genesisHash> <pivotStateRoot>\n", .{});
+        std.debug.print("usage: zeth snap-sync <enode://...> <networkId> <genesisHash> <pivotStateRoot> [maxAccounts]\n", .{});
         return;
     }
     const enode = try zeth.peer.parseEnode(args[0]);
     const network_id = std.fmt.parseInt(u64, args[1], 10) catch 1;
     const genesis_hash = hex32(args[2]);
     const root = hex32(args[3]);
-    const fid = forkIdFor(network_id, genesis_hash);
+    // Optional cap on accounts to download (0 = whole trie). Mainnet has ~300M
+    // accounts; a bounded run verifies the live state without pulling all of it —
+    // every chunk is still proven against the real state root.
+    const max_accounts: usize = if (args.len >= 5) (std.fmt.parseInt(usize, args[4], 10) catch 0) else 0;
+    const fid = if (network_id == 1) zeth.forkid.mainnet(0, 0) else forkIdFor(network_id, genesis_hash);
     const SNAP_BASE: u64 = 34;
 
     const priv = zeth.ecies.randomPriv(io);
@@ -621,54 +625,69 @@ fn snapSync(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
     var origin = std.mem.zeroes([32]u8);
     const limit: [32]u8 = @splat(0xff);
     var requests: usize = 0;
-    while (requests < 1000) : (requests += 1) {
+    var total: usize = 0;
+    var complete = false;
+    const want_full = max_accounts == 0; // rebuild the whole trie only for a full download
+    while (requests < 100_000) : (requests += 1) {
         const req = try zeth.snap_proto.encodeGetAccountRange(a, requests + 1, root, origin, limit, 200_000);
         try p.writeMessage(SNAP_BASE + zeth.snap_proto.snap.get_account_range, req);
         const resp = try p.readUntil(gpa, SNAP_BASE + zeth.snap_proto.snap.account_range);
         defer gpa.free(resp);
         const ar = try zeth.snap_proto.decodeAccountRange(a, resp);
-        if (ar.accounts.len == 0) break;
-        // Per-chunk boundary-proof verification against the pivot state root —
-        // verify-and-drop, no need to hold the whole trie (mainnet-scalable).
+        if (ar.accounts.len == 0) {
+            complete = true;
+            break;
+        }
         const ck = try a.alloc([32]u8, ar.accounts.len);
         const cv = try a.alloc([]const u8, ar.accounts.len);
         for (ar.accounts, 0..) |e, j| {
             ck[j] = e.hash;
             cv[j] = zeth.trie.accountValueRlp(a, e.account.nonce, e.account.balance, e.account.storage_root.?, e.account.code_hash.?);
         }
-        // Per-chunk boundary-proof verification (informational): the verifier
-        // passes synthetic inclusion ranges but doesn't yet validate geth's real
-        // exclusion-boundary proofs — the final root check below is the actual
-        // guarantee for a complete download.
-        const chunk_ok = zeth.trie.verifyRangeProof(a, root, origin, ck, cv, ar.proof) catch false;
-        std.debug.print("  AccountRange #{d}: {d} accts, proofNodes={d}, boundary-proof verify={s}\n", .{ requests + 1, ar.accounts.len, ar.proof.len, if (chunk_ok) "✓" else "✗ (verifier WIP for real proofs)" });
+        // Per-chunk boundary-proof verification against the real state root — the
+        // trust anchor that makes this scale (verify a chunk, keep it, drop the
+        // proof; no need to hold or rebuild the whole 300M-account trie). A chunk
+        // that doesn't verify means an untrusted peer/response → abort.
+        if (!(zeth.trie.verifyRangeProof(a, root, origin, ck, cv, ar.proof) catch false)) {
+            std.debug.print("  ✗ AccountRange #{d} failed proof verification against the state root — untrusted data\n", .{requests + 1});
+            return error.RangeInvalid;
+        }
         for (ar.accounts, 0..) |e, j| {
-            try pairs.append(a, .{ .key = a.dupe(u8, &e.hash) catch return error.OutOfMemory, .value = cv[j] });
+            if (want_full) try pairs.append(a, .{ .key = a.dupe(u8, &e.hash) catch return error.OutOfMemory, .value = cv[j] });
             try snap.putAccount(e.hash, .{ .nonce = e.account.nonce, .balance = e.account.balance, .storage_root = e.account.storage_root.?, .code_hash = e.account.code_hash.? });
             if (!std.mem.eql(u8, &e.account.storage_root.?, &empty_root))
                 try contracts.append(a, .{ .hash = e.hash, .storage_root = e.account.storage_root.? });
             if (!std.mem.eql(u8, &e.account.code_hash.?, &empty_code))
                 try code_hashes.append(a, e.account.code_hash.?);
         }
+        total += ar.accounts.len;
         const last = ar.accounts[ar.accounts.len - 1].hash;
-        std.debug.print("  ✓ AccountRange #{d}: {d} accounts (total {d}) — boundary proof verified vs root; last 0x{s}…\n", .{ requests + 1, ar.accounts.len, pairs.items.len, std.fmt.bytesToHex(last[0..6], .lower) });
-        // Done when the range was complete (no boundary proof) or reached the end.
-        if (ar.proof.len == 0 or std.mem.eql(u8, &last, &limit)) break;
+        // Fraction of the key-space covered so far (top 64 bits of the last key).
+        const top64: u64 = @truncate(std.mem.readInt(u256, &last, .big) >> 192);
+        const pct: f64 = @as(f64, @floatFromInt(top64)) / 18446744073709551616.0 * 100.0; // / 2^64
+        std.debug.print("  ✓ AccountRange #{d}: +{d} accts (total {d}), ~{d:.2}% of key-space, verified vs root; last 0x{s}…\n", .{ requests + 1, ar.accounts.len, total, pct, std.fmt.bytesToHex(last[0..6], .lower) });
+        if (ar.proof.len == 0 or std.mem.eql(u8, &last, &limit)) {
+            complete = true;
+            break;
+        }
+        if (max_accounts != 0 and total >= max_accounts) break; // bounded run
         var n = std.mem.readInt(u256, &last, .big);
         n +%= 1;
         std.mem.writeInt(u256, &origin, n, .big);
     }
 
-    // Rebuild the account trie from the downloaded (hashedKey → account) pairs;
-    // the keys are already keccak(address), so the trie is unsecured here.
-    const got = zeth.trie.computeRoot(a, pairs.items, false);
-    const match = std.mem.eql(u8, &got, &root);
-    std.debug.print("\nsnap-sync accounts: {d} in {d} request(s) — {s}\n", .{
-        pairs.items.len,
-        requests + 1,
-        if (match) "✓ root matches geth" else "✗ root MISMATCH",
-    });
-    if (!match) return;
+    if (complete and want_full) {
+        // Full download: rebuild the account trie and check the root end-to-end
+        // (the keys are already keccak(address), so the trie is unsecured).
+        const got = zeth.trie.computeRoot(a, pairs.items, false);
+        const match = std.mem.eql(u8, &got, &root);
+        std.debug.print("\nsnap-sync accounts: {d} in {d} request(s) — {s}\n", .{ total, requests + 1, if (match) "✓ rebuilt root matches the state root" else "✗ root MISMATCH" });
+        if (!match) return;
+    } else {
+        // Bounded/partial download: every chunk was already proven against the
+        // state root, so the downloaded slice is trustworthy without a full rebuild.
+        std.debug.print("\nsnap-sync accounts: {d} downloaded in {d} request(s), each chunk verified against the state root (partial — bounded by maxAccounts)\n", .{ total, requests + 1 });
+    }
 
     // Storage tries: per contract, download its slots and verify the rebuilt
     // storage root equals the account's storageRoot.
