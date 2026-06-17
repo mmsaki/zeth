@@ -594,7 +594,13 @@ fn snapSync(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
     const fid = if (network_id == 1) zeth.forkid.mainnet(0, 0) else forkIdFor(network_id, genesis_hash);
     const SNAP_BASE: u64 = 34;
 
-    const priv = zeth.ecies.randomPriv(io);
+    // Optional stable identity (`--key=<64hex>`) so the peer can addTrustedPeer
+    // us and serve past its peer limit.
+    var priv = zeth.ecies.randomPriv(io);
+    for (args) |arg| if (std.mem.startsWith(u8, arg, "--key=")) {
+        const hx = arg["--key=".len..];
+        _ = std.fmt.hexToBytes(&priv, if (std.mem.startsWith(u8, hx, "0x")) hx[2..] else hx) catch {};
+    };
     const pub_key = try zeth.ecies.pubFromPriv(priv);
     const p = try zeth.peer.Peer.dial(gpa, io, enode, priv);
     defer p.destroy();
