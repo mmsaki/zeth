@@ -383,7 +383,8 @@ fn processImpl(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
         var refund: i64 = @intCast(auth_refund);
         if (success) refund += evm.refund_counter;
         if (refund < 0) refund = 0;
-        const max_refund: u64 = gas_used / 5;
+        // EIP-3529 (London) lowered the refund cap from gas_used/2 to gas_used/5.
+        const max_refund: u64 = if (env.fork.atLeast(.london)) gas_used / 5 else gas_used / 2;
         const applied: u64 = @min(@as(u64, @intCast(refund)), max_refund);
         gas_used -= applied;
     }

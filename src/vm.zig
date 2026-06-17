@@ -1019,33 +1019,58 @@ pub const Evm = struct {
         self.pc += 1;
     }
 
-    /// SSTORE with the EIP-2200 (net-gas) + EIP-2929 (access list) + EIP-3529
-    /// (refund) accounting, ported from `prague/vm/instructions/storage.py`.
+    /// SSTORE with full per-fork gas accounting:
+    ///   • Frontier…Byzantium + Petersburg — the original `current`-based scheme
+    ///     (SET 20000 / RESET 5000, 15000 clear refund), no net metering.
+    ///   • Constantinople (EIP-1283) — net metering, SLOAD_GAS 200.
+    ///   • Istanbul (EIP-2200) — net metering, SLOAD_GAS 800, 2300-gas sentry.
+    ///   • Berlin (EIP-2929) — adds cold/warm access (2100/100).
+    ///   • London (EIP-3529) — clear refund 15000 → 4800.
     fn sstore(self: *Evm) VmError!void {
         const key = try self.stack.pop();
         const new_value = try self.stack.pop();
-        if (self.gas_left <= Gas.CALL_STIPEND) return error.OutOfGas;
-
+        const f = self.env.fork;
         const target = self.message.current_target;
-        const original = self.state.getStorageOriginal(target, key);
         const current = self.state.getStorage(target, key);
 
+        // Original scheme: pre-Constantinople, and Petersburg (which reverted
+        // EIP-1283). Gas depends only on `current`; no net metering, no sentry.
+        if (!f.atLeast(.constantinople) or f == .petersburg) {
+            const cost: u64 = if (current == 0 and new_value != 0) Gas.STORAGE_SET else Gas.COLD_STORAGE_WRITE;
+            try self.chargeGas(cost);
+            if (self.is_static) return error.StaticStateChange;
+            if (current != 0 and new_value == 0) self.refund_counter += 15000; // R_sclear (original)
+            self.state.setStorage(target, key, new_value) catch @panic("out of memory");
+            self.pc += 1;
+            return;
+        }
+
+        // Net-gas-metering schemes (EIP-1283 / 2200 / 2929 / 3529).
+        const eip2929 = f.atLeast(.berlin);
+        if (f.atLeast(.istanbul) and self.gas_left <= Gas.CALL_STIPEND) return error.OutOfGas; // EIP-2200 sentry
+        const sload_gas: u64 = if (eip2929) Gas.WARM_ACCESS else if (f.atLeast(.istanbul)) 800 else 200;
+        const reset_gas: u64 = if (eip2929) Gas.COLD_STORAGE_WRITE - Gas.COLD_STORAGE_ACCESS else Gas.COLD_STORAGE_WRITE; // 2900 vs 5000
+        const clear_refund: i64 = if (f.atLeast(.london)) Gas.REFUND_STORAGE_CLEAR else 15000;
+
+        const original = self.state.getStorageOriginal(target, key);
+
         var gas_cost: u64 = 0;
-        if (!self.state.accessStorage(target, key)) gas_cost += Gas.COLD_STORAGE_ACCESS;
+        const warm = self.state.accessStorage(target, key);
+        if (eip2929 and !warm) gas_cost += Gas.COLD_STORAGE_ACCESS;
         if (original == current and current != new_value) {
-            gas_cost += if (original == 0) Gas.STORAGE_SET else (Gas.COLD_STORAGE_WRITE - Gas.COLD_STORAGE_ACCESS);
+            gas_cost += if (original == 0) Gas.STORAGE_SET else reset_gas;
         } else {
-            gas_cost += Gas.WARM_ACCESS;
+            gas_cost += sload_gas;
         }
 
         if (current != new_value) {
-            if (original != 0 and current != 0 and new_value == 0) self.refund_counter += Gas.REFUND_STORAGE_CLEAR;
-            if (original != 0 and current == 0) self.refund_counter -= Gas.REFUND_STORAGE_CLEAR;
+            if (original != 0 and current != 0 and new_value == 0) self.refund_counter += clear_refund;
+            if (original != 0 and current == 0) self.refund_counter -= clear_refund;
             if (original == new_value) {
                 self.refund_counter += if (original == 0)
-                    @as(i64, Gas.STORAGE_SET - Gas.WARM_ACCESS)
+                    @as(i64, @intCast(Gas.STORAGE_SET - sload_gas))
                 else
-                    @as(i64, Gas.COLD_STORAGE_WRITE - Gas.COLD_STORAGE_ACCESS - Gas.WARM_ACCESS);
+                    @as(i64, @intCast(reset_gas - sload_gas));
             }
         }
 
