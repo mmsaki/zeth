@@ -275,10 +275,15 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
             }
         };
 
+        // Infer the EIP-2718 type from which fields the fixture carries, so the
+        // validator can fork-gate it (e.g. a type-4 set-code tx is invalid pre-Prague).
+        const tx_type: u8 = if (tx_o.get("authorizationList") != null) 4 else if (tx_o.get("maxFeePerBlobGas") != null or tx_o.get("blobVersionedHashes") != null) 3 else if (tx_o.get("maxFeePerGas") != null) 2 else if (tx_o.get("accessList") != null) 1 else 0;
+
         const to_s = jstr(tx_o, "to") orelse "";
         const tx = zeth.tx.Tx{
             .sender = addrFromHex(sender_s),
             .to = if (to_s.len == 0 or std.mem.eql(u8, to_s, "0x")) null else addrFromHex(to_s),
+            .tx_type = tx_type,
             .nonce = u64FromHex(jstr(tx_o, "nonce") orelse "0x0"),
             .gas_limit = u64FromHex(jarrIdx(tx_o, "gasLimit", gi) orelse return .skip),
             .gas_price = gas_price,

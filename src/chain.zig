@@ -373,6 +373,7 @@ pub const Chain = struct {
             const tx = txmod.Tx{
                 .sender = dt.sender,
                 .to = dt.to,
+                .tx_type = dt.tx_type,
                 .nonce = dt.nonce,
                 .gas_limit = dt.gas_limit,
                 .gas_price = gas_price,
@@ -601,7 +602,7 @@ pub const Chain = struct {
             env.origin = dt.sender;
             env.blob_versioned_hashes = dt.blob_versioned_hashes;
             const blob_fee: u256 = @as(u256, txmod.GAS_PER_BLOB) * dt.blob_versioned_hashes.len * env.blob_base_fee;
-            const tx = txmod.Tx{ .sender = dt.sender, .to = dt.to, .nonce = dt.nonce, .gas_limit = dt.gas_limit, .gas_price = gas_price, .value = dt.value, .data = dt.data, .access_list = dt.access_list, .authorizations = dt.authorizations, .blob_data_fee = blob_fee };
+            const tx = txmod.Tx{ .sender = dt.sender, .to = dt.to, .tx_type = dt.tx_type, .nonce = dt.nonce, .gas_limit = dt.gas_limit, .gas_price = gas_price, .value = dt.value, .data = dt.data, .access_list = dt.access_list, .authorizations = dt.authorizations, .blob_data_fee = blob_fee };
             if (txmod.validate(self.state, &env, tx, dt.max_fee, dt.max_priority_fee) != null) continue; // skip invalid
             if (cumulative_gas + dt.gas_limit > parent.gas_limit) continue; // wouldn't fit
             var logs: std.ArrayList(vm.Log) = .empty;

@@ -33,6 +33,7 @@ pub const Authorization = struct {
 pub const Tx = struct {
     sender: Address,
     to: ?Address, // null => contract creation
+    tx_type: u8 = 0, // EIP-2718 type (0 legacy, 1 2930, 2 1559, 3 4844, 4 7702)
     nonce: u64,
     gas_limit: u64,
     gas_price: u256, // effective gas price (legacy or 1559-resolved)
@@ -206,6 +207,8 @@ pub const InvalidReason = enum {
     sender_not_eoa,
     set_code_creation,
     gas_limit_exceeds_cap,
+    tx_type_not_supported,
+    empty_authorization_list,
 
     pub fn message(self: InvalidReason) []const u8 {
         return switch (self) {
@@ -213,6 +216,8 @@ pub const InvalidReason = enum {
             .tip_above_fee_cap => "max priority fee per gas higher than max fee per gas",
             .gas_limit_exceeds_block => "transaction gas limit exceeds block gas limit",
             .gas_limit_exceeds_cap => "transaction gas limit exceeds maximum (EIP-7825)",
+            .tx_type_not_supported => "transaction type not supported at this fork",
+            .empty_authorization_list => "authorization list is empty (EIP-7702)",
             .init_code_too_large => "max initcode size exceeded",
             .intrinsic_gas_too_low => "intrinsic gas too low",
             .nonce_too_high => "nonce too high",
@@ -230,6 +235,20 @@ pub const InvalidReason = enum {
 /// `max_fee_cap`/`max_prio` are the raw 1559 fields (for a legacy tx pass
 /// gas_price as the cap and 0 as the priority).
 pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: u256, max_prio: u256) ?InvalidReason {
+    // The EIP-2718 transaction type must be active at this fork; a type that the
+    // fork doesn't know yet is an invalid transaction (no state change).
+    const ok_type = switch (tx.tx_type) {
+        0 => true,
+        1 => env.fork.atLeast(.berlin), // EIP-2930
+        2 => env.fork.atLeast(.london), // EIP-1559
+        3 => env.fork.atLeast(.cancun), // EIP-4844
+        4 => env.fork.atLeast(.prague), // EIP-7702
+        else => false,
+    };
+    if (!ok_type) return .tx_type_not_supported;
+    // EIP-7702: a set-code transaction must carry at least one authorization.
+    if (tx.tx_type == 4 and tx.authorizations.len == 0) return .empty_authorization_list;
+
     // EIP-1559 fee-cap sanity.
     if (max_fee_cap < env.base_fee) return .fee_cap_below_base_fee;
     if (max_fee_cap < max_prio) return .tip_above_fee_cap;
