@@ -60,6 +60,10 @@ fn dispatch(ctx: *MainCtx) void {
         syncCmd(ctx.gpa, ctx.io, args[2..]) catch |e| {
             ctx.err = e;
         };
+    } else if (std.mem.eql(u8, cmd, "snap")) {
+        snapDemo(ctx.gpa, ctx.io, args[2..]) catch |e| {
+            ctx.err = e;
+        };
     } else {
         ctx.err = usage(args[0]);
     }
@@ -194,6 +198,89 @@ fn p2pConnect(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !voi
             else => std.debug.print("← msg id=0x{x} ({d} bytes)\n", .{ msg.id, msg.payload.len }),
         }
     }
+}
+
+fn hex32(s: []const u8) [32]u8 {
+    var out: [32]u8 = std.mem.zeroes([32]u8);
+    const b = if (std.mem.startsWith(u8, s, "0x")) s[2..] else s;
+    _ = std.fmt.hexToBytes(&out, b) catch {};
+    return out;
+}
+
+/// `zeth snap <enode> <networkId> <genesisHash> <stateRoot>` — dial a peer,
+/// complete the eth/69 handshake, then issue a snap/1 GetAccountRange and decode
+/// the real AccountRange response (the first live exercise of the snap codec).
+fn snapDemo(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (args.len < 4) {
+        std.debug.print("usage: zeth snap <enode://...> <networkId> <genesisHash> <stateRoot>\n", .{});
+        return;
+    }
+    const enode = try zeth.peer.parseEnode(args[0]);
+    const network_id = std.fmt.parseInt(u64, args[1], 10) catch 1;
+    const genesis_hash = hex32(args[2]);
+    const state_root = hex32(args[3]);
+    // All-at-genesis devnet forkid = CRC32(genesis); pass passed_forks for a real chain.
+    const fid = zeth.forkid.compute(genesis_hash, &.{}, 0);
+
+    // snap/1 rides the negotiated message-id range: 16 (p2p) + 18 (eth/69) = 34.
+    const SNAP_BASE: u64 = 34;
+    const GET_ACCOUNT_RANGE = SNAP_BASE + zeth.snap_proto.snap.get_account_range;
+    const ACCOUNT_RANGE = SNAP_BASE + zeth.snap_proto.snap.account_range;
+
+    const priv = zeth.ecies.randomPriv(io);
+    const pub_key = try zeth.ecies.pubFromPriv(priv);
+    const p = try zeth.peer.Peer.dial(gpa, io, enode, priv);
+    defer p.destroy();
+    std.debug.print("✓ RLPx handshake with {s}:{d}\n", .{ enode.host, enode.port });
+
+    try p.sendHello(pub_key);
+    gpa.free(try p.readUntil(gpa, zeth.eth_proto.p2p.hello));
+    std.debug.print("← Hello (advertised eth/69 + snap/1)\n", .{});
+
+    const our_status = zeth.eth_proto.Status69{
+        .version = 69,
+        .network_id = network_id,
+        .genesis_hash = genesis_hash,
+        .fork_hash = fid.hash,
+        .fork_next = fid.next,
+        .latest_block_hash = genesis_hash,
+    };
+    {
+        var ha = std.heap.ArenaAllocator.init(gpa);
+        defer ha.deinit();
+        try p.writeMessage(zeth.eth_proto.eth.status, try our_status.encode(ha.allocator()));
+    }
+    {
+        const sp = try p.readUntil(gpa, zeth.eth_proto.eth.status);
+        defer gpa.free(sp);
+        var sa = std.heap.ArenaAllocator.init(gpa);
+        defer sa.deinit();
+        const peer_status = zeth.eth_proto.Status69.decode(sa.allocator(), sp) catch {
+            std.debug.print("✗ peer rejected our Status (forkid/genesis mismatch?)\n", .{});
+            return;
+        };
+        std.debug.print("✓ eth/69 handshake — peer head #{d}\n", .{peer_status.latest_block});
+    }
+
+    // Issue the snap/1 GetAccountRange over the whole key-space at `state_root`.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const origin = std.mem.zeroes([32]u8);
+    const limit: [32]u8 = @splat(0xff);
+    const req = try zeth.snap_proto.encodeGetAccountRange(a, 1, state_root, origin, limit, 8000);
+    try p.writeMessage(GET_ACCOUNT_RANGE, req);
+    std.debug.print("→ snap GetAccountRange (root=0x{s}…, 8000 bytes)\n", .{std.fmt.bytesToHex(state_root[0..6], .lower)});
+
+    const resp = try p.readUntil(gpa, ACCOUNT_RANGE);
+    defer gpa.free(resp);
+    const ar = try zeth.snap_proto.decodeAccountRange(a, resp);
+    std.debug.print("← snap AccountRange: {d} accounts, {d} boundary-proof nodes\n", .{ ar.accounts.len, ar.proof.len });
+    const show = @min(ar.accounts.len, 5);
+    for (ar.accounts[0..show]) |e| {
+        std.debug.print("    acct 0x{s}…  nonce={d} balance={d} wei\n", .{ std.fmt.bytesToHex(e.hash[0..6], .lower), e.account.nonce, e.account.balance });
+    }
+    std.debug.print("✓ decoded a real snap/1 AccountRange from geth — codec verified live\n", .{});
 }
 
 /// Dial `enode`, complete the eth/69 handshake, then download headers + bodies
