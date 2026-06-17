@@ -12,7 +12,11 @@ zvm i master && zvm use master
 ```
 
 Or grab the latest master build from <https://ziglang.org/download/> and put `zig` on
-your `PATH`. Check: `zig version`.
+your `PATH`.
+
+Check: `zig version` should print `0.17.0-dev…`. If it still shows an older version,
+another `zig` is shadowing zvm's — remove it (e.g. `brew uninstall zig`) or put
+`~/.zvm/bin` ahead of it on your `PATH`.
 
 ## 2. Build + the tests that need nothing else
 
