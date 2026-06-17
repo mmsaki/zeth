@@ -257,6 +257,24 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
             }
         }
 
+        // Optional EIP-7702 (type-4) authorization list.
+        var auth_list = std.ArrayList(zeth.tx.Authorization).empty;
+        if (tx_o.get("authorizationList")) |al| if (al == .array) {
+            for (al.array.items) |e_v| {
+                if (e_v != .object) continue;
+                const e = e_v.object;
+                const yp = jstr(e, "yParity") orelse jstr(e, "v") orelse "0x0";
+                auth_list.append(a, .{
+                    .chain_id = u256FromHex(jstr(e, "chainId") orelse "0x0"),
+                    .address = addrFromHex(jstr(e, "address") orelse continue),
+                    .nonce = u64FromHex(jstr(e, "nonce") orelse "0x0"),
+                    .y_parity = @intCast(u256FromHex(yp)),
+                    .r = u256FromHex(jstr(e, "r") orelse "0x0"),
+                    .s = u256FromHex(jstr(e, "s") orelse "0x0"),
+                }) catch @panic("oom");
+            }
+        };
+
         const to_s = jstr(tx_o, "to") orelse "";
         const tx = zeth.tx.Tx{
             .sender = addrFromHex(sender_s),
@@ -267,6 +285,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
             .value = u256FromHex(jarrIdx(tx_o, "value", vi) orelse return .skip),
             .data = bytesFromHex(a, jarrIdx(tx_o, "data", di) orelse return .skip),
             .access_list = access_list.items,
+            .authorizations = auth_list.items,
             .blob_data_fee = blob_data_fee,
         };
 
