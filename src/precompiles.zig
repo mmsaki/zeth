@@ -805,7 +805,7 @@ test "idOf detects precompile range" {
 }
 
 test "identity returns input" {
-    const out = run(testing.allocator, 4, "hello", 1000).?;
+    const out = run(testing.allocator, 4, "hello", 1000, .prague).?;
     defer testing.allocator.free(out.data);
     try testing.expectEqualStrings("hello", out.data);
     try testing.expectEqual(@as(u64, 18), out.gas);
@@ -820,7 +820,7 @@ test "blake2f EIP-152 vector (12 rounds)" {
     input[70] = 0x63;
     input[196] = 3; // t0 = 3
     input[212] = 1; // final block
-    const out = run(testing.allocator, 9, &input, 100).?;
+    const out = run(testing.allocator, 9, &input, 100, .prague).?;
     defer testing.allocator.free(out.data);
     var got: [128]u8 = undefined;
     _ = std.fmt.bufPrint(&got, "{x}", .{out.data}) catch unreachable;
@@ -849,18 +849,18 @@ test "modexp large operand gas boundary (EIP-2565)" {
     var input: [96 + 1024]u8 = std.mem.zeroes([96 + 1024]u8);
     input[64 + 30] = 0x04; // mod_len high byte: 0x0400 = 1024
     // Exactly enough gas must succeed.
-    const ok = run(testing.allocator, 5, &input, 5461);
+    const ok = run(testing.allocator, 5, &input, 5461, .prague);
     try testing.expect(ok != null);
     if (ok) |o| {
         try testing.expectEqual(@as(u64, 5461), o.gas);
         testing.allocator.free(o.data);
     }
     // One gas short must out-of-gas.
-    try testing.expect(run(testing.allocator, 5, &input, 5460) == null);
+    try testing.expect(run(testing.allocator, 5, &input, 5460, .prague) == null);
 }
 
 test "sha256 of empty" {
-    const out = run(testing.allocator, 2, "", 1000).?;
+    const out = run(testing.allocator, 2, "", 1000, .prague).?;
     defer testing.allocator.free(out.data);
     var hex: [64]u8 = undefined;
     _ = std.fmt.bufPrint(&hex, "{x}", .{out.data}) catch unreachable;
