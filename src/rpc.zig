@@ -575,6 +575,429 @@ fn nextBaseFee(c: *chain_mod.Chain) u256 {
     return if (parent > delta) parent - delta else 0;
 }
 
+// ── eth_simulateV1 (EIP-7756 / multi-block call simulation) ───────────────────
+
+fn jbool(o: std.json.ObjectMap, k: []const u8) bool {
+    const v = o.get(k) orelse return false;
+    return v == .bool and v.bool;
+}
+fn jU64opt(o: std.json.ObjectMap, k: []const u8) ?u64 {
+    const v = o.get(k) orelse return null;
+    return switch (v) {
+        .string => parseU64(v.string),
+        .integer => @intCast(v.integer),
+        else => null,
+    };
+}
+fn jU256opt(o: std.json.ObjectMap, k: []const u8) ?u256 {
+    const v = o.get(k) orelse return null;
+    return switch (v) {
+        .string => parseU256(v.string),
+        .integer => @intCast(v.integer),
+        else => null,
+    };
+}
+
+/// Apply an eth_simulateV1 `stateOverrides` map to `st`: per-account balance,
+/// nonce, code, and storage (`state` = full replace, `stateDiff` = merge).
+const SimErr = struct { code: i32, msg: []const u8 };
+
+fn applyStateOverrides(a: std.mem.Allocator, st: *state_mod.State, ov: std.json.ObjectMap) ?SimErr {
+    var it = ov.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.* != .object) continue;
+        const addr = parseAddr(e.key_ptr.*) orelse continue;
+        const o = e.value_ptr.object;
+        // movePrecompileToAddress requires the source to be a precompile.
+        if (jstr(o, "movePrecompileToAddress")) |_| {
+            if (!isPrecompile(addr))
+                return .{ .code = -32000, .msg = std.fmt.allocPrint(a, "account {s} is not a precompile", .{dataHex(a, &addr)}) catch "not a precompile" };
+        }
+        if (jU256opt(o, "balance")) |b| st.setBalance(addr, b) catch {};
+        if (jU64opt(o, "nonce")) |n| st.setNonce(addr, n) catch {};
+        if (jstr(o, "code")) |code| st.setCode(addr, hexBytes(a, code)) catch {};
+        // `state` clears all existing storage first; `stateDiff` merges.
+        if (o.get("state")) |s| if (s == .object) {
+            st.clearStorage(addr);
+            var sit = s.object.iterator();
+            while (sit.next()) |kv| if (kv.value_ptr.* == .string)
+                st.setStorage(addr, parseU256(kv.key_ptr.*), parseU256(kv.value_ptr.string)) catch {};
+        };
+        if (o.get("stateDiff")) |s| if (s == .object) {
+            var sit = s.object.iterator();
+            while (sit.next()) |kv| if (kv.value_ptr.* == .string)
+                st.setStorage(addr, parseU256(kv.key_ptr.*), parseU256(kv.value_ptr.string)) catch {};
+        };
+    }
+    return null;
+}
+
+const SimBlock = struct { number: u64, time: u64, ov: ?std.json.ObjectMap, so: ?std.json.ObjectMap, calls: []const std.json.Value };
+
+const SIM_SYSTEM_ADDR: Address = .{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe };
+const SIM_BEACON_ROOTS: Address = .{ 0x00, 0x0F, 0x3d, 0xf6, 0xD7, 0x32, 0x80, 0x7E, 0xf1, 0x31, 0x9f, 0xB7, 0xB8, 0xbB, 0x85, 0x22, 0xd0, 0xBe, 0xac, 0x02 };
+const SIM_HISTORY_STORAGE: Address = .{ 0x00, 0x00, 0xF9, 0x08, 0x27, 0xF1, 0xC5, 0x3a, 0x10, 0xcb, 0x7A, 0x02, 0x33, 0x5B, 0x17, 0x53, 0x20, 0x00, 0x29, 0x35 };
+
+fn simSystemCall(a: std.mem.Allocator, st: *state_mod.State, env: *const vm.Environment, to: Address, data: []const u8) void {
+    if (st.codeOf(to).len == 0) return;
+    var evm = vm.processMessage(a, st, env, .{
+        .caller = SIM_SYSTEM_ADDR,
+        .current_target = to,
+        .code_address = to,
+        .code = st.codeOf(to),
+        .data = data,
+        .gas = 30_000_000,
+        .value = 0,
+    }, null);
+    evm.deinit();
+}
+
+fn simulateV1(a: std.mem.Allocator, id: ?std.json.Value, c: *chain_mod.Chain, opts: std.json.ObjectMap, base_tag: []const u8) []const u8 {
+    const validation = jbool(opts, "validation");
+    const bsc_v = opts.get("blockStateCalls") orelse return err(a, id, -32602, "missing blockStateCalls");
+    if (bsc_v != .array) return err(a, id, -32602, "invalid blockStateCalls");
+
+    const base_num = resolveBlock(c, base_tag) orelse return err(a, id, -32000, "header not found");
+    if (base_num > c.head.number) return err(a, id, -32000, "header not found");
+    const base = c.headerByNumber(base_num) orelse return err(a, id, -32000, "header not found");
+    const base_hash = base.hash(a) catch return err(a, id, -32603, "hash");
+
+    // sanitizeChain: assign block numbers (default prev+1) and timestamps
+    // (default prev+12), filling numeric gaps with empty blocks.
+    var blocks: std.ArrayList(SimBlock) = .empty;
+    var prev_num = base.number;
+    var prev_time = base.timestamp;
+    for (bsc_v.array.items) |b_v| {
+        if (b_v != .object) return err(a, id, -32602, "invalid block");
+        const bo = b_v.object;
+        const ov: ?std.json.ObjectMap = if (bo.get("blockOverrides")) |x| (if (x == .object) x.object else null) else null;
+        const num = if (ov != null) (jU64opt(ov.?, "number") orelse prev_num + 1) else prev_num + 1;
+        if (num <= prev_num) return err(a, id, -38020, "block numbers must be in order");
+        if (num - base.number > 256) return err(a, id, -38026, "too many blocks"); // maxSimulateBlocks
+        // Fill gaps with empty blocks.
+        var fill = prev_num + 1;
+        while (fill < num) : (fill += 1) {
+            prev_time += 12;
+            blocks.append(a, .{ .number = fill, .time = prev_time, .ov = null, .so = null, .calls = &.{} }) catch return err(a, id, -32603, "oom");
+        }
+        const t = if (ov != null) (jU64opt(ov.?, "time") orelse prev_time + 12) else prev_time + 12;
+        if (t <= prev_time) return err(a, id, -38021, "block timestamps must be in order");
+        const calls: []const std.json.Value = if (bo.get("calls")) |cl| (if (cl == .array) cl.array.items else &.{}) else &.{};
+        const so: ?std.json.ObjectMap = if (bo.get("stateOverrides")) |x| (if (x == .object) x.object else null) else null;
+        blocks.append(a, .{ .number = num, .time = t, .ov = ov, .so = so, .calls = calls }) catch return err(a, id, -32603, "oom");
+        prev_num = num;
+        prev_time = t;
+    }
+
+    // Simulate on a clone of the head state (the only state we retain). Changes
+    // persist across the block sequence.
+    var st = c.state.clone() catch return err(a, id, -32603, "oom");
+    defer st.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    out.append(a, '[') catch return err(a, id, -32603, "oom");
+    var coinbase = base.coinbase;
+    var parent_hash = base_hash;
+    var prev_base_fee: u256 = base.base_fee_per_gas orelse 0;
+    var prev_gas_used: u64 = base.gas_used;
+    var prev_gas_limit: u64 = base.gas_limit;
+
+    for (blocks.items, 0..) |blk, bidx| {
+        const fork = c.schedule.forkAt(blk.number, blk.time);
+        if (blk.ov) |ov| if (jstr(ov, "feeRecipient")) |fr| {
+            if (parseAddr(fr)) |addr| coinbase = addr;
+        };
+        const base_fee: ?u256 = if (fork.atLeast(.london)) blk: {
+            if (blk.ov) |ov| if (jU256opt(ov, "baseFeePerGas")) |bf| break :blk bf;
+            // Validation mode computes EIP-1559 base fee from the parent;
+            // non-validation defaults to 0 (so gasPrice < baseFee is allowed).
+            break :blk if (validation) calcBaseFee(prev_base_fee, prev_gas_used, prev_gas_limit) else 0;
+        } else null;
+        var prev_randao = std.mem.zeroes([32]u8);
+        if (blk.ov) |ov| if (jstr(ov, "prevRandao")) |pr| {
+            prev_randao = hashFromHex(pr);
+        };
+
+        var hdr = block.Header{
+            .parent_hash = parent_hash,
+            .coinbase = coinbase,
+            .number = blk.number,
+            .gas_limit = if (blk.ov != null) (jU64opt(blk.ov.?, "gasLimit") orelse base.gas_limit) else base.gas_limit,
+            .timestamp = blk.time,
+            .prev_randao = prev_randao,
+            .difficulty = if (fork.atLeast(.paris)) 0 else base.difficulty,
+            .base_fee_per_gas = base_fee,
+            .withdrawals_root = if (fork.atLeast(.shanghai)) trie.EMPTY_TRIE_ROOT else null,
+            .parent_beacon_block_root = if (fork.atLeast(.cancun)) std.mem.zeroes([32]u8) else null,
+            .blob_gas_used = if (fork.atLeast(.cancun)) 0 else null,
+            .excess_blob_gas = if (fork.atLeast(.cancun)) 0 else null,
+        };
+
+        // State overrides apply before execution.
+        if (blk.ov == null) {} // no-op
+        if (blk.calls.len == 0 and blk.ov == null) {} // empty block fast-path uses defaults
+        if (blk.so) |so| {
+            if (applyStateOverrides(a, &st, so)) |se| return err(a, id, se.code, se.msg);
+        }
+
+        var env = vm.Environment{
+            .fork = fork,
+            .chain_id = c.chain_id,
+            .coinbase = coinbase,
+            .number = blk.number,
+            .time = blk.time,
+            .gas_limit = hdr.gas_limit,
+            .base_fee = base_fee orelse 0,
+            .prev_randao = bytesToU256RPC(&prev_randao),
+            .block_hashes = c.hashes.items,
+        };
+
+        // Block-start system calls mutate predeploy storage (so the empty-block
+        // state root differs from the parent's): EIP-4788 beacon root (Cancun+)
+        // and EIP-2935 history storage (Prague+).
+        if (fork.atLeast(.cancun)) simSystemCall(a, &st, &env, SIM_BEACON_ROOTS, &hdr.parent_beacon_block_root.?);
+        if (fork.atLeast(.prague)) simSystemCall(a, &st, &env, SIM_HISTORY_STORAGE, &hdr.parent_hash);
+
+        var receipts: std.ArrayList(block.Receipt) = .empty;
+        var tx_encs: std.ArrayList([]const u8) = .empty;
+        var calls_json: std.ArrayList(u8) = .empty;
+        calls_json.append(a, '[') catch {};
+        var cum_gas: u64 = 0;
+        var gas_pool: u64 = hdr.gas_limit;
+
+        for (blk.calls, 0..) |call_v, ci| {
+            if (call_v != .object) continue;
+            const cr = simExecCall(a, &st, &env, call_v.object, gas_pool, validation);
+            if (cr.err_code != 0) return err(a, id, cr.err_code, cr.err_msg);
+            cum_gas += cr.gas_used;
+            if (gas_pool >= cr.gas_used) gas_pool -= cr.gas_used else gas_pool = 0;
+            receipts.append(a, .{ .tx_type = 2, .success = cr.success, .cumulative_gas_used = cum_gas, .logs = cr.logs }) catch {};
+            tx_encs.append(a, cr.tx_enc) catch {};
+            if (ci != 0) calls_json.append(a, ',') catch {};
+            calls_json.appendSlice(a, cr.json) catch {};
+        }
+        calls_json.append(a, ']') catch {};
+
+        if (fork.atLeast(.spurious_dragon)) st.destroyTouchedEmpty();
+        hdr.gas_used = cum_gas;
+        hdr.state_root = trie.stateRoot(a, &st, false);
+        hdr.transactions_root = block.orderedTrieRoot(a, tx_encs.items);
+        hdr.receipts_root = block.receiptsRoot(a, receipts.items);
+        var bloom = std.mem.zeroes([256]u8);
+        for (receipts.items) |*r| block.orBloom(&bloom, block.logsBloom(r.logs));
+        hdr.logs_bloom = bloom;
+        if (fork.atLeast(.prague)) {
+            var rh: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash("", &rh, .{});
+            hdr.requests_hash = rh;
+        }
+
+        const blk_hash = hdr.hash(a) catch return err(a, id, -32603, "hash");
+        parent_hash = blk_hash;
+        prev_base_fee = base_fee orelse 0;
+        prev_gas_used = hdr.gas_used;
+        prev_gas_limit = hdr.gas_limit;
+
+        if (bidx != 0) out.append(a, ',') catch {};
+        out.appendSlice(a, simBlockJson(a, &hdr, blk_hash, calls_json.items)) catch {};
+    }
+    out.append(a, ']') catch {};
+    return ok(a, id, out.toOwnedSlice(a) catch return err(a, id, -32603, "oom"));
+}
+
+fn bytesToU256RPC(b: *const [32]u8) u256 {
+    return std.mem.readInt(u256, b, .big);
+}
+
+/// EIP-1559 base fee of a block given its parent's base fee, gas used, and gas
+/// limit (validation mode; mirrors nextBaseFee but parameterized by the parent).
+fn calcBaseFee(parent_base: u256, gas_used: u64, gas_limit: u64) u256 {
+    const target: u64 = gas_limit / 2;
+    if (target == 0 or gas_used == target) return parent_base;
+    if (gas_used > target) {
+        const delta = (parent_base * (gas_used - target)) / target / 8;
+        return parent_base + @max(delta, 1);
+    }
+    const delta = (parent_base * (target - gas_used)) / target / 8;
+    return if (parent_base > delta) parent_base - delta else 0;
+}
+
+const SimCallResult = struct { gas_used: u64, success: bool, logs: []const vm.Log, json: []const u8, tx_enc: []const u8, err_code: i32 = 0, err_msg: []const u8 = "" };
+
+const SIM_GAS_CAP: u64 = 50_000_000; // geth's default RPCGasCap
+
+/// EIP-55 checksummed address string ("0x" + mixed-case hex), as geth prints
+/// addresses in error messages.
+fn checksumAddr(a: std.mem.Allocator, addr: Address) []const u8 {
+    const lower = std.fmt.bytesToHex(&addr, .lower); // 40 chars
+    const h = crypto.keccak256(&lower);
+    var out = a.alloc(u8, 42) catch @panic("oom");
+    out[0] = '0';
+    out[1] = 'x';
+    for (lower, 0..) |ch, i| {
+        const shift: u3 = if (i % 2 == 0) 4 else 0;
+        const nibble = (h[i / 2] >> shift) & 0x0f;
+        out[2 + i] = if (ch >= 'a' and ch <= 'f' and nibble >= 8) ch - 32 else ch;
+    }
+    return out;
+}
+
+fn rlpMinU256(a: std.mem.Allocator, v: u256) []const u8 {
+    var buf: [32]u8 = undefined;
+    std.mem.writeInt(u256, &buf, v, .big);
+    var s: usize = 0;
+    while (s < 32 and buf[s] == 0) s += 1;
+    return rlp.encodeBytes(a, buf[s..]) catch @panic("oom");
+}
+
+/// Encode a simulated call as an unsigned EIP-1559 (type-2) transaction — the
+/// form eth_simulateV1 uses to build the synthetic block's transactions root.
+fn encodeSimTx(a: std.mem.Allocator, chain_id: u64, nonce: u64, gas: u64, to: ?Address, value: u256, data: []const u8) []const u8 {
+    const empty_al = rlp.encodeList(a, &.{}) catch @panic("oom");
+    const to_enc = if (to) |t| (rlp.encodeBytes(a, &t) catch @panic("oom")) else (rlp.encodeBytes(a, &.{}) catch @panic("oom"));
+    const items = [_][]const u8{
+        rlpMinU256(a, chain_id), rlpMinU256(a, nonce), rlpMinU256(a, 0), rlpMinU256(a, 0),
+        rlpMinU256(a, gas),      to_enc,               rlpMinU256(a, value),
+        rlp.encodeBytes(a, data) catch @panic("oom"), empty_al,
+        rlpMinU256(a, 0),        rlpMinU256(a, 0),     rlpMinU256(a, 0),
+    };
+    const list = rlp.encodeList(a, &items) catch @panic("oom");
+    const out = a.alloc(u8, 1 + list.len) catch @panic("oom");
+    out[0] = 0x02;
+    @memcpy(out[1..], list);
+    return out;
+}
+
+/// Execute one eth_simulateV1 call against `st` (committing on success,
+/// reverting on failure), returning its result + the tx encoding for the root.
+fn simExecCall(a: std.mem.Allocator, st: *state_mod.State, env: *vm.Environment, call: std.json.ObjectMap, gas_pool: u64, validation: bool) SimCallResult {
+    const from = if (jstr(call, "from")) |f| (parseAddr(f) orelse state_mod.zero_address) else state_mod.zero_address;
+    const to: ?Address = if (jstr(call, "to")) |t| parseAddr(t) else null;
+    const value = if (jstr(call, "value")) |v| parseU256(v) else 0;
+    const data = if (jstr(call, "data") orelse jstr(call, "input")) |d| hexBytes(a, d) else &.{};
+    const nonce = jU64opt(call, "nonce") orelse st.nonceOf(from);
+    // Default gas is the remaining block gas, clamped to the RPC gas cap.
+    const call_gas = jU64opt(call, "gas") orelse @min(gas_pool, SIM_GAS_CAP);
+    const gas = @min(@min(call_gas, gas_pool), SIM_GAS_CAP);
+
+    var zero_b: u64 = 0;
+    var nz: u64 = 0;
+    for (data) |b| if (b == 0) {
+        zero_b += 1;
+    } else {
+        nz += 1;
+    };
+    const is_create = to == null;
+    const intrinsic: u64 = 21000 + zero_b * 4 + nz * 16 + (if (is_create) @as(u64, 32000) else 0);
+
+    const gas_price: u256 = if (validation) (if (jstr(call, "gasPrice") orelse jstr(call, "maxFeePerGas")) |gp| parseU256(gp) else env.base_fee) else 0;
+    // Validation-mode pre-checks: nonce overflow and fee cap below base fee.
+    if (validation) {
+        if (nonce == std.math.maxInt(u64))
+            return .{ .gas_used = 0, .success = false, .logs = &.{}, .json = "", .tx_enc = "", .err_code = -32603, .err_msg = std.fmt.allocPrint(a, "err: nonce has max value: address {s}, nonce: {d} (supplied gas {d})", .{ checksumAddr(a, from), nonce, gas }) catch "nonce has max value" };
+        const max_fee: u256 = if (jstr(call, "maxFeePerGas") orelse jstr(call, "gasPrice")) |gp| parseU256(gp) else 0;
+        if (max_fee < env.base_fee)
+            return .{ .gas_used = 0, .success = false, .logs = &.{}, .json = "", .tx_enc = "", .err_code = -38012, .err_msg = std.fmt.allocPrint(a, "err: max fee per gas less than block base fee: address {s}, maxFeePerGas: {d}, baseFee: {d} (supplied gas {d})", .{ checksumAddr(a, from), max_fee, env.base_fee, gas }) catch "max fee too low" };
+    }
+    // EIP-7756 pre-execution checks (apply even in non-validation mode):
+    if (gas < intrinsic) return .{ .gas_used = 0, .success = false, .logs = &.{}, .json = "", .tx_enc = "", .err_code = -38013, .err_msg = std.fmt.allocPrint(a, "err: intrinsic gas too low: have {d}, want {d} (supplied gas {d})", .{ gas, intrinsic, gas }) catch "intrinsic gas too low" };
+    const need: u256 = value + @as(u256, gas) * gas_price;
+    if (st.balanceOf(from) < need) return .{ .gas_used = 0, .success = false, .logs = &.{}, .json = "", .tx_enc = "", .err_code = -38014, .err_msg = std.fmt.allocPrint(a, "err: insufficient funds for gas * price + value: address {s} have {d} want {d} (supplied gas {d})", .{ checksumAddr(a, from), st.balanceOf(from), need, gas }) catch "insufficient funds" };
+
+    env.origin = from;
+    env.gas_price = gas_price;
+    st.beginTx();
+    st.setNonce(from, nonce +% 1) catch {};
+
+    const msg_gas: u64 = if (gas > intrinsic) gas - intrinsic else 0;
+    const target = to orelse (state_mod.computeContractAddress(a, from, nonce) catch state_mod.zero_address);
+    var evm = vm.processMessage(a, st, env, .{
+        .caller = from,
+        .current_target = target,
+        .code_address = target,
+        .code = st.codeOf(target),
+        .data = data,
+        .gas = msg_gas,
+        .value = value,
+    }, null);
+    defer evm.deinit();
+    const success = evm.halt_error == null and !evm.reverted;
+    var gas_used = intrinsic + (msg_gas - evm.gas_left);
+    if (success) {
+        var refund: i64 = evm.refund_counter;
+        if (refund < 0) refund = 0;
+        const cap: u64 = if (env.fork.atLeast(.london)) gas_used / 5 else gas_used / 2;
+        gas_used -= @min(@as(u64, @intCast(refund)), cap);
+    }
+    if (env.fork.atLeast(.spurious_dragon)) st.destroyTouchedEmpty();
+
+    const output = a.dupe(u8, evm.output) catch "";
+    var logs_buf: std.ArrayList(vm.Log) = .empty;
+    if (success) for (evm.logs.items) |lg| {
+        logs_buf.append(a, .{ .address = lg.address, .topics = a.dupe([32]u8, lg.topics) catch &.{}, .data = a.dupe(u8, lg.data) catch "" }) catch {};
+    };
+
+    // Per-call result JSON.
+    var buf: std.ArrayList(u8) = .empty;
+    p(a, &buf, "{{\"returnData\":\"{s}\",\"gasUsed\":\"{s}\",\"logs\":[", .{ dataHex(a, output), qHex(a, gas_used) });
+    for (logs_buf.items, 0..) |lg, i| {
+        if (i != 0) buf.append(a, ',') catch {};
+        p(a, &buf, "{{\"address\":\"{s}\",\"topics\":[", .{dataHex(a, &lg.address)});
+        for (lg.topics, 0..) |t, j| {
+            if (j != 0) buf.append(a, ',') catch {};
+            p(a, &buf, "\"{s}\"", .{hash32Hex(a, t)});
+        }
+        p(a, &buf, "],\"data\":\"{s}\"}}", .{dataHex(a, lg.data)});
+    }
+    p(a, &buf, "],\"status\":\"{s}\"", .{if (success) "0x1" else "0x0"});
+    if (!success) {
+        const msg = if (evm.reverted) "execution reverted" else "execution error";
+        p(a, &buf, ",\"error\":{{\"code\":{d},\"message\":\"{s}\"}}", .{ @as(i32, if (evm.reverted) 3 else -32000), msg });
+    }
+    buf.append(a, '}') catch {};
+
+    const tx_enc = encodeSimTx(a, env.chain_id, nonce, gas, to, value, data);
+    return .{ .gas_used = gas_used, .success = success, .logs = logs_buf.items, .json = buf.toOwnedSlice(a) catch "", .tx_enc = tx_enc };
+}
+
+/// Format a synthetic simulated block: full block fields + `calls` array. The
+/// `size` is the byte length of the network-encoded block.
+fn simBlockJson(a: std.mem.Allocator, h: *const block.Header, blk_hash: [32]u8, calls_json: []const u8) []const u8 {
+    const EMPTY_LIST = [_]u8{0xc0};
+    // Assemble block RLP for `size`: rlp([header, txs, ommers, withdrawals?]).
+    const hdr_rlp = h.encode(a) catch @panic("oom");
+    var parts: std.ArrayList([]const u8) = .empty;
+    parts.append(a, hdr_rlp) catch {};
+    parts.append(a, &EMPTY_LIST) catch {}; // transactions (empty for size baseline)
+    parts.append(a, &EMPTY_LIST) catch {}; // ommers
+    if (h.withdrawals_root != null) parts.append(a, &EMPTY_LIST) catch {}; // withdrawals
+    const block_rlp = rlp.encodeList(a, parts.items) catch @panic("oom");
+
+    var buf: std.ArrayList(u8) = .empty;
+    p(a, &buf, "{{\"number\":\"{s}\",\"hash\":\"{s}\",\"parentHash\":\"{s}\",\"nonce\":\"{s}\",\"mixHash\":\"{s}\",\"sha3Uncles\":\"{s}\",\"logsBloom\":\"{s}\",\"transactionsRoot\":\"{s}\",\"stateRoot\":\"{s}\",\"receiptsRoot\":\"{s}\",\"miner\":\"{s}\",\"difficulty\":\"{s}\",\"extraData\":\"0x\",\"gasLimit\":\"{s}\",\"gasUsed\":\"{s}\",\"timestamp\":\"{s}\",\"size\":\"{s}\"", .{
+        qHex(a, h.number),                hash32Hex(a, blk_hash),       hash32Hex(a, h.parent_hash),
+        dataHex(a, &h.nonce),             hash32Hex(a, h.prev_randao),  hash32Hex(a, h.ommers_hash),
+        dataHex(a, &h.logs_bloom),        hash32Hex(a, h.transactions_root), hash32Hex(a, h.state_root),
+        hash32Hex(a, h.receipts_root),    dataHex(a, &h.coinbase),      qHex(a, h.difficulty),
+        qHex(a, h.gas_limit),             qHex(a, h.gas_used),          qHex(a, h.timestamp),
+        qHex(a, block_rlp.len),
+    });
+    if (h.base_fee_per_gas) |bf| p(a, &buf, ",\"baseFeePerGas\":\"{s}\"", .{qHex(a, bf)});
+    if (h.withdrawals_root) |w| p(a, &buf, ",\"withdrawalsRoot\":\"{s}\"", .{hash32Hex(a, w)});
+    if (h.blob_gas_used) |g| p(a, &buf, ",\"blobGasUsed\":\"{s}\"", .{qHex(a, g)});
+    if (h.excess_blob_gas) |g| p(a, &buf, ",\"excessBlobGas\":\"{s}\"", .{qHex(a, g)});
+    if (h.parent_beacon_block_root) |r| p(a, &buf, ",\"parentBeaconBlockRoot\":\"{s}\"", .{hash32Hex(a, r)});
+    if (h.requests_hash) |r| p(a, &buf, ",\"requestsHash\":\"{s}\"", .{hash32Hex(a, r)});
+    p(a, &buf, ",\"uncles\":[],\"transactions\":[],\"calls\":{s}}}", .{calls_json});
+    return buf.toOwnedSlice(a) catch @panic("oom");
+}
+fn hashFromHex(s: []const u8) [32]u8 {
+    var out: [32]u8 = std.mem.zeroes([32]u8);
+    const b = if (std.mem.startsWith(u8, s, "0x")) s[2..] else s;
+    _ = std.fmt.hexToBytes(&out, b) catch {};
+    return out;
+}
+
 fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []const u8 {
     if (v != .object) return err(a, null, -32600, "invalid request");
     const obj = v.object;
@@ -602,11 +1025,19 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
     if (std.mem.eql(u8, method, "eth_sendRawTransaction")) {
         const raw = hexBytes(a, strParam(params, 0) orelse return err(a, id, -32602, "invalid params"));
         if (raw.len == 0) return err(a, id, -32602, "invalid transaction");
-        return okStr(a, id, hash32Hex(a, rawTxHash(a, raw)));
+        const hash = rawTxHash(a, raw);
+        // Admit to the pending pool (the producer draws on it); reject undecodable txs.
+        c.txpool.add(raw) catch return err(a, id, -32000, "invalid transaction");
+        return okStr(a, id, hash32Hex(a, hash));
     }
     if (std.mem.eql(u8, method, "eth_createAccessList")) {
         if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
         return ok(a, id, createAccessList(a, c, params[0].object));
+    }
+    if (std.mem.eql(u8, method, "eth_simulateV1")) {
+        if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
+        const base_tag = strParam(params, 1) orelse "latest";
+        return simulateV1(a, id, c, params[0].object, base_tag);
     }
     if (std.mem.eql(u8, method, "eth_capabilities")) {
         var buf: std.ArrayList(u8) = .empty;
@@ -657,6 +1088,31 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
     if (std.mem.eql(u8, method, "eth_getProof")) {
         const addr = parseAddr(strParam(params, 0) orelse return err(a, id, -32602, "invalid params")) orelse return err(a, id, -32602, "invalid address");
         return ok(a, id, getProof(a, c, addr, if (params.len > 1 and params[1] == .array) params[1].array.items else &.{}));
+    }
+    if (std.mem.eql(u8, method, "eth_getStorageValues")) {
+        if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
+        const m = params[0].object;
+        if (m.count() == 0) return err(a, id, -32602, "empty request");
+        var buf: std.ArrayList(u8) = .empty;
+        buf.append(a, '{') catch {};
+        var it = m.iterator();
+        var first = true;
+        while (it.next()) |e| {
+            const addr = parseAddr(e.key_ptr.*) orelse continue;
+            if (!first) buf.append(a, ',') catch {};
+            first = false;
+            p(a, &buf, "\"{s}\":[", .{e.key_ptr.*});
+            if (e.value_ptr.* == .array) for (e.value_ptr.array.items, 0..) |k, i| {
+                if (k != .string) continue;
+                if (i != 0) buf.append(a, ',') catch {};
+                var word: [32]u8 = undefined;
+                std.mem.writeInt(u256, &word, c.state.getStorage(addr, parseU256(k.string)), .big);
+                p(a, &buf, "\"{s}\"", .{hash32Hex(a, word)});
+            };
+            buf.append(a, ']') catch {};
+        }
+        buf.append(a, '}') catch {};
+        return ok(a, id, buf.toOwnedSlice(a) catch return err(a, id, -32603, "oom"));
     }
 
     if (std.mem.eql(u8, method, "eth_getTransactionByHash")) {
@@ -815,11 +1271,31 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
         for (c.hashes.items) |h| if (std.mem.eql(u8, &h, &head)) {
             known = true;
         };
-        const body = if (known)
-            std.fmt.allocPrint(a, "{{\"payloadStatus\":{{\"status\":\"VALID\",\"latestValidHash\":\"{s}\",\"validationError\":null}},\"payloadId\":null}}", .{hash32Hex(a, head)}) catch @panic("oom")
-        else
-            "{\"payloadStatus\":{\"status\":\"SYNCING\",\"latestValidHash\":null,\"validationError\":null},\"payloadId\":null}";
+        if (!known)
+            return ok(a, id, "{\"payloadStatus\":{\"status\":\"SYNCING\",\"latestValidHash\":null,\"validationError\":null},\"payloadId\":null}");
+
+        // payloadAttributes present (and head is our head) → start building a block,
+        // return a payloadId the CL collects with engine_getPayload.
+        var payload_id_json: []const u8 = "null";
+        if (params.len > 1 and params[1] == .object and std.mem.eql(u8, &head, &(c.head.hash(a) catch std.mem.zeroes([32]u8)))) {
+            const at = params[1].object;
+            const fork = c.schedule.forkAt(c.head.number + 1, parseU64(jstr(at, "timestamp") orelse "0x0"));
+            const attrs = chain_mod.Chain.ProduceAttrs{
+                .timestamp = parseU64(jstr(at, "timestamp") orelse "0x0"),
+                .prev_randao = fixed(32, jstr(at, "prevRandao")),
+                .fee_recipient = fixed(20, jstr(at, "suggestedFeeRecipient")),
+                .withdrawals = parseWithdrawals(a, at.get("withdrawals")),
+                .parent_beacon_block_root = if (fork.atLeast(.cancun)) fixed(32, jstr(at, "parentBeaconBlockRoot")) else null,
+            };
+            const pid = c.buildPayload(attrs) catch return err(a, id, -38003, "invalid payload attributes");
+            payload_id_json = std.fmt.allocPrint(a, "\"{s}\"", .{dataHex(a, &pid)}) catch @panic("oom");
+        }
+        const body = std.fmt.allocPrint(a, "{{\"payloadStatus\":{{\"status\":\"VALID\",\"latestValidHash\":\"{s}\",\"validationError\":null}},\"payloadId\":{s}}}", .{ hash32Hex(a, head), payload_id_json }) catch @panic("oom");
         return ok(a, id, body);
+    }
+    if (std.mem.startsWith(u8, method, "engine_getPayloadV")) {
+        const ver: u8 = std.fmt.parseInt(u8, method["engine_getPayloadV".len..], 10) catch 1;
+        return getPayload(a, c, id, params, ver);
     }
     if (std.mem.eql(u8, method, "engine_exchangeCapabilities")) {
         return ok(a, id,
@@ -984,6 +1460,88 @@ fn computeRequestsHash(a: std.mem.Allocator, reqs: []std.json.Value) [32]u8 {
     return out;
 }
 
+/// Parse an Engine API payloadAttributes `withdrawals` array into raw RLP
+/// withdrawals (`[index, validatorIndex, address, amount]`), the form
+/// chain.produceBlock expects. Null/absent → empty.
+fn parseWithdrawals(a: std.mem.Allocator, wv: ?std.json.Value) []const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    if (wv) |v| if (v == .array) for (v.array.items) |w| if (w == .object) {
+        const o = w.object;
+        const items = [_][]const u8{
+            rlp.encodeUint(a, parseU64(jstr(o, "index") orelse "0x0")) catch @panic("oom"),
+            rlp.encodeUint(a, parseU64(jstr(o, "validatorIndex") orelse "0x0")) catch @panic("oom"),
+            rlp.encodeBytes(a, &fixed(20, jstr(o, "address"))) catch @panic("oom"),
+            rlp.encodeUint(a, parseU64(jstr(o, "amount") orelse "0x0")) catch @panic("oom"),
+        };
+        out.append(a, rlp.encodeList(a, &items) catch @panic("oom")) catch @panic("oom");
+    };
+    return out.items;
+}
+
+/// engine_getPayloadV* → return the block built under this payloadId as an
+/// ExecutionPayload, plus its blockValue (and, V3+, an empty blobsBundle).
+fn getPayload(a: std.mem.Allocator, c: *chain_mod.Chain, id: ?std.json.Value, params: []const std.json.Value, version: u8) []const u8 {
+    if (params.len < 1 or params[0] != .string) return err(a, id, -32602, "invalid params");
+    const pid = fixed(8, params[0].string);
+    const built = c.takePayload(pid) orelse return err(a, id, -38001, "unknown payload");
+    const h = built.block.header;
+
+    var ep: std.ArrayList(u8) = .empty;
+    p(a, &ep, "{{\"parentHash\":\"{s}\"", .{hash32Hex(a, h.parent_hash)});
+    p(a, &ep, ",\"feeRecipient\":\"{s}\"", .{dataHex(a, &h.coinbase)});
+    p(a, &ep, ",\"stateRoot\":\"{s}\"", .{hash32Hex(a, h.state_root)});
+    p(a, &ep, ",\"receiptsRoot\":\"{s}\"", .{hash32Hex(a, h.receipts_root)});
+    p(a, &ep, ",\"logsBloom\":\"{s}\"", .{dataHex(a, &h.logs_bloom)});
+    p(a, &ep, ",\"prevRandao\":\"{s}\"", .{dataHex(a, &h.prev_randao)});
+    p(a, &ep, ",\"blockNumber\":\"{s}\"", .{qHex(a, h.number)});
+    p(a, &ep, ",\"gasLimit\":\"{s}\"", .{qHex(a, h.gas_limit)});
+    p(a, &ep, ",\"gasUsed\":\"{s}\"", .{qHex(a, h.gas_used)});
+    p(a, &ep, ",\"timestamp\":\"{s}\"", .{qHex(a, h.timestamp)});
+    p(a, &ep, ",\"extraData\":\"{s}\"", .{dataHex(a, h.extra_data)});
+    p(a, &ep, ",\"baseFeePerGas\":\"{s}\"", .{qHex(a, h.base_fee_per_gas orelse 0)});
+    p(a, &ep, ",\"blockHash\":\"{s}\"", .{hash32Hex(a, h.hash(a) catch std.mem.zeroes([32]u8))});
+    ep.appendSlice(a, ",\"transactions\":[") catch @panic("oom");
+    for (built.block.transactions, 0..) |t, i| {
+        if (i > 0) ep.append(a, ',') catch @panic("oom");
+        p(a, &ep, "\"{s}\"", .{dataHex(a, t)});
+    }
+    ep.append(a, ']') catch @panic("oom");
+    if (version >= 2) { // Shanghai: withdrawals
+        ep.appendSlice(a, ",\"withdrawals\":[") catch @panic("oom");
+        for (built.block.withdrawals, 0..) |w, i| {
+            if (i > 0) ep.append(a, ',') catch @panic("oom");
+            ep.appendSlice(a, withdrawalJson(a, w)) catch @panic("oom");
+        }
+        ep.append(a, ']') catch @panic("oom");
+    }
+    if (version >= 3) { // Cancun: blob gas accounting
+        p(a, &ep, ",\"blobGasUsed\":\"{s}\"", .{qHex(a, h.blob_gas_used orelse 0)});
+        p(a, &ep, ",\"excessBlobGas\":\"{s}\"", .{qHex(a, h.excess_blob_gas orelse 0)});
+    }
+    ep.append(a, '}') catch @panic("oom");
+
+    var res: std.ArrayList(u8) = .empty;
+    p(a, &res, "{{\"executionPayload\":{s},\"blockValue\":\"{s}\"", .{ ep.items, qHex(a, built.fees) });
+    if (version >= 3) // empty blobs bundle (we don't build blob txs yet)
+        res.appendSlice(a, ",\"blobsBundle\":{\"commitments\":[],\"proofs\":[],\"blobs\":[]},\"shouldOverrideBuilder\":false") catch @panic("oom");
+    res.append(a, '}') catch @panic("oom");
+    return ok(a, id, res.items);
+}
+
+/// Decode a raw RLP withdrawal back to the Engine API JSON object form.
+fn withdrawalJson(a: std.mem.Allocator, raw: []const u8) []const u8 {
+    const item = rlp.decode(a, raw) catch return "{}";
+    const f = item.items() catch return "{}";
+    if (f.len != 4) return "{}";
+    const idx = f[0].uint(u64) catch 0;
+    const vi = f[1].uint(u64) catch 0;
+    const addr_b = f[2].bytes() catch return "{}";
+    const amt = f[3].uint(u64) catch 0;
+    var addr: [20]u8 = std.mem.zeroes([20]u8);
+    if (addr_b.len == 20) @memcpy(&addr, addr_b);
+    return std.fmt.allocPrint(a, "{{\"index\":\"{s}\",\"validatorIndex\":\"{s}\",\"address\":\"{s}\",\"amount\":\"{s}\"}}", .{ qHex(a, idx), qHex(a, vi), dataHex(a, &addr), qHex(a, amt) }) catch @panic("oom");
+}
+
 /// engine_newPayloadV* → import the payload, return the payload status.
 fn newPayload(a: std.mem.Allocator, c: *chain_mod.Chain, id: ?std.json.Value, params: []const std.json.Value, version: u8) []const u8 {
     if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
@@ -1032,6 +1590,113 @@ pub fn handleBody(a: std.mem.Allocator, c: *chain_mod.Chain, body: []const u8) [
 
 // ── tests ───────────────────────────────────────────────────────────────────
 const testing = std.testing;
+const genesis_mod = @import("genesis.zig");
+const ecies = @import("ecies.zig");
+const testsign = @import("testsign.zig");
+
+test "eth_sendRawTransaction admits the tx to the pending pool" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Minimal post-Merge genesis funding a freshly generated sender.
+    const priv = ecies.randomPriv(io);
+    const pk = try ecies.pubFromPriv(priv);
+    const sh = crypto.keccak256(&pk);
+    var addr_hex: [40]u8 = undefined;
+    for (sh[12..32], 0..) |byte, i| _ = std.fmt.bufPrint(addr_hex[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable;
+    const gjson = try std.fmt.allocPrint(a,
+        \\{{"config":{{"chainId":1,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"mergeNetsplitBlock":0,"terminalTotalDifficulty":0,"shanghaiTime":0}},
+        \\"gasLimit":"0x1000000","difficulty":"0x0","timestamp":"0x0",
+        \\"alloc":{{"{s}":{{"balance":"0xde0b6b3a7640000"}}}}}}
+    , .{addr_hex});
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, gjson, .{});
+    defer parsed.deinit();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    const g = try genesis_mod.load(a, &st, parsed.value);
+    var ch = try chain_mod.Chain.initGenesis(testing.allocator, &st, g);
+    defer ch.deinit();
+
+    var to = std.mem.zeroes(state_mod.Address);
+    to[19] = 0x42;
+    const raw = try testsign.signLegacy(a, io, priv, 1, 0, 2_000_000_000, 21000, to, 1000);
+    var raw_hex = std.ArrayList(u8).empty;
+    try raw_hex.appendSlice(a, "0x");
+    for (raw) |byte| try raw_hex.print(a, "{x:0>2}", .{byte});
+    const body = try std.fmt.allocPrint(a,
+        \\{{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["{s}"]}}
+    , .{raw_hex.items});
+
+    const resp = handleBody(a, &ch, body);
+    try testing.expect(std.mem.indexOf(u8, resp, "\"result\"") != null); // hash returned
+    try testing.expectEqual(@as(usize, 1), ch.txpool.count()); // and it's pending
+}
+
+test "engine: forkchoiceUpdated(attrs) → getPayload → newPayload round-trips VALID" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const priv = ecies.randomPriv(io);
+    const pk = try ecies.pubFromPriv(priv);
+    const sh = crypto.keccak256(&pk);
+    var addr_hex: [40]u8 = undefined;
+    for (sh[12..32], 0..) |byte, i| _ = std.fmt.bufPrint(addr_hex[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable;
+    const gjson = try std.fmt.allocPrint(a,
+        \\{{"config":{{"chainId":1,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"mergeNetsplitBlock":0,"terminalTotalDifficulty":0,"shanghaiTime":0}},
+        \\"gasLimit":"0x1000000","difficulty":"0x0","timestamp":"0x0",
+        \\"alloc":{{"{s}":{{"balance":"0xde0b6b3a7640000"}}}}}}
+    , .{addr_hex});
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, gjson, .{});
+    defer parsed.deinit();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    const g = try genesis_mod.load(a, &st, parsed.value);
+    var ch = try chain_mod.Chain.initGenesis(testing.allocator, &st, g);
+    defer ch.deinit();
+    const genesis_hash = hash32Hex(a, try ch.head.hash(a));
+
+    // A pending tx to include in the built block.
+    var to = std.mem.zeroes(state_mod.Address);
+    to[19] = 0x42;
+    try ch.txpool.add(try testsign.signLegacy(a, io, priv, 1, 0, 2_000_000_000, 21000, to, 1000));
+
+    // forkchoiceUpdatedV2 with payloadAttributes → expect a payloadId.
+    const fcu_body = try std.fmt.allocPrint(a,
+        \\{{"jsonrpc":"2.0","id":1,"method":"engine_forkchoiceUpdatedV2","params":[{{"headBlockHash":"{s}","safeBlockHash":"{s}","finalizedBlockHash":"{s}"}},{{"timestamp":"0xc","prevRandao":"0x0000000000000000000000000000000000000000000000000000000000000001","suggestedFeeRecipient":"0x00000000000000000000000000000000000000ee","withdrawals":[]}}]}}
+    , .{ genesis_hash, genesis_hash, genesis_hash });
+    const fcu_resp = handleBody(a, &ch, fcu_body);
+    var fcu = try std.json.parseFromSlice(std.json.Value, a, fcu_resp, .{});
+    defer fcu.deinit();
+    const payload_id = fcu.value.object.get("result").?.object.get("payloadId").?.string;
+    try testing.expect(!std.mem.eql(u8, payload_id, "null"));
+
+    // engine_getPayloadV2 → ExecutionPayload with our tx.
+    const gp_body = try std.fmt.allocPrint(a,
+        \\{{"jsonrpc":"2.0","id":2,"method":"engine_getPayloadV2","params":["{s}"]}}
+    , .{payload_id});
+    const gp_resp = handleBody(a, &ch, gp_body);
+    var gp = try std.json.parseFromSlice(std.json.Value, a, gp_resp, .{});
+    defer gp.deinit();
+    const exec_payload = gp.value.object.get("result").?.object.get("executionPayload").?;
+    try testing.expectEqualStrings("0x1", exec_payload.object.get("blockNumber").?.string);
+    try testing.expectEqual(@as(usize, 1), exec_payload.object.get("transactions").?.array.items.len);
+
+    // Feed it straight back into engine_newPayloadV2 → must validate.
+    var np_params: std.ArrayList(u8) = .empty;
+    try np_params.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"engine_newPayloadV2\",\"params\":[");
+    try np_params.appendSlice(a, gp_resp[std.mem.indexOf(u8, gp_resp, "\"executionPayload\":").? + "\"executionPayload\":".len .. std.mem.indexOf(u8, gp_resp, ",\"blockValue\"").?]);
+    try np_params.appendSlice(a, "]}");
+    const np_resp = handleBody(a, &ch, np_params.items);
+    try testing.expect(std.mem.indexOf(u8, np_resp, "\"VALID\"") != null);
+}
 
 test "rawTxHash matches sendRawTransaction fixtures (legacy/2930/1559)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

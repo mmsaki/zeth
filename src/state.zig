@@ -301,6 +301,12 @@ pub const State = struct {
         return a.storage.get(key) orelse 0;
     }
 
+    /// Drop all storage of an account (eth_simulateV1 `state` override resets
+    /// storage before applying the given slots).
+    pub fn clearStorage(self: *State, addr: Address) void {
+        if (self.accounts.getPtr(addr)) |acc| acc.storage.clearRetainingCapacity();
+    }
+
     pub fn setStorage(self: *State, addr: Address, key: u256, value: u256) !void {
         const acc = try self.getOrCreate(addr);
         if (value == 0) {

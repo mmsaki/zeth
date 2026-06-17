@@ -11,9 +11,11 @@ const txmod = @import("tx.zig");
 const state_mod = @import("state.zig");
 const trie = @import("trie.zig");
 const vm = @import("vm.zig");
+const rlp = @import("rlp.zig");
 const crypto = @import("crypto.zig");
 const genesis_mod = @import("genesis.zig");
 const store_mod = @import("store.zig");
+const mempool_mod = @import("mempool.zig");
 const Header = block.Header;
 const State = state_mod.State;
 const Address = state_mod.Address;
@@ -114,6 +116,14 @@ pub const Chain = struct {
     headers: std.ArrayList(Header) = .empty,
     /// Canonical block hashes by number, for the BLOCKHASH opcode + RPC.
     hashes: std.ArrayList([32]u8) = .empty,
+    /// Pending transactions accepted via eth_sendRawTransaction, drawn on by the
+    /// block producer and pruned (mined/stale nonces) after each import.
+    txpool: mempool_mod.Mempool = undefined,
+    /// The most recent block built for the Engine API (forkchoiceUpdated →
+    /// payloadId), held until engine_getPayload collects it. Lives in its own
+    /// arena so its slices outlive the building RPC request.
+    payload: ?BuiltPayload = null,
+    payload_arena: ?std.heap.ArenaAllocator = null,
 
     pub fn initGenesis(gpa: std.mem.Allocator, state: *State, g: genesis_mod.Genesis) !Chain {
         var c = Chain{
@@ -122,6 +132,7 @@ pub const Chain = struct {
             .schedule = g.schedule,
             .chain_id = g.schedule.chain_id,
             .head = g.header,
+            .txpool = mempool_mod.Mempool.init(gpa),
         };
         try c.pushBlock(g.header, try g.header.hash(gpa));
         try c.block_txs.append(gpa, &.{}); // genesis has no transactions
@@ -150,6 +161,8 @@ pub const Chain = struct {
         self.block_txs.deinit(self.gpa);
         self.sizes.deinit(self.gpa);
         self.tx_index.deinit(self.gpa);
+        self.txpool.deinit();
+        if (self.payload_arena) |*pa| pa.deinit();
         if (self.genesis_state) |*gs| gs.deinit();
     }
 
@@ -498,7 +511,204 @@ pub const Chain = struct {
         self.sizes.append(self.gpa, size + 16) catch return error.OutOfMemory; // ~RLP list overhead
         for (owned, 0..) |r, i|
             self.tx_index.put(self.gpa, r.hash, .{ .block_number = h.number, .index = @intCast(i) }) catch return error.OutOfMemory;
+        self.txpool.prune(self.state); // drop now-mined/stale pending txs
         return self.head;
+    }
+
+    /// Attributes for building a block (the CL's payloadAttributes).
+    pub const ProduceAttrs = struct {
+        timestamp: u64,
+        prev_randao: [32]u8 = std.mem.zeroes([32]u8),
+        fee_recipient: Address = state_mod.zero_address,
+        withdrawals: []const []const u8 = &.{}, // raw RLP withdrawals (Shanghai+)
+        parent_beacon_block_root: ?[32]u8 = null,
+    };
+
+    /// EIP-1559 base fee for the block following `parent`.
+    fn nextBaseFee(parent: Header) u256 {
+        const base = parent.base_fee_per_gas orelse 1_000_000_000;
+        const target: u64 = parent.gas_limit / 2; // elasticity multiplier 2
+        if (target == 0 or parent.gas_used == target) return base;
+        if (parent.gas_used > target) {
+            const delta = (base * (parent.gas_used - target)) / target / 8;
+            return base + @max(delta, 1);
+        }
+        const delta = (base * (target - parent.gas_used)) / target / 8;
+        return if (base > delta) base - delta else 0;
+    }
+
+    /// A built block plus its value to the proposer (sum of priority fees), which
+    /// the Engine API reports as `blockValue` in engine_getPayload.
+    pub const ProduceResult = struct { block: block.Block, fees: u256 };
+
+    /// Build the next block on top of the head (the producer/proposer side):
+    /// apply the payload attributes, run the block-start system calls, include
+    /// the given txs *skipping any that fail validation or don't fit*, apply
+    /// withdrawals, and compute the full header. Built on a clone of the state so
+    /// the chain head is untouched — import the returned block to apply it.
+    pub fn produceBlock(self: *Chain, a: std.mem.Allocator, attrs: ProduceAttrs, txs: []const []const u8) !ProduceResult {
+        const parent = self.head;
+        const number = parent.number + 1;
+        const fork = self.schedule.forkAt(number, attrs.timestamp);
+        const parent_hash = try parent.hash(self.gpa);
+
+        // Produce on a clone so a failed build never mutates the chain state.
+        const orig = self.state;
+        var clone = try orig.clone();
+        self.state = &clone;
+        defer {
+            self.state = orig;
+            clone.deinit();
+        }
+
+        const base_fee: ?u256 = if (fork.atLeast(.london)) nextBaseFee(parent) else null;
+        var excess_blob: ?u64 = null;
+        if (fork.atLeast(.cancun)) {
+            const pe = parent.excess_blob_gas orelse 0;
+            const pu = parent.blob_gas_used orelse 0;
+            const target = txmod.targetBlobGasPerBlock(fork);
+            excess_blob = if (pe + pu < target) 0 else pe + pu - target;
+        }
+
+        var env = vm.Environment{
+            .fork = fork,
+            .chain_id = self.chain_id,
+            .coinbase = attrs.fee_recipient,
+            .number = number,
+            .time = attrs.timestamp,
+            .gas_limit = parent.gas_limit,
+            .base_fee = base_fee orelse 0,
+            .prev_randao = bytesToU256(&attrs.prev_randao),
+            .block_hashes = self.hashes.items,
+            .blob_base_fee = txmod.blobGasPrice(excess_blob orelse 0, fork),
+        };
+        self.state.touched.clearRetainingCapacity();
+
+        if (fork.atLeast(.cancun)) if (attrs.parent_beacon_block_root) |r| {
+            _ = self.systemCall(a, &env, BEACON_ROOTS, &r);
+        };
+        if (fork.atLeast(.prague)) _ = self.systemCall(a, &env, HISTORY_STORAGE, &parent_hash);
+
+        var included: std.ArrayList([]const u8) = .empty;
+        var receipts: std.ArrayList(block.Receipt) = .empty;
+        var cumulative_gas: u64 = 0;
+        var blob_gas_used: u64 = 0;
+        var fees: u256 = 0; // proposer's take: Σ gas_used × (effective_price − base_fee)
+        for (txs) |enc| {
+            const dt = transaction.decode(a, enc) catch continue;
+            const gas_price = dt.effectiveGasPrice(env.base_fee);
+            env.gas_price = gas_price;
+            env.origin = dt.sender;
+            env.blob_versioned_hashes = dt.blob_versioned_hashes;
+            const blob_fee: u256 = @as(u256, txmod.GAS_PER_BLOB) * dt.blob_versioned_hashes.len * env.blob_base_fee;
+            const tx = txmod.Tx{ .sender = dt.sender, .to = dt.to, .nonce = dt.nonce, .gas_limit = dt.gas_limit, .gas_price = gas_price, .value = dt.value, .data = dt.data, .access_list = dt.access_list, .authorizations = dt.authorizations, .blob_data_fee = blob_fee };
+            if (txmod.validate(self.state, &env, tx, dt.max_fee, dt.max_priority_fee) != null) continue; // skip invalid
+            if (cumulative_gas + dt.gas_limit > parent.gas_limit) continue; // wouldn't fit
+            var logs: std.ArrayList(vm.Log) = .empty;
+            const res = txmod.processWithReceipt(a, self.state, &env, tx, &logs);
+            cumulative_gas += res.gas_used;
+            fees += @as(u256, res.gas_used) * (gas_price - env.base_fee);
+            blob_gas_used += @as(u64, txmod.GAS_PER_BLOB) * dt.blob_versioned_hashes.len;
+            const post_state: ?[32]u8 = if (fork.atLeast(.byzantium)) null else trie.stateRoot(a, self.state, false);
+            try receipts.append(a, .{ .tx_type = dt.tx_type, .success = res.success, .cumulative_gas_used = cumulative_gas, .logs = logs.items, .post_state = post_state });
+            try included.append(a, enc);
+        }
+
+        for (attrs.withdrawals) |w_enc| {
+            const wd = decodeWithdrawal(a, w_enc) catch continue;
+            try self.state.setBalance(wd.address, self.state.balanceOf(wd.address) + @as(u256, wd.amount) * 1_000_000_000);
+        }
+
+        var requests_hash: ?[32]u8 = null;
+        if (fork.atLeast(.prague)) {
+            const Sha256 = std.crypto.hash.sha2.Sha256;
+            var outer = Sha256.init(.{});
+            var deposits: std.ArrayList(u8) = .empty;
+            for (receipts.items) |*r| for (r.logs) |lg| {
+                if (std.mem.eql(u8, &lg.address, &DEPOSIT_CONTRACT) and lg.topics.len > 0 and std.mem.eql(u8, &lg.topics[0], &DEPOSIT_EVENT_SIG)) {
+                    if (extractDepositData(lg.data)) |dd| deposits.appendSlice(a, &dd) catch {};
+                }
+            };
+            if (deposits.items.len > 0) hashRequest(&outer, 0x00, deposits.items);
+            const wd = self.systemCall(a, &env, WITHDRAWAL_REQUEST_PREDEPLOY, &.{});
+            if (wd.len > 0) hashRequest(&outer, 0x01, wd);
+            const cd = self.systemCall(a, &env, CONSOLIDATION_REQUEST_PREDEPLOY, &.{});
+            if (cd.len > 0) hashRequest(&outer, 0x02, cd);
+            var rh: [32]u8 = undefined;
+            outer.final(&rh);
+            requests_hash = rh;
+        }
+
+        if (fork.atLeast(.spurious_dragon)) self.state.destroyTouchedEmpty();
+
+        var bloom = std.mem.zeroes([256]u8);
+        for (receipts.items) |*r| block.orBloom(&bloom, block.logsBloom(r.logs));
+        const hdr = block.Header{
+            .parent_hash = parent_hash,
+            .coinbase = attrs.fee_recipient,
+            .state_root = trie.stateRoot(a, self.state, false),
+            .transactions_root = block.orderedTrieRoot(a, included.items),
+            .receipts_root = block.receiptsRoot(a, receipts.items),
+            .logs_bloom = bloom,
+            .difficulty = if (fork.atLeast(.paris)) 0 else parent.difficulty,
+            .number = number,
+            .gas_limit = parent.gas_limit,
+            .gas_used = cumulative_gas,
+            .timestamp = attrs.timestamp,
+            .extra_data = "zeth",
+            .prev_randao = attrs.prev_randao,
+            .base_fee_per_gas = base_fee,
+            .withdrawals_root = if (fork.atLeast(.shanghai)) block.orderedTrieRoot(a, attrs.withdrawals) else null,
+            .blob_gas_used = if (fork.atLeast(.cancun)) blob_gas_used else null,
+            .excess_blob_gas = excess_blob,
+            .parent_beacon_block_root = if (fork.atLeast(.cancun)) (attrs.parent_beacon_block_root orelse std.mem.zeroes([32]u8)) else null,
+            .requests_hash = requests_hash,
+        };
+        return .{ .block = .{
+            .header = hdr,
+            // Deep-copy into `a` so the block owns its bytes (the Engine path holds
+            // it past the building request; pool txs may be pruned meanwhile).
+            .transactions = try dupeSlices(a, included.items),
+            .withdrawals = try dupeSlices(a, attrs.withdrawals),
+            .has_withdrawals = fork.atLeast(.shanghai),
+            .ommers = &.{},
+        }, .fees = fees };
+    }
+
+    /// Engine API building: a payloadId plus the block it points at, held until
+    /// the consensus client fetches it with engine_getPayload. We keep only the
+    /// most recent build (one outstanding payload), in its own arena.
+    const BuiltPayload = struct { id: [8]u8, block: block.Block, fees: u256 };
+
+    /// Build a block from payload attributes (drawing pending txs from the pool)
+    /// and stash it under a fresh payloadId for engine_getPayload to collect.
+    pub fn buildPayload(self: *Chain, attrs: ProduceAttrs) ![8]u8 {
+        if (self.payload_arena) |*pa| pa.deinit();
+        self.payload_arena = std.heap.ArenaAllocator.init(self.gpa);
+        const a = self.payload_arena.?.allocator();
+
+        const fork = self.schedule.forkAt(self.head.number + 1, attrs.timestamp);
+        const base_fee: u256 = if (fork.atLeast(.london)) nextBaseFee(self.head) else 0;
+        const batch = try self.txpool.select(a, self.state, self.head.gas_limit, base_fee);
+        const res = try self.produceBlock(a, attrs, batch);
+
+        // payloadId = first 8 bytes of keccak(parentHash ‖ timestamp ‖ randao ‖ feeRecipient).
+        var pre: [92]u8 = undefined;
+        @memcpy(pre[0..32], &res.block.header.parent_hash);
+        std.mem.writeInt(u64, pre[32..40], attrs.timestamp, .big);
+        @memcpy(pre[40..72], &attrs.prev_randao);
+        @memcpy(pre[72..92], &attrs.fee_recipient);
+        var id: [8]u8 = undefined;
+        @memcpy(&id, crypto.keccak256(&pre)[0..8]);
+        self.payload = .{ .id = id, .block = res.block, .fees = res.fees };
+        return id;
+    }
+
+    /// The block previously built under `id` (engine_getPayload), or null.
+    pub fn takePayload(self: *Chain, id: [8]u8) ?BuiltPayload {
+        const p = self.payload orelse return null;
+        if (!std.mem.eql(u8, &p.id, &id)) return null;
+        return p;
     }
 
     /// Run a system call (caller = SYSTEM_ADDRESS, 30M gas, no fees) and return
@@ -523,6 +733,13 @@ fn bytesToU256(b: *const [32]u8) u256 {
     return std.mem.readInt(u256, b, .big);
 }
 
+/// Deep-copy a slice-of-byte-slices into `a` (outer array + each inner slice).
+fn dupeSlices(a: std.mem.Allocator, slices: []const []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, slices.len);
+    for (slices, 0..) |s, i| out[i] = try a.dupe(u8, s);
+    return out;
+}
+
 /// Deep-copy a tx's logs into `gpa` so they outlive the per-block arena.
 fn ownLogs(gpa: std.mem.Allocator, logs: []const vm.Log) []const vm.Log {
     const out = gpa.alloc(vm.Log, logs.len) catch @panic("oom");
@@ -538,7 +755,6 @@ const Withdrawal = struct { address: Address, amount: u64 };
 
 /// Decode a withdrawal RLP: `[index, validatorIndex, address, amount]`.
 fn decodeWithdrawal(a: std.mem.Allocator, raw: []const u8) !Withdrawal {
-    const rlp = @import("rlp.zig");
     const item = try rlp.decode(a, raw);
     const f = try item.items();
     if (f.len != 4) return error.Malformed;
@@ -547,4 +763,63 @@ fn decodeWithdrawal(a: std.mem.Allocator, raw: []const u8) !Withdrawal {
     var address: Address = undefined;
     @memcpy(&address, addr_bytes);
     return .{ .address = address, .amount = try f[3].uint(u64) };
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+const testing = std.testing;
+const ecies = @import("ecies.zig");
+const testsign = @import("testsign.zig");
+
+test "produceBlock: include a signed tx, then self-validate by import" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A funded sender at a freshly generated key.
+    const priv = ecies.randomPriv(io);
+    const pub_key = try ecies.pubFromPriv(priv);
+    const ph = crypto.keccak256(&pub_key);
+    var sender: Address = undefined;
+    @memcpy(&sender, ph[12..32]);
+    var to = std.mem.zeroes(Address);
+    to[19] = 0x42;
+
+    // Shanghai-from-genesis (post-Merge, EIP-1559, withdrawals) funding `sender`.
+    var addr_hex: [40]u8 = undefined;
+    for (sender, 0..) |byte, i| _ = std.fmt.bufPrint(addr_hex[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable;
+    const gjson = try std.fmt.allocPrint(a,
+        \\{{"config":{{"chainId":1,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"mergeNetsplitBlock":0,"terminalTotalDifficulty":0,"shanghaiTime":0}},
+        \\"gasLimit":"0x1000000","difficulty":"0x0","timestamp":"0x0",
+        \\"alloc":{{"{s}":{{"balance":"0xde0b6b3a7640000"}}}}}}
+    , .{addr_hex});
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, gjson, .{});
+    defer parsed.deinit();
+    var st = State.init(testing.allocator);
+    defer st.deinit();
+    const g = try genesis_mod.load(a, &st, parsed.value);
+    var ch = try Chain.initGenesis(testing.allocator, &st, g);
+    defer ch.deinit();
+
+    // Pool a single value-transfer tx (gas price ≥ 1 gwei base fee).
+    const raw = try testsign.signLegacy(a, io, priv, 1, 0, 2_000_000_000, 21000, to, 1_000_000);
+    var pool = mempool_mod.Mempool.init(testing.allocator);
+    defer pool.deinit();
+    try pool.add(raw);
+    const batch = try pool.select(a, ch.state, ch.head.gas_limit, ch.head.base_fee_per_gas.?);
+    try testing.expectEqual(@as(usize, 1), batch.len);
+
+    // Build block 1 and self-validate it by importing (re-execution checks roots).
+    const built = try ch.produceBlock(a, .{ .timestamp = ch.head.timestamp + 12 }, batch);
+    const blk = built.block;
+    try testing.expectEqual(@as(usize, 1), blk.transactions.len);
+    try testing.expectEqual(@as(u64, 21000), blk.header.gas_used);
+    try testing.expectEqual(@as(u256, 21000) * (2_000_000_000 - blk.header.base_fee_per_gas.?), built.fees); // tip = gas × (price − base)
+    const h = try ch.importDecoded(a, blk);
+    try testing.expectEqual(@as(u64, 1), h.number);
+    // The transfer + nonce bump landed.
+    try testing.expectEqual(@as(u64, 1), ch.state.nonceOf(sender));
+    try testing.expectEqual(@as(u256, 1_000_000), ch.state.balanceOf(to));
 }

@@ -61,6 +61,9 @@ pub const Peer = struct {
     /// move); free it with `destroy`.
     pub fn dial(gpa: std.mem.Allocator, io: Io, enode: Enode, our_priv: [32]u8) !*Peer {
         var addr = try net.IpAddress.parse(enode.host, enode.port);
+        // NB: std.Io connect timeout is unimplemented in the pinned Zig
+        // (netConnectIpPosix panics on a non-none timeout), so dead peers use
+        // the OS default connect timeout — slow when sweeping many peers.
         const stream = try addr.connect(io, .{ .mode = .stream });
 
         const self = try gpa.create(Peer);
@@ -150,17 +153,37 @@ pub const Peer = struct {
         }
     }
 
-    /// Send our p2p Hello (announcing eth/69) as the first frame.
+    /// Hold the connection open: read messages forever, answering p2p pings with
+    /// pongs (so the peer doesn't drop us) and ignoring everything else. Returns
+    /// when the peer disconnects or the link errors — i.e. when we stop holding
+    /// this peer.
+    pub fn keepAlive(self: *Peer, gpa: std.mem.Allocator) !void {
+        while (true) {
+            const msg = try self.readMessage(gpa);
+            defer gpa.free(msg.payload);
+            if (msg.id == eth_proto.p2p.ping) {
+                try self.writeMessage(eth_proto.p2p.pong, "\xc0"); // rlp([])
+            } else if (msg.id == eth_proto.p2p.disconnect) {
+                return error.Disconnected;
+            }
+            // else: NewPooledTransactionHashes / BlockHeaders / etc. — ignore.
+        }
+    }
+
+    /// Send our p2p Hello (announcing eth/69 + snap/1) as the first frame.
     pub fn sendHello(self: *Peer, our_pub: [64]u8) !void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const cap_items = [_][]const u8{
+        const eth_cap = try rlp.encodeList(a, &[_][]const u8{
             try rlp.encodeBytes(a, "eth"),
             try rlp.encodeUint(a, 69), // negotiate eth/69 (geth no longer offers 68)
-        };
-        const cap = try rlp.encodeList(a, &cap_items);
-        const caps = try rlp.encodeList(a, &[_][]const u8{cap});
+        });
+        const snap_cap = try rlp.encodeList(a, &[_][]const u8{
+            try rlp.encodeBytes(a, "snap"),
+            try rlp.encodeUint(a, 1), // snap/1 satellite protocol (state-range sync)
+        });
+        const caps = try rlp.encodeList(a, &[_][]const u8{ eth_cap, snap_cap });
         const fields = [_][]const u8{
             try rlp.encodeUint(a, 4), // p2p protocol version (4 = no snappy)
             try rlp.encodeBytes(a, "zeth/0.1.0"),

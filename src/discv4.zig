@@ -300,7 +300,7 @@ pub fn bondAndFindNode(
     out: []Node,
 ) !usize {
     var bind_addr: net.IpAddress = .{ .ip4 = net.Ip4Address.unspecified(0) };
-    const sock = try net.Socket.bind(&bind_addr, io, .{ .mode = .dgram });
+    const sock = try net.IpAddress.bind(&bind_addr, io, .{ .mode = .dgram });
     defer sock.close(io);
 
     const dest: net.IpAddress = .{ .ip4 = .{ .bytes = boot_ip, .port = boot_udp } };

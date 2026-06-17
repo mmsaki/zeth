@@ -90,6 +90,7 @@ const TX_BASE: u64 = 21000;
 const TX_CREATE: u64 = 32000;
 const INIT_WORD: u64 = 2; // EIP-3860
 const FLOOR_PER_TOKEN: u64 = 10; // EIP-7623
+pub const TX_GAS_LIMIT_CAP: u64 = 1 << 24; // 16,777,216 — EIP-7825 (Osaka)
 
 const Intrinsic = struct { standard: u64, floor: u64 };
 
@@ -204,12 +205,14 @@ pub const InvalidReason = enum {
     insufficient_funds,
     sender_not_eoa,
     set_code_creation,
+    gas_limit_exceeds_cap,
 
     pub fn message(self: InvalidReason) []const u8 {
         return switch (self) {
             .fee_cap_below_base_fee => "max fee per gas less than block base fee",
             .tip_above_fee_cap => "max priority fee per gas higher than max fee per gas",
             .gas_limit_exceeds_block => "transaction gas limit exceeds block gas limit",
+            .gas_limit_exceeds_cap => "transaction gas limit exceeds maximum (EIP-7825)",
             .init_code_too_large => "max initcode size exceeded",
             .intrinsic_gas_too_low => "intrinsic gas too low",
             .nonce_too_high => "nonce too high",
@@ -233,6 +236,10 @@ pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: 
 
     // The transaction's gas limit may not exceed the block gas limit.
     if (tx.gas_limit > env.gas_limit) return .gas_limit_exceeds_block;
+
+    // EIP-7825 (Osaka): a transaction's gas limit is capped at 2^24 (16,777,216),
+    // independent of the block gas limit.
+    if (env.fork.atLeast(.osaka) and tx.gas_limit > TX_GAS_LIMIT_CAP) return .gas_limit_exceeds_cap;
 
     // EIP-3860 (Shanghai+): a creation transaction's init code is bounded.
     const eip3860 = env.fork.atLeast(.shanghai);
@@ -412,4 +419,37 @@ fn processImpl(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
     // that is now empty. Before this fork empty accounts persist.
     if (env.fork.atLeast(.spurious_dragon)) state.destroyTouchedEmpty();
     return .{ .gas_used = gas_used, .success = success };
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+test "EIP-7825: transaction gas limit cap applies from Osaka" {
+    const testing = std.testing;
+    var st = State.init(testing.allocator);
+    defer st.deinit();
+    const sender = std.mem.zeroes(Address);
+    var to = std.mem.zeroes(Address);
+    to[19] = 0x42;
+
+    const tx = Tx{
+        .sender = sender,
+        .to = to,
+        .nonce = 0,
+        .gas_limit = TX_GAS_LIMIT_CAP + 1, // one over the cap
+        .gas_price = 0,
+        .value = 0,
+        .data = &.{},
+    };
+    // Block gas limit is generous, so only the EIP-7825 cap can reject this.
+    var env = vm.Environment{ .gas_limit = 100_000_000, .base_fee = 0 };
+
+    env.fork = .prague; // pre-Osaka: no per-tx cap → valid
+    try testing.expectEqual(@as(?InvalidReason, null), validate(&st, &env, tx, 0, 0));
+
+    env.fork = .osaka; // Osaka: capped → rejected
+    try testing.expectEqual(@as(?InvalidReason, .gas_limit_exceeds_cap), validate(&st, &env, tx, 0, 0));
+
+    // Exactly at the cap is allowed.
+    var at_cap = tx;
+    at_cap.gas_limit = TX_GAS_LIMIT_CAP;
+    try testing.expectEqual(@as(?InvalidReason, null), validate(&st, &env, at_cap, 0, 0));
 }
