@@ -153,6 +153,23 @@ pub const Peer = struct {
         }
     }
 
+    /// Hold the connection open: read messages forever, answering p2p pings with
+    /// pongs (so the peer doesn't drop us) and ignoring everything else. Returns
+    /// when the peer disconnects or the link errors — i.e. when we stop holding
+    /// this peer.
+    pub fn keepAlive(self: *Peer, gpa: std.mem.Allocator) !void {
+        while (true) {
+            const msg = try self.readMessage(gpa);
+            defer gpa.free(msg.payload);
+            if (msg.id == eth_proto.p2p.ping) {
+                try self.writeMessage(eth_proto.p2p.pong, "\xc0"); // rlp([])
+            } else if (msg.id == eth_proto.p2p.disconnect) {
+                return error.Disconnected;
+            }
+            // else: NewPooledTransactionHashes / BlockHeaders / etc. — ignore.
+        }
+    }
+
     /// Send our p2p Hello (announcing eth/69 + snap/1) as the first frame.
     pub fn sendHello(self: *Peer, our_pub: [64]u8) !void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);

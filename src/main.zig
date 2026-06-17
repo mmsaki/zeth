@@ -16,6 +16,7 @@ const VERSION = "zeth/0.1.0-dev";
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
+    zeth.log.init(init.io);
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) return usage(args[0]);
 
@@ -1072,15 +1073,64 @@ fn benchEvm(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
     , .{ evm.op_count, gas_used, secs, mgas, mops, ns_op });
 }
 
-/// `zeth peers <bootnode-enode> <networkId> <genesisHash> [maxPeers]` — a
-/// discovery crawl: starting from a bootnode, repeatedly findnode for neighbors
-/// (growing the candidate set) and run the eth/69 handshake on each, logging a
-/// live peer count — the discovery+handshake pipeline that a persistent peer
-/// manager is built on. Sequential (no connect timeout in std yet, so dead nodes
-/// are slow); capped to keep the crawl bounded.
+/// Shared state for the peer manager: live held-peer counters (atomic, since
+/// connector threads update them concurrently).
+const PeerManager = struct {
+    held: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    accepted: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    gpa: std.mem.Allocator, // thread-safe
+    io: std.Io,
+    network_id: u64,
+    genesis_hash: [32]u8,
+    fid: zeth.forkid.ForkId,
+};
+
+fn nodeShort(id: [64]u8) [16]u8 {
+    var out: [16]u8 = undefined;
+    for (id[0..8], 0..) |b, i| _ = std.fmt.bufPrint(out[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    return out;
+}
+
+/// Dial → RLPx → Hello → eth/69 Status, returning the live, held-ready peer
+/// (caller must `destroy`). Errors if the peer rejects us at any stage.
+fn dialAndHandshake(gpa: std.mem.Allocator, io: std.Io, enode: zeth.peer.Enode, priv: [32]u8, network_id: u64, genesis_hash: [32]u8, fid: zeth.forkid.ForkId) !*zeth.peer.Peer {
+    const pub_key = try zeth.ecies.pubFromPriv(priv);
+    const p = try zeth.peer.Peer.dial(gpa, io, enode, priv);
+    errdefer p.destroy();
+    try p.sendHello(pub_key);
+    gpa.free(try p.readUntil(gpa, zeth.eth_proto.p2p.hello));
+    var ha = std.heap.ArenaAllocator.init(gpa);
+    defer ha.deinit();
+    const st = zeth.eth_proto.Status69{ .version = 69, .network_id = network_id, .genesis_hash = genesis_hash, .fork_hash = fid.hash, .fork_next = fid.next, .latest_block_hash = genesis_hash };
+    try p.writeMessage(zeth.eth_proto.eth.status, try st.encode(ha.allocator()));
+    gpa.free(try p.readUntil(gpa, zeth.eth_proto.eth.status));
+    return p;
+}
+
+/// One connector thread: dial a candidate, and if it accepts us, *hold* the
+/// connection (keepalive) — bumping the live count for as long as we keep it.
+fn holdPeer(mgr: *PeerManager, enode: zeth.peer.Enode, priv: [32]u8) void {
+    defer mgr.gpa.free(enode.host); // owned dup handed to this thread
+    const p = dialAndHandshake(mgr.gpa, mgr.io, enode, priv, mgr.network_id, mgr.genesis_hash, mgr.fid) catch return;
+    defer p.destroy();
+    const sid = nodeShort(enode.pubkey);
+    _ = mgr.accepted.fetchAdd(1, .monotonic);
+    const n = mgr.held.fetchAdd(1, .monotonic) + 1;
+    zeth.log.info("peer connected   id={s}… peercount={d}", .{ sid, n });
+    p.keepAlive(mgr.gpa) catch {}; // blocks here, holding the peer, until it drops
+    const m = mgr.held.fetchSub(1, .monotonic) - 1;
+    zeth.log.warn("peer dropped     id={s}… peercount={d}", .{ sid, m });
+}
+
+/// `zeth peers <bootnode-enode> <networkId> <genesisHash> [target] [--key=hex]`
+/// — a persistent peer manager: dial the bootnode (and its discovered neighbours)
+/// each on its own thread, and *hold* every peer that accepts us, logging a live
+/// peercount. Per-peer threads mean a dead node's slow dial blocks only its own
+/// thread, not the manager (a natural workaround for std's missing connect
+/// timeout). Runs a ~30s window so you can watch the count.
 fn peersCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     if (args.len < 3) {
-        std.debug.print("usage: zeth peers <bootnode-enode> <networkId> <genesisHash> [maxPeers]\n", .{});
+        std.debug.print("usage: zeth peers <bootnode-enode> <networkId> <genesisHash> [target] [--key=hex]\n", .{});
         return error.MissingArgument;
     }
     const boot = try zeth.peer.parseEnode(args[0]);
@@ -1088,56 +1138,60 @@ fn peersCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
     var genesis_hash = hex32(args[2]);
     if (network_id == 1 and std.mem.eql(u8, &genesis_hash, &std.mem.zeroes([32]u8)))
         genesis_hash = zeth.forkid.MAINNET_GENESIS_HASH;
-    const max_peers: usize = if (args.len >= 4) (std.fmt.parseInt(usize, args[3], 10) catch 8) else 8;
     const fid = if (network_id == 1) zeth.forkid.mainnet(0, 0) else forkIdFor(network_id, genesis_hash);
 
-    const boot_ip = (net.Ip4Address.parse(boot.host, 0) catch {
-        std.debug.print("bootnode host must be an IPv4 literal\n", .{});
-        return error.InvalidArgument;
-    }).bytes;
-    const priv = zeth.ecies.randomPriv(io);
+    // Optional stable identity for the bootnode dial (so it can trust us).
+    var boot_key = zeth.ecies.randomPriv(io);
+    for (args) |arg| if (std.mem.startsWith(u8, arg, "--key=")) {
+        const hx = arg["--key=".len..];
+        _ = std.fmt.hexToBytes(&boot_key, if (std.mem.startsWith(u8, hx, "0x")) hx[2..] else hx) catch {};
+    };
 
-    var seen = std.AutoHashMap([64]u8, void).init(gpa);
-    defer seen.deinit();
-    var queue: std.ArrayList(zeth.discv4.Node) = .empty;
-    defer queue.deinit(gpa);
-    var seed = zeth.discv4.Node{ .id = boot.pubkey, .ip_len = 4, .udp = boot.port, .tcp = boot.port };
-    @memcpy(seed.ip[0..4], &boot_ip);
-    try queue.append(gpa, seed);
-    try seen.put(boot.pubkey, {});
+    // Per-peer connector threads each allocate, so hand them a thread-safe
+    // allocator (page allocator). Shared state is heap-allocated so it outlives
+    // the detached threads.
+    const a = std.heap.page_allocator;
+    const mgr = try gpa.create(PeerManager);
+    mgr.* = .{ .gpa = a, .io = io, .network_id = network_id, .genesis_hash = genesis_hash, .fid = fid };
 
-    var live: usize = 0;
-    var discovered: usize = 0;
-    var queried: usize = 0;
-    const max_queries: usize = 16;
-    std.debug.print("peer crawl on network {d} — target {d} eth/69 peers …\n", .{ network_id, max_peers });
-    while (queue.items.len > 0 and live < max_peers and queried < max_queries) {
-        const node = queue.orderedRemove(0); // breadth-first
-        queried += 1;
+    zeth.log.info("p2p: starting peer manager network={d} forkid=0x{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ network_id, fid.hash[0], fid.hash[1], fid.hash[2], fid.hash[3] });
 
-        // Ask this node for neighbours; enqueue any we haven't seen.
+    // Connector for the bootnode itself (uses the stable key).
+    {
+        const host = try a.dupe(u8, boot.host);
+        const e = zeth.peer.Enode{ .pubkey = boot.pubkey, .host = host, .port = boot.port };
+        (std.Thread.spawn(.{}, holdPeer, .{ mgr, e, boot_key }) catch unreachable).detach();
+    }
+
+    // Discover neighbours from the bootnode and spawn a connector for each.
+    if (net.Ip4Address.parse(boot.host, 0)) |boot_addr| {
         var target: [64]u8 = undefined;
         io.random(&target);
         var buf: [16]zeth.discv4.Node = undefined;
-        const n = zeth.discv4.bondAndFindNode(gpa, io, priv, node.ip[0..4].*, node.udp, target, &buf) catch 0;
+        const n = zeth.discv4.bondAndFindNode(gpa, io, boot_key, boot_addr.bytes, boot.port, target, &buf) catch 0;
+        zeth.log.info("p2p: discovered {d} candidate(s) from bootnode", .{n});
         for (buf[0..n]) |nb| {
-            if (seen.contains(nb.id)) continue;
-            seen.put(nb.id, {}) catch {};
-            discovered += 1;
-            queue.append(gpa, nb) catch {};
+            if (nb.ip_len != 4 or nb.tcp == 0) continue;
+            var hb: [16]u8 = undefined;
+            const hs = std.fmt.bufPrint(&hb, "{d}.{d}.{d}.{d}", .{ nb.ip[0], nb.ip[1], nb.ip[2], nb.ip[3] }) catch continue;
+            const host = a.dupe(u8, hs) catch continue;
+            const e = zeth.peer.Enode{ .pubkey = nb.id, .host = host, .port = nb.tcp };
+            (std.Thread.spawn(.{}, holdPeer, .{ mgr, e, zeth.ecies.randomPriv(io) }) catch {
+                a.free(host);
+                continue;
+            }).detach();
         }
+    } else |_| {}
 
-        // Try the eth/69 handshake on this node.
-        if (node.ip_len == 4 and node.tcp != 0) {
-            var hostbuf: [16]u8 = undefined;
-            if (std.fmt.bufPrint(&hostbuf, "{d}.{d}.{d}.{d}", .{ node.ip[0], node.ip[1], node.ip[2], node.ip[3] })) |host| {
-                const enode = zeth.peer.Enode{ .pubkey = node.id, .host = host, .port = node.tcp };
-                if (tryHandshake(gpa, io, enode, network_id, genesis_hash, fid) catch false) live += 1;
-            } else |_| {}
-        }
-        std.debug.print("  peercount={d} discovered={d} queried={d} queue={d}\n", .{ live, discovered, queried, queue.items.len });
+    // Watch the held count for a window.
+    var tick: usize = 0;
+    while (tick < 10) : (tick += 1) {
+        io.sleep(std.Io.Duration.fromSeconds(3), .awake) catch {};
+        const held = mgr.held.load(.monotonic);
+        const acc = mgr.accepted.load(.monotonic);
+        zeth.log.info("p2p: peercount={d} accepted_total={d}", .{ held, acc });
     }
-    std.debug.print("\ncrawl done: {d} eth/69 peer(s) held, {d} node(s) discovered across {d} queries\n", .{ live, discovered, queried });
+    zeth.log.info("p2p: manager window elapsed — exiting", .{});
 }
 
 /// `zeth produce <genesis.json> [chain.rlp ...] [--tx=0xRAW ...] [--coinbase=0x..]`
