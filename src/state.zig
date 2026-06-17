@@ -88,6 +88,10 @@ pub const State = struct {
     /// deliberately NOT rolled back on revert (a reverted CREATE still counts,
     /// per the spec edge case) and is cleared at the start of each transaction.
     created_accounts: AddressSet = .{},
+    /// EIP-161 (Spurious Dragon): accounts touched during this transaction.
+    /// At the end of the tx, any touched account that is empty is destroyed.
+    /// Rolls back with snapshots (a touch inside a reverted frame is discarded).
+    touched: AddressSet = .{},
 
     pub fn init(allocator: std.mem.Allocator) State {
         return .{ .allocator = allocator };
@@ -106,6 +110,7 @@ pub const State = struct {
         self.transient.deinit(self.allocator);
         self.original.deinit(self.allocator);
         self.created_accounts.deinit(self.allocator);
+        self.touched.deinit(self.allocator);
     }
 
     /// Reset all transaction-scoped bookkeeping (EIP-2929 access lists, EIP-1153
@@ -117,6 +122,26 @@ pub const State = struct {
         self.transient.clearRetainingCapacity();
         self.original.clearRetainingCapacity();
         self.created_accounts.clearRetainingCapacity();
+        self.touched.clearRetainingCapacity();
+    }
+
+    /// Mark `addr` as touched this transaction (EIP-161). Does not create the
+    /// account; emptiness is checked at tx end by `destroyTouchedEmpty`.
+    pub fn markTouched(self: *State, addr: Address) void {
+        self.touched.put(self.allocator, addr, {}) catch @panic("oom");
+    }
+
+    /// EIP-161 state clearing: remove every touched account that is now empty
+    /// (nonce 0, balance 0, no code). Run at the end of a transaction from
+    /// Spurious Dragon onward.
+    pub fn destroyTouchedEmpty(self: *State) void {
+        var it = self.touched.iterator();
+        while (it.next()) |e| {
+            const addr = e.key_ptr.*;
+            if (self.accounts.get(addr)) |acc| {
+                if (acc.nonce == 0 and acc.balance == 0 and acc.code.len == 0) self.removeAccount(addr);
+            }
+        }
     }
 
     /// Mark `addr` as created in the current transaction (EIP-6780).
@@ -179,6 +204,7 @@ pub const State = struct {
         copy.accessed_addresses = self.cloneMap(AddressSet, self.accessed_addresses);
         copy.accessed_storage_keys = self.cloneMap(StorageKeySet, self.accessed_storage_keys);
         copy.transient = self.cloneMap(StorageKeyMap, self.transient);
+        copy.touched = self.cloneMap(AddressSet, self.touched);
         return copy;
     }
 
@@ -196,9 +222,13 @@ pub const State = struct {
         self.transient.deinit(self.allocator);
         self.transient = snapshot.transient;
         snapshot.transient = .{};
+        self.touched.deinit(self.allocator);
+        self.touched = snapshot.touched;
+        snapshot.touched = .{};
     }
 
     fn getOrCreate(self: *State, addr: Address) !*Account {
+        self.touched.put(self.allocator, addr, {}) catch @panic("oom");
         const gop = try self.accounts.getOrPut(self.allocator, addr);
         if (!gop.found_existing) gop.value_ptr.* = .{};
         return gop.value_ptr;

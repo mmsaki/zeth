@@ -559,7 +559,7 @@ fn applyBlock(a: std.mem.Allocator, st: *zeth.State, block: std.json.ObjectMap, 
         systemCall(a, st, &env, "0x0000BBdDc7CE488642fb579F8B00f3a590007251", &.{}); // EIP-7251
     }
 
-    const got = zeth.trie.stateRoot(a, st, g_fork.atLeast(.spurious_dragon));
+    const got = zeth.trie.stateRoot(a, st, false);
     var want: [32]u8 = undefined;
     const sr = jstr(header, "stateRoot") orelse return false;
     _ = std.fmt.hexToBytes(&want, sr[2..]) catch {};
@@ -610,7 +610,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
     if (jobj(obj, "genesisBlockHeader")) |gh| {
         appendHash(&block_hashes, a, gh);
         if (jstr(gh, "stateRoot")) |sr| {
-            const got = zeth.trie.stateRoot(a, &st, g_fork.atLeast(.spurious_dragon));
+            const got = zeth.trie.stateRoot(a, &st, false);
             var want: [32]u8 = undefined;
             _ = std.fmt.hexToBytes(&want, sr[2..]) catch {};
             if (!std.mem.eql(u8, &got, &want)) {
