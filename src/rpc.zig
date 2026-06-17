@@ -11,6 +11,7 @@ const vm = @import("vm.zig");
 const transaction = @import("transaction.zig");
 const crypto = @import("crypto.zig");
 const rlp = @import("rlp.zig");
+const trie = @import("trie.zig");
 const Address = state_mod.Address;
 
 const CLIENT_VERSION = "zeth/0.1.0-dev";
@@ -367,6 +368,57 @@ fn strParam(params: []const std.json.Value, i: usize) ?[]const u8 {
 }
 
 /// Dispatch a single request object.
+/// Render a list of RLP-encoded MPT nodes as a JSON array of 0x-hex strings.
+fn proofArray(a: std.mem.Allocator, nodes: []const []const u8) []const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    buf.append(a, '[') catch @panic("oom");
+    for (nodes, 0..) |n, i| {
+        if (i != 0) buf.append(a, ',') catch @panic("oom");
+        p(a, &buf, "\"{s}\"", .{dataHex(a, n)});
+    }
+    buf.append(a, ']') catch @panic("oom");
+    return buf.toOwnedSlice(a) catch @panic("oom");
+}
+
+/// EIP-1186 `eth_getProof`: account + storage Merkle proofs against the head
+/// state. Works for present and absent accounts/slots (exclusion proofs).
+fn getProof(a: std.mem.Allocator, c: *chain_mod.Chain, addr: Address, keys: []const std.json.Value) []const u8 {
+    const prune = c.schedule.forkAt(c.head.number, c.head.timestamp).atLeast(.spurious_dragon);
+    const acct_proof = trie.accountProof(a, c.state, prune, addr);
+    const acc = c.state.accounts.getPtr(addr);
+    const nonce: u64 = if (acc) |x| x.nonce else 0;
+    const balance: u256 = if (acc) |x| x.balance else 0;
+    const code: []const u8 = if (acc) |x| x.code else &.{};
+    const code_hash = crypto.keccak256(code);
+    const storage_root: [32]u8 = if (acc) |x| trie.storageRoot(a, x.storage) else trie.EMPTY_TRIE_ROOT;
+
+    var sp: std.ArrayList(u8) = .empty;
+    sp.append(a, '[') catch @panic("oom");
+    for (keys, 0..) |kv, i| {
+        if (kv != .string) continue;
+        const key = parseU256(kv.string);
+        const value = c.state.getStorage(addr, key);
+        const nodes = if (acc) |x| trie.storageProof(a, x.storage, key) else &[_][]const u8{};
+        var kb: [32]u8 = undefined;
+        std.mem.writeInt(u256, &kb, key, .big);
+        if (i != 0) sp.append(a, ',') catch @panic("oom");
+        p(a, &sp, "{{\"key\":\"{s}\",\"value\":\"{s}\",\"proof\":{s}}}", .{ hash32Hex(a, kb), qHex(a, value), proofArray(a, nodes) });
+    }
+    sp.append(a, ']') catch @panic("oom");
+
+    var buf: std.ArrayList(u8) = .empty;
+    p(a, &buf, "{{\"address\":\"{s}\",\"accountProof\":{s},\"balance\":\"{s}\",\"codeHash\":\"{s}\",\"nonce\":\"{s}\",\"storageHash\":\"{s}\",\"storageProof\":{s}}}", .{
+        dataHex(a, &addr),
+        proofArray(a, acct_proof),
+        qHex(a, balance),
+        hash32Hex(a, code_hash),
+        qHex(a, nonce),
+        hash32Hex(a, storage_root),
+        sp.toOwnedSlice(a) catch @panic("oom"),
+    });
+    return buf.toOwnedSlice(a) catch @panic("oom");
+}
+
 fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []const u8 {
     if (v != .object) return err(a, null, -32600, "invalid request");
     const obj = v.object;
@@ -425,6 +477,10 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
         var word: [32]u8 = undefined;
         std.mem.writeInt(u256, &word, c.state.getStorage(addr, key), .big);
         return okStr(a, id, hash32Hex(a, word));
+    }
+    if (std.mem.eql(u8, method, "eth_getProof")) {
+        const addr = parseAddr(strParam(params, 0) orelse return err(a, id, -32602, "invalid params")) orelse return err(a, id, -32602, "invalid address");
+        return ok(a, id, getProof(a, c, addr, if (params.len > 1 and params[1] == .array) params[1].array.items else &.{}));
     }
 
     if (std.mem.eql(u8, method, "eth_getTransactionByHash")) {
