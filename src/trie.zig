@@ -495,6 +495,7 @@ pub const RangeError = error{ RangeInvalid, RangeUnsupported };
 pub fn verifyRangeProof(
     a: std.mem.Allocator,
     root: [32]u8,
+    origin: [32]u8,
     keys: []const [32]u8,
     values: []const []const u8,
     proof: []const []const u8,
@@ -515,14 +516,19 @@ pub fn verifyRangeProof(
         return std.mem.eql(u8, &got, &root);
     }
 
-    // Case 2 — single key: a degenerate range is just an inclusion proof.
-    if (keys.len == 1) {
+    // Case 2 — single key whose left boundary is itself: a degenerate range is
+    // just an inclusion proof. (When `origin` is strictly to the left — snap's
+    // usual exclusion boundary — fall through to the bounded reconstruction.)
+    if (keys.len == 1 and std.mem.eql(u8, &origin, &keys[0])) {
         const got = verifyProof(a, root, proof, bytesToNibbles(a, keys[0][0..]));
         return if (got) |val| std.mem.eql(u8, val, values[0]) else error.RangeInvalid;
     }
 
     // General bounded case — sparse-trie reconstruction (geth VerifyRangeProof).
-    const first = bytesToNibblesTerm(a, keys[0][0..], false); // hex path (no terminator)
+    // The LEFT edge is the requested `origin` (usually an exclusion boundary,
+    // i.e. lastKey+1 from the prior chunk, not an actual key); the RIGHT edge is
+    // the last returned key.
+    const first = bytesToNibblesTerm(a, origin[0..], false); // hex path (no terminator)
     const last = bytesToNibblesTerm(a, keys[keys.len - 1][0..], false);
 
     // Index proof nodes by hash, then reconstruct the two edge paths.
@@ -853,13 +859,13 @@ test "range proof: empty proof rebuilds the whole trie" {
     for (0..4) |j| pairs[j] = .{ .key = keys[j][0..], .value = vals[j] };
     const root = computeRoot(al, pairs, false);
 
-    try testing.expect(try verifyRangeProof(al, root, keys[0..], vals[0..], &.{}));
+    try testing.expect(try verifyRangeProof(al, root, keys[0], keys[0..], vals[0..], &.{}));
     // Tampering any value must be caught.
     vals[1] = "tampered-body";
-    try testing.expect(!try verifyRangeProof(al, root, keys[0..], vals[0..], &.{}));
+    try testing.expect(!try verifyRangeProof(al, root, keys[0], keys[0..], vals[0..], &.{}));
     // Unsorted keys are rejected outright.
     const swapped = [_][32]u8{ keys[1], keys[0], keys[2], keys[3] };
-    try testing.expectError(error.RangeInvalid, verifyRangeProof(al, root, swapped[0..], vals[0..], &.{}));
+    try testing.expectError(error.RangeInvalid, verifyRangeProof(al, root, swapped[0], swapped[0..], vals[0..], &.{}));
 }
 
 test "range proof: single key equals an inclusion proof" {
@@ -880,10 +886,10 @@ test "range proof: single key equals an inclusion proof" {
     const root = computeRoot(al, pairs, false);
 
     const proof = proveKey(al, pairs, false, keys[1][0..]);
-    try testing.expect(try verifyRangeProof(al, root, keys[1..2], vals[1..2], proof));
+    try testing.expect(try verifyRangeProof(al, root, keys[1], keys[1..2], vals[1..2], proof));
     // Wrong value for the proven key → not verified.
     const badv = [_][]const u8{"wrong-value"};
-    try testing.expect(!try verifyRangeProof(al, root, keys[1..2], badv[0..], proof));
+    try testing.expect(!try verifyRangeProof(al, root, keys[1], keys[1..2], badv[0..], proof));
 }
 
 test "range proof: bounded range verifies and rejects tampering + gaps" {
@@ -913,14 +919,14 @@ test "range proof: bounded range verifies and rejects tampering + gaps" {
     for (proveKey(al, pairs, false, keys[hi][0..])) |n| proof.append(al, n) catch unreachable;
 
     // Honest range → verifies.
-    try testing.expect(try verifyRangeProof(al, root, keys[lo .. hi + 1], vals[lo .. hi + 1], proof.items));
+    try testing.expect(try verifyRangeProof(al, root, keys[lo], keys[lo .. hi + 1], vals[lo .. hi + 1], proof.items));
     // Tampered interior value → rejected.
     const tampered = [_][]const u8{ vals[2], "tampered-body", vals[4], vals[5] };
-    try testing.expect(!try verifyRangeProof(al, root, keys[lo .. hi + 1], tampered[0..], proof.items));
+    try testing.expect(!try verifyRangeProof(al, root, keys[lo], keys[lo .. hi + 1], tampered[0..], proof.items));
     // Missing interior leaf (a gap the peer tried to hide) → rejected.
     const gapKeys = [_][32]u8{ keys[2], keys[4], keys[5] };
     const gapVals = [_][]const u8{ vals[2], vals[4], vals[5] };
-    try testing.expect(!try verifyRangeProof(al, root, gapKeys[0..], gapVals[0..], proof.items));
+    try testing.expect(!try verifyRangeProof(al, root, gapKeys[0], gapKeys[0..], gapVals[0..], proof.items));
 }
 
 test "proof verifies for included and excluded secured keys" {
