@@ -19,6 +19,7 @@ execution-apis
 ethereum-package-kurtosis
 mev-boost
 devp2p
+rbuilder
 
 # Python
 __pycache__/
@@ -33,3 +34,4 @@ zig-out-linux/
 eest-fixtures/
 
 .agents/
+.claude/

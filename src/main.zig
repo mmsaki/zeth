@@ -48,6 +48,10 @@ fn dispatch(ctx: *MainCtx) void {
         importChain(ctx.gpa, ctx.io, args[2..]) catch |e| {
             ctx.err = e;
         };
+    } else if (std.mem.eql(u8, cmd, "produce")) {
+        produceCmd(ctx.gpa, ctx.io, args[2..]) catch |e| {
+            ctx.err = e;
+        };
     } else if (std.mem.eql(u8, cmd, "node")) {
         nodeServe(ctx.gpa, ctx.io, args[2..]) catch |e| {
             ctx.err = e;
@@ -932,6 +936,102 @@ fn importChain(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !vo
     std.debug.print("imported {d} block(s); head: number={d} hash=0x{s} stateRoot=0x{s}\n", .{
         imported, ch.head.number, std.fmt.bytesToHex(&head_hash, .lower), std.fmt.bytesToHex(&ch.head.state_root, .lower),
     });
+}
+
+/// `zeth produce <genesis.json> [chain.rlp ...] [--tx=0xRAW ...] [--coinbase=0x..]`
+/// — load genesis, import the given blocks to establish a head, then BUILD the
+/// next block (the proposer/producer path): pool the supplied raw txs, select a
+/// gas-bounded nonce-ordered batch, run the block-start system calls, and compute
+/// the header. The produced block is self-validated by importing it back into the
+/// same chain — re-execution checks every root, so a clean import proves the
+/// producer and the importer agree bit-for-bit.
+fn produceCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (args.len < 1) {
+        std.debug.print("usage: zeth produce <genesis.json> [chain.rlp ...] [--tx=0xRAW ...] [--coinbase=0xADDR]\n", .{});
+        return error.MissingArgument;
+    }
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var coinbase = std.mem.zeroes([20]u8);
+    coinbase[19] = 0xee; // default fee recipient (nonzero, distinct)
+    var raw_txs: std.ArrayList([]const u8) = .empty;
+    var positionals: std.ArrayList([]const u8) = .empty;
+    for (args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--tx=")) {
+            const hx = arg["--tx=".len..];
+            const h = if (std.mem.startsWith(u8, hx, "0x")) hx[2..] else hx;
+            const buf = try a.alloc(u8, h.len / 2);
+            _ = std.fmt.hexToBytes(buf, h) catch {
+                std.debug.print("bad --tx hex\n", .{});
+                return error.InvalidArgument;
+            };
+            try raw_txs.append(a, buf);
+        } else if (std.mem.startsWith(u8, arg, "--coinbase=")) {
+            const hx = arg["--coinbase=".len..];
+            const h = if (std.mem.startsWith(u8, hx, "0x")) hx[2..] else hx;
+            _ = std.fmt.hexToBytes(&coinbase, h) catch {};
+        } else {
+            try positionals.append(a, arg);
+        }
+    }
+
+    // Genesis → world state + genesis header, then import any blocks to a head.
+    const gjson = try readFile(gpa, io, positionals.items[0]);
+    defer gpa.free(gjson);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, gjson, .{});
+    defer parsed.deinit();
+    var st = zeth.State.init(gpa);
+    defer st.deinit();
+    const g = try zeth.genesis.load(a, &st, parsed.value);
+    var ch = try zeth.chain.Chain.initGenesis(gpa, &st, g);
+    defer ch.deinit();
+    for (positionals.items[1..]) |path| {
+        const data = try readFile(gpa, io, path);
+        defer gpa.free(data);
+        var off: usize = 0;
+        while (off < data.len) {
+            const r = try zeth.rlp.decodeItem(a, data[off..]);
+            _ = try ch.importBlock(data[off .. off + r.consumed]);
+            off += r.consumed;
+        }
+    }
+
+    // Pool the raw txs (the Chain's pool, the same one eth_sendRawTransaction
+    // feeds) and select a batch ready on top of the current head.
+    for (raw_txs.items) |rt| ch.txpool.add(rt) catch |e| {
+        std.debug.print("  skipped a tx (decode/validate): {s}\n", .{@errorName(e)});
+    };
+    const next_fork = ch.schedule.forkAt(ch.head.number + 1, ch.head.timestamp + 12);
+    const base_fee: u256 = if (next_fork.atLeast(.london)) (ch.head.base_fee_per_gas orelse 1_000_000_000) else 0;
+    const batch = try ch.txpool.select(a, ch.state, ch.head.gas_limit, base_fee);
+
+    // Build the next block (proposer/producer path).
+    const attrs = zeth.chain.Chain.ProduceAttrs{
+        .timestamp = ch.head.timestamp + 12,
+        .fee_recipient = coinbase,
+        .parent_beacon_block_root = if (next_fork.atLeast(.cancun)) std.mem.zeroes([32]u8) else null,
+    };
+    const blk = try ch.produceBlock(a, attrs, batch);
+    const ph = try ch.head.hash(gpa);
+    std.debug.print("built block {d} on parent 0x{s}\n", .{ blk.header.number, std.fmt.bytesToHex(&ph, .lower) });
+    std.debug.print("  txs={d} gasUsed={d} stateRoot=0x{s} txRoot=0x{s} receiptsRoot=0x{s}\n", .{
+        blk.transactions.len, blk.header.gas_used,
+        std.fmt.bytesToHex(&blk.header.state_root, .lower),
+        std.fmt.bytesToHex(&blk.header.transactions_root, .lower),
+        std.fmt.bytesToHex(&blk.header.receipts_root, .lower),
+    });
+
+    // Self-validate: import the produced block back. produceBlock ran on a clone,
+    // so the head is unchanged; importDecoded re-executes against real state and
+    // checks every root — a clean return means the block is internally valid.
+    const h = ch.importDecoded(a, blk) catch |e| {
+        std.debug.print("SELF-VALIDATION FAILED: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    const bh = try h.hash(gpa);
+    std.debug.print("self-validated ✓  head now block {d} hash=0x{s}\n", .{ h.number, std.fmt.bytesToHex(&bh, .lower) });
 }
 
 /// `zeth node <genesis.json> [chain.rlp ...] [--http.addr=HOST:PORT]` — load

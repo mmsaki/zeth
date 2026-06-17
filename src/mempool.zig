@@ -129,42 +129,9 @@ pub const Mempool = struct {
 
 // ── tests ───────────────────────────────────────────────────────────────────
 const testing = std.testing;
-const secp = @import("secp.zig");
 const ecies = @import("ecies.zig");
-const rlp = @import("rlp.zig");
 const crypto = @import("crypto.zig");
-
-/// Build a signed legacy tx (chainId 1, EIP-155) for the pool tests.
-fn signedLegacyTx(a: std.mem.Allocator, io: std.Io, priv: [32]u8, nonce: u64, gas_price: u64, gas_limit: u64, to: Address, value: u64) ![]u8 {
-    const chain_id: u64 = 1;
-    var items: std.ArrayList([]const u8) = .empty;
-    try items.append(a, try rlp.encodeUint(a, nonce));
-    try items.append(a, try rlp.encodeUint(a, gas_price));
-    try items.append(a, try rlp.encodeUint(a, gas_limit));
-    try items.append(a, try rlp.encodeBytes(a, &to));
-    try items.append(a, try rlp.encodeUint(a, value));
-    try items.append(a, try rlp.encodeBytes(a, &.{}));
-    // EIP-155 signing payload: [..fields.., chainId, 0, 0]
-    try items.append(a, try rlp.encodeUint(a, chain_id));
-    try items.append(a, try rlp.encodeBytes(a, &.{}));
-    try items.append(a, try rlp.encodeBytes(a, &.{}));
-    const sig_payload = try rlp.encodeList(a, items.items);
-    const sig = secp.sign(io, crypto.keccak256(sig_payload), priv);
-    const v = @as(u64, sig.v) + 35 + chain_id * 2;
-    // Final tx: [nonce, gasPrice, gas, to, value, data, v, r, s]
-    var f: std.ArrayList([]const u8) = .empty;
-    for (items.items[0..6]) |it| try f.append(a, it);
-    try f.append(a, try rlp.encodeUint(a, v));
-    try f.append(a, try rlp.encodeBytes(a, trimZeros(&sig.r)));
-    try f.append(a, try rlp.encodeBytes(a, trimZeros(&sig.s)));
-    return rlp.encodeList(a, f.items);
-}
-
-fn trimZeros(b: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < b.len and b[i] == 0) i += 1;
-    return b[i..];
-}
+const testsign = @import("testsign.zig");
 
 test "mempool add/replace-by-fee + nonce-ordered selection" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -185,11 +152,11 @@ test "mempool add/replace-by-fee + nonce-ordered selection" {
     const to = std.mem.zeroes(Address);
 
     // Two txs from one sender, nonces 0 and 1 (added out of order).
-    try pool.add(try signedLegacyTx(a, io, priv, 1, 10, 21000, to, 0));
-    try pool.add(try signedLegacyTx(a, io, priv, 0, 10, 21000, to, 0));
+    try pool.add(try testsign.signLegacy(a, io, priv, 1, 1, 10, 21000, to, 0));
+    try pool.add(try testsign.signLegacy(a, io, priv, 1, 0, 10, 21000, to, 0));
     try testing.expectEqual(@as(usize, 2), pool.count());
     // Replace-by-fee: same nonce 0, higher price → replaces (count unchanged).
-    try pool.add(try signedLegacyTx(a, io, priv, 0, 50, 21000, to, 0));
+    try pool.add(try testsign.signLegacy(a, io, priv, 1, 0, 50, 21000, to, 0));
     try testing.expectEqual(@as(usize, 2), pool.count());
 
     var st = state_mod.State.init(testing.allocator);

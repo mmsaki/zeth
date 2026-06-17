@@ -1025,7 +1025,10 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
     if (std.mem.eql(u8, method, "eth_sendRawTransaction")) {
         const raw = hexBytes(a, strParam(params, 0) orelse return err(a, id, -32602, "invalid params"));
         if (raw.len == 0) return err(a, id, -32602, "invalid transaction");
-        return okStr(a, id, hash32Hex(a, rawTxHash(a, raw)));
+        const hash = rawTxHash(a, raw);
+        // Admit to the pending pool (the producer draws on it); reject undecodable txs.
+        c.txpool.add(raw) catch return err(a, id, -32000, "invalid transaction");
+        return okStr(a, id, hash32Hex(a, hash));
     }
     if (std.mem.eql(u8, method, "eth_createAccessList")) {
         if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
@@ -1485,6 +1488,51 @@ pub fn handleBody(a: std.mem.Allocator, c: *chain_mod.Chain, body: []const u8) [
 
 // ── tests ───────────────────────────────────────────────────────────────────
 const testing = std.testing;
+const genesis_mod = @import("genesis.zig");
+const ecies = @import("ecies.zig");
+const testsign = @import("testsign.zig");
+
+test "eth_sendRawTransaction admits the tx to the pending pool" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Minimal post-Merge genesis funding a freshly generated sender.
+    const priv = ecies.randomPriv(io);
+    const pk = try ecies.pubFromPriv(priv);
+    const sh = crypto.keccak256(&pk);
+    var addr_hex: [40]u8 = undefined;
+    for (sh[12..32], 0..) |byte, i| _ = std.fmt.bufPrint(addr_hex[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable;
+    const gjson = try std.fmt.allocPrint(a,
+        \\{{"config":{{"chainId":1,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"mergeNetsplitBlock":0,"terminalTotalDifficulty":0,"shanghaiTime":0}},
+        \\"gasLimit":"0x1000000","difficulty":"0x0","timestamp":"0x0",
+        \\"alloc":{{"{s}":{{"balance":"0xde0b6b3a7640000"}}}}}}
+    , .{addr_hex});
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, gjson, .{});
+    defer parsed.deinit();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    const g = try genesis_mod.load(a, &st, parsed.value);
+    var ch = try chain_mod.Chain.initGenesis(testing.allocator, &st, g);
+    defer ch.deinit();
+
+    var to = std.mem.zeroes(state_mod.Address);
+    to[19] = 0x42;
+    const raw = try testsign.signLegacy(a, io, priv, 1, 0, 2_000_000_000, 21000, to, 1000);
+    var raw_hex = std.ArrayList(u8).empty;
+    try raw_hex.appendSlice(a, "0x");
+    for (raw) |byte| try raw_hex.print(a, "{x:0>2}", .{byte});
+    const body = try std.fmt.allocPrint(a,
+        \\{{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["{s}"]}}
+    , .{raw_hex.items});
+
+    const resp = handleBody(a, &ch, body);
+    try testing.expect(std.mem.indexOf(u8, resp, "\"result\"") != null); // hash returned
+    try testing.expectEqual(@as(usize, 1), ch.txpool.count()); // and it's pending
+}
 
 test "rawTxHash matches sendRawTransaction fixtures (legacy/2930/1559)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
