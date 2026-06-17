@@ -9,47 +9,41 @@
 
 ## What works today (and is tested)
 
-| Area | Status | Evidence |
-|---|---|---|
-| **EVM** (Frontier→Prague + Osaka opcodes) | ✅ solid | EEST through Prague; `ethereum-tests` BlockchainTests green |
-| Precompiles incl. bn254, **BLS12-381**, **KZG** | ✅ | conformance suites |
-| EIP-7702 set-code, EIP-7685 requests, EIP-4844 blobs | ✅ | EEST Prague suites |
-| **EIP-7825** tx gas-limit cap (Osaka/Fusaka) | ✅ | EEST Osaka `eip7825…` blockchain 5/5 + state 5/5 |
-| **Block import** (state/tx/receipt/bloom roots, gas) | ✅ | `chain.importDecoded` + conformance; full Frontier→Prague chain, head matches geth |
-| **Mempool** (replace-by-fee, nonce-ordered selection) | ✅ | `src/mempool.zig`; `eth_sendRawTransaction` admits to the pool |
-| **Block producer** (build + self-validate next block) | ✅ | `chain.produceBlock`; `zeth produce` re-imports the built block, every root re-checked |
-| **JSON-RPC** (`eth_*`, `debug_*` traces) | ✅ usable | hive `rpc-compat` |
-| **Engine API** incl. **block building** | ✅ | `newPayload` / `forkchoiceUpdated(attrs)→payloadId` / `getPayload`; round-trips VALID |
-| **Persistence** (`--datadir`: snapshot + resume) | ✅ | round-trips genesis state across restart |
-| **devp2p transport** (ECIES, RLPx, eth/69, snap/1) | ✅ vs geth | [kurtosis.md](./kurtosis.md) |
-| **EIP-2124 forkid** (real mainnet schedule) | ✅ | verified vs canonical EIP-2124 vectors; accepted by live mainnet geth |
-| **Live mainnet handshake + holds a peer** | ✅ | dials mainnet geth, eth/69 Status accepted, `zeth peers` holds peercount=1 |
-| **discovery v4** + discovery crawl | ✅ basic | signed ping/pong/findnode/neighbors; `zeth peers` crawls + holds |
-| **snap/1 state-range download** | ✅ basic | `snap/1` codec; full devnet state downloaded + root-checked from geth |
-| **P2P full sync** (headers→bodies→execute→validate) | ✅ basic | `zeth sync` synced from geth; head hash matched exactly |
+- [x] **EVM** (Frontier→Prague + Osaka opcodes) — conformance-tested via EEST and `ethereum-tests`
+- [x] **Precompiles** incl. bn254, BLS12-381, KZG
+- [x] **EIP-7702** set-code, **EIP-7685** requests, **EIP-4844** blobs
+- [x] **EIP-7825** transaction gas-limit cap (Osaka/Fusaka)
+- [x] **Block import** — state/tx/receipt/bloom roots + gas; imports the full Frontier→Prague chain, head matching geth
+- [x] **Mempool** — replace-by-fee, nonce-ordered selection; `eth_sendRawTransaction` admits to the pool
+- [x] **Block producer** — builds and self-validates the next block (`zeth produce` re-imports it, every root re-checked)
+- [x] **JSON-RPC** — `eth_*`, `debug_*` traces
+- [x] **Engine API** incl. block building — `newPayload` / `forkchoiceUpdated(attrs)→payloadId` / `getPayload`
+- [x] **Persistence** — `--datadir` snapshot + resume across restart
+- [x] **devp2p transport** — ECIES, RLPx, eth/69, snap/1 (validated against geth)
+- [x] **EIP-2124 forkid** — real mainnet schedule; accepted by live mainnet geth
+- [x] **Live mainnet handshake + holds a peer** — dials mainnet geth, eth/69 Status accepted, connection held
+- [x] **discovery v4** — signed ping/pong/findnode/neighbors + a discovery crawl
+- [x] **snap/1 state-range download** — verified against a devnet geth
+- [x] **P2P full sync** — headers→bodies→execute→validate from a peer
+
+See [kurtosis.md](./kurtosis.md) for the networking surfaces and [hive.md](./hive.md)
+for the conformance harness.
 
 ## What is NOT ready (required before mainnet)
 
-- **Full mainnet sync at tip.** zeth has snap-downloaded a *devnet's* state and
-  full-synced small chains from a single peer, but has not completed a full mainnet
-  sync (~25M blocks / hundreds of GB of state). The snap range-proof verifier passes
-  on synthetic proofs but **fails on real geth bounded proofs** — an open bug.
-- **Robust multi-peer sync.** Single-peer sync + a peer *holder* exist, but not a
-  peer *set* that syncs in parallel, scores peers, and recovers from mid-sync drops.
-- **Inbound p2p.** zeth dials out and holds peers, but does not yet *listen* for
-  inbound connections (no stable node identity / listener), so other clients can't
-  dial it (see `hive-client/enode.sh`).
-- **Persistent discovery table.** `zeth peers` runs a bounded findnode crawl; there's
-  no long-lived Kademlia routing table / continuous bootstrap. Discovery v5 (encrypted
-  / ENR / topic) is not started.
-- **Tx gossip & block propagation.** A mempool exists, but txs/blocks are not gossiped
-  to peers (no `NewPooledTransactionHashes` / block announcement flow).
-- **Reorgs / deep fork choice.** No reorg handling beyond linear import.
-- **Robustness / DoS hardening.** The EVM maps call depth onto native recursion (run on
-  a large-stack thread as a workaround, not an iterative interpreter); adversarial-input
-  fuzzing and resource limits are not done. Not safe to expose to untrusted peers at scale.
-- **Pre-Berlin historical gas schedules** are incomplete — irrelevant for mainnet
-  (post-merge) but worth knowing.
+- [ ] **Full mainnet sync at tip** — only devnet state + small single-peer chains so far;
+  the snap range-proof verifier still fails on real geth bounded proofs.
+- [ ] **Robust multi-peer sync** — a peer *set* that syncs in parallel, scores peers, and
+  recovers from mid-sync drops (today: single-peer sync + a peer holder).
+- [ ] **Inbound p2p** — zeth dials out and holds peers but does not yet *listen* for
+  inbound connections (no stable node identity / listener).
+- [ ] **Persistent discovery** — a long-lived routing table + continuous bootstrap
+  (today: a bounded crawl). Discovery v5 / ENR not started.
+- [ ] **Tx + block gossip** — propagate pool txs and new blocks to peers.
+- [ ] **Reorgs / deep fork choice** — beyond linear import.
+- [ ] **Robustness / DoS hardening** — iterative EVM (drop the large-stack workaround),
+  input fuzzing, resource limits.
+- [ ] **Pre-Berlin historical gas schedules** — incomplete (irrelevant for post-merge mainnet).
 
 ## Where you *can* use it today
 

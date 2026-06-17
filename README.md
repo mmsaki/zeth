@@ -8,15 +8,15 @@ so correctness comes from the spec, not from copying another client.
 
 It already:
 
-- ✅ **Passes the official tests** — the EF trie tests (25/25) and the Execution Spec
-  Tests across every fork **Frontier → Prague** (plus Osaka/Fusaka EIPs). Imports the
-  full historical chain with the head hash matching geth **exactly**.
-- ✅ **Builds blocks** — a mempool + producer that assembles the next block and
+- [x] **Passes the official tests** — the EF trie tests and the Execution Spec Tests
+  across every fork **Frontier → Prague** (plus Osaka/Fusaka EIPs). Imports the full
+  historical chain with the head hash matching geth **exactly**.
+- [x] **Builds blocks** — a mempool + producer that assembles the next block and
   **self-validates** it (re-imports and re-checks every root), wired to the Engine API
   (`forkchoiceUpdated → getPayload`).
-- ✅ **Talks to mainnet** — RLPx, eth/69, snap/1, discovery v4, and the real EIP-2124
+- [x] **Talks to mainnet** — RLPx, eth/69, snap/1, discovery v4, and the real EIP-2124
   forkid. zeth handshakes **live mainnet geth** and **holds the peer**.
-- ✅ **Is fast** — pure EVM dispatch at **~680 Mgas/s**; a built-in `Mgas/s` benchmark to
+- [x] **Built for speed** — a no-GC interpreter with built-in `Mgas/s` benchmarks to
   race it against geth and reth.
 
 > ⚠️ Honest status: zeth is a **conformance-grade EVM and a devnet/testnet node** — not
@@ -33,13 +33,13 @@ zig build -Doptimize=ReleaseFast       # needs Zig 0.17.0-dev.702 (pinned)
 ./zig-out/bin/zeth run 6006600701
 
 # How fast is the interpreter?
-./zig-out/bin/zeth bench-evm           # → ~680 Mgas/s, ns/op
+./zig-out/bin/zeth bench-evm           # → Mgas/s + ns/op
 
 # Build a real block from a signed transaction and prove it's valid:
 ./zig-out/bin/zeth produce genesis.json --tx=0x… # → "self-validated ✓ head now block 1"
 
 # Dial and hold a live mainnet peer (discovery + eth/69 handshake):
-./zig-out/bin/zeth peers <enode://…> 1 <genesisHash>   # → peercount=1 …
+./zig-out/bin/zeth peers <enode://…> 1 <genesisHash>   # → holds peers, logs a live peercount
 ```
 
 ## Prove it — run the tests
