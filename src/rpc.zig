@@ -442,6 +442,109 @@ fn rawTxHash(a: std.mem.Allocator, raw: []const u8) [32]u8 {
     return crypto.keccak256(raw);
 }
 
+/// True for a precompile address (0x00…01 … 0x00…14): 19 zero bytes then a
+/// small index. These are always warm and never listed in an access list.
+fn isPrecompile(addr: Address) bool {
+    for (addr[0..19]) |b| if (b != 0) return false;
+    return addr[19] >= 1 and addr[19] <= 0x14;
+}
+
+/// eth_createAccessList: run the call, collect the EIP-2929 addresses/slots it
+/// touched (excluding the sender, precompiles, and the implicitly-warm
+/// from/to/coinbase when they carry no storage), and report gasUsed (intrinsic
+/// + execution) and any execution error.
+fn createAccessList(a: std.mem.Allocator, c: *chain_mod.Chain, call: std.json.ObjectMap) []const u8 {
+    const from = if (jstr(call, "from")) |f| (parseAddr(f) orelse state_mod.zero_address) else state_mod.zero_address;
+    const to = if (jstr(call, "to")) |t| (parseAddr(t) orelse state_mod.zero_address) else state_mod.zero_address;
+    const data = if (jstr(call, "data") orelse jstr(call, "input")) |d| hexBytes(a, d) else &.{};
+    const value = if (jstr(call, "value")) |v| parseU256(v) else 0;
+
+    var zero: u64 = 0;
+    var nz: u64 = 0;
+    for (data) |b| if (b == 0) {
+        zero += 1;
+    } else {
+        nz += 1;
+    };
+    const is_create = jstr(call, "to") == null;
+    const intrinsic: u64 = 21000 + zero * 4 + nz * 16 + (if (is_create) @as(u64, 32000) else 0);
+    const msg_gas: u64 = if (c.head.gas_limit > intrinsic) c.head.gas_limit - intrinsic else 0;
+
+    var st = c.state.clone() catch return "{\"accessList\":[],\"gasUsed\":\"0x0\"}";
+    defer st.deinit();
+    st.beginTx();
+    var env = headEnv(c);
+    env.origin = from;
+    var evm = vm.processMessage(a, &st, &env, .{
+        .caller = from,
+        .current_target = to,
+        .code_address = to,
+        .code = st.codeOf(to),
+        .data = data,
+        .gas = msg_gas,
+        .value = value,
+    }, null);
+    defer evm.deinit();
+    const reverted = evm.reverted;
+    const failed = evm.halt_error != null;
+    const gas_used = intrinsic + (msg_gas - evm.gas_left);
+
+    // Group accessed storage slots by address.
+    const Entry = struct { addr: Address, keys: std.ArrayList(u256) };
+    var entries: std.ArrayList(Entry) = .empty;
+    const find = struct {
+        fn f(list: *std.ArrayList(Entry), al: std.mem.Allocator, addr: Address) *Entry {
+            for (list.items) |*e| if (std.mem.eql(u8, &e.addr, &addr)) return e;
+            list.append(al, .{ .addr = addr, .keys = .empty }) catch @panic("oom");
+            return &list.items[list.items.len - 1];
+        }
+    }.f;
+
+    var sk = st.accessed_storage_keys.iterator();
+    while (sk.next()) |e| {
+        const addr = e.key_ptr.addr;
+        if (std.mem.eql(u8, &addr, &from) or isPrecompile(addr)) continue;
+        const ent = find(&entries, a, addr);
+        ent.keys.append(a, e.key_ptr.key) catch @panic("oom");
+    }
+    // Address-only accesses (BALANCE/EXTCODE*/CALL): list them too, unless they
+    // are implicitly warm (from/to/coinbase) and carry no storage.
+    var ad = st.accessed_addresses.iterator();
+    while (ad.next()) |e| {
+        const addr = e.key_ptr.*;
+        if (std.mem.eql(u8, &addr, &from) or isPrecompile(addr)) continue;
+        if (std.mem.eql(u8, &addr, &to) or std.mem.eql(u8, &addr, &c.head.coinbase)) continue;
+        _ = find(&entries, a, addr); // ensure present (empty keys ok)
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    buf.appendSlice(a, "{\"accessList\":[") catch @panic("oom");
+    var first = true;
+    for (entries.items) |*e| {
+        // Drop entries with no storage keys that are only implicitly warm.
+        if (e.keys.items.len == 0 and (std.mem.eql(u8, &e.addr, &to) or std.mem.eql(u8, &e.addr, &c.head.coinbase))) continue;
+        std.mem.sort(u256, e.keys.items, {}, std.sort.asc(u256));
+        if (!first) buf.append(a, ',') catch @panic("oom");
+        first = false;
+        p(a, &buf, "{{\"address\":\"{s}\",\"storageKeys\":[", .{dataHex(a, &e.addr)});
+        for (e.keys.items, 0..) |k, i| {
+            if (i != 0) buf.append(a, ',') catch @panic("oom");
+            var kb: [32]u8 = undefined;
+            std.mem.writeInt(u256, &kb, k, .big);
+            p(a, &buf, "\"{s}\"", .{hash32Hex(a, kb)});
+        }
+        buf.appendSlice(a, "]}") catch @panic("oom");
+    }
+    buf.appendSlice(a, "]") catch @panic("oom");
+    if (reverted) {
+        p(a, &buf, ",\"error\":\"execution reverted\"", .{});
+    } else if (failed) {
+        p(a, &buf, ",\"error\":\"{s}\"", .{@errorName(evm.halt_error.?)});
+    }
+    p(a, &buf, ",\"gasUsed\":\"{s}\"}}", .{qHex(a, gas_used)});
+    return buf.toOwnedSlice(a) catch @panic("oom");
+}
+
 /// Method names this node routes — returned by `eth_capabilities` (the
 /// rpc-compat check is schema-only: a JSON array of strings).
 const CAPABILITIES = [_][]const u8{
@@ -500,6 +603,10 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
         const raw = hexBytes(a, strParam(params, 0) orelse return err(a, id, -32602, "invalid params"));
         if (raw.len == 0) return err(a, id, -32602, "invalid transaction");
         return okStr(a, id, hash32Hex(a, rawTxHash(a, raw)));
+    }
+    if (std.mem.eql(u8, method, "eth_createAccessList")) {
+        if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
+        return ok(a, id, createAccessList(a, c, params[0].object));
     }
     if (std.mem.eql(u8, method, "eth_capabilities")) {
         var buf: std.ArrayList(u8) = .empty;
