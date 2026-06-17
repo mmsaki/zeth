@@ -1086,6 +1086,31 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
         const addr = parseAddr(strParam(params, 0) orelse return err(a, id, -32602, "invalid params")) orelse return err(a, id, -32602, "invalid address");
         return ok(a, id, getProof(a, c, addr, if (params.len > 1 and params[1] == .array) params[1].array.items else &.{}));
     }
+    if (std.mem.eql(u8, method, "eth_getStorageValues")) {
+        if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
+        const m = params[0].object;
+        if (m.count() == 0) return err(a, id, -32602, "empty request");
+        var buf: std.ArrayList(u8) = .empty;
+        buf.append(a, '{') catch {};
+        var it = m.iterator();
+        var first = true;
+        while (it.next()) |e| {
+            const addr = parseAddr(e.key_ptr.*) orelse continue;
+            if (!first) buf.append(a, ',') catch {};
+            first = false;
+            p(a, &buf, "\"{s}\":[", .{e.key_ptr.*});
+            if (e.value_ptr.* == .array) for (e.value_ptr.array.items, 0..) |k, i| {
+                if (k != .string) continue;
+                if (i != 0) buf.append(a, ',') catch {};
+                var word: [32]u8 = undefined;
+                std.mem.writeInt(u256, &word, c.state.getStorage(addr, parseU256(k.string)), .big);
+                p(a, &buf, "\"{s}\"", .{hash32Hex(a, word)});
+            };
+            buf.append(a, ']') catch {};
+        }
+        buf.append(a, '}') catch {};
+        return ok(a, id, buf.toOwnedSlice(a) catch return err(a, id, -32603, "oom"));
+    }
 
     if (std.mem.eql(u8, method, "eth_getTransactionByHash")) {
         const h = parseHash(strParam(params, 0) orelse return err(a, id, -32602, "invalid params")) orelse return ok(a, id, "null");
