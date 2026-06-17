@@ -324,7 +324,12 @@ fn snapSync(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
     defer arena.deinit();
     const a = arena.allocator();
 
+    const Contract = struct { hash: [32]u8, storage_root: [32]u8 };
     var pairs: std.ArrayList(zeth.trie.KV) = .empty;
+    var contracts: std.ArrayList(Contract) = .empty;
+    var code_hashes: std.ArrayList([32]u8) = .empty;
+    const empty_root = zeth.trie.EMPTY_TRIE_ROOT;
+    const empty_code = zeth.snap_proto.EMPTY_CODE_HASH;
     var origin = std.mem.zeroes([32]u8);
     const limit: [32]u8 = @splat(0xff);
     var requests: usize = 0;
@@ -339,6 +344,10 @@ fn snapSync(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
             const key = a.dupe(u8, &e.hash) catch return error.OutOfMemory;
             const val = zeth.trie.accountValueRlp(a, e.account.nonce, e.account.balance, e.account.storage_root.?, e.account.code_hash.?);
             try pairs.append(a, .{ .key = key, .value = val });
+            if (!std.mem.eql(u8, &e.account.storage_root.?, &empty_root))
+                try contracts.append(a, .{ .hash = e.hash, .storage_root = e.account.storage_root.? });
+            if (!std.mem.eql(u8, &e.account.code_hash.?, &empty_code))
+                try code_hashes.append(a, e.account.code_hash.?);
         }
         const last = ar.accounts[ar.accounts.len - 1].hash;
         std.debug.print("  ← AccountRange #{d}: {d} accounts (total {d}), last 0x{s}…\n", .{ requests + 1, ar.accounts.len, pairs.items.len, std.fmt.bytesToHex(last[0..6], .lower) });
@@ -353,13 +362,63 @@ fn snapSync(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
     // the keys are already keccak(address), so the trie is unsecured here.
     const got = zeth.trie.computeRoot(a, pairs.items, false);
     const match = std.mem.eql(u8, &got, &root);
-    std.debug.print("\nsnap-sync: {d} accounts in {d} request(s)\n  rebuilt root = 0x{s}\n  pivot  root = 0x{s}\n  {s}\n", .{
+    std.debug.print("\nsnap-sync accounts: {d} in {d} request(s) — {s}\n", .{
         pairs.items.len,
         requests + 1,
-        std.fmt.bytesToHex(&got, .lower),
-        std.fmt.bytesToHex(&root, .lower),
-        if (match) "✓ ROOT MATCHES — account state downloaded and verified" else "✗ root mismatch",
+        if (match) "✓ root matches geth" else "✗ root MISMATCH",
     });
+    if (!match) return;
+
+    // Storage tries: per contract, download its slots and verify the rebuilt
+    // storage root equals the account's storageRoot.
+    var storage_ok: usize = 0;
+    var reqid: u64 = requests + 2;
+    for (contracts.items) |ct| {
+        var sp: std.ArrayList(zeth.trie.KV) = .empty;
+        var sorigin = std.mem.zeroes([32]u8);
+        var done = false;
+        while (!done) {
+            const sreq = try zeth.snap_proto.encodeGetStorageRanges(a, reqid, root, &[_][32]u8{ct.hash}, &sorigin, &limit, 200_000);
+            reqid += 1;
+            try p.writeMessage(SNAP_BASE + zeth.snap_proto.snap.get_storage_ranges, sreq);
+            const sresp = try p.readUntil(gpa, SNAP_BASE + zeth.snap_proto.snap.storage_ranges);
+            defer gpa.free(sresp);
+            const sr = try zeth.snap_proto.decodeStorageRanges(a, sresp);
+            if (sr.slots.len == 0 or sr.slots[0].len == 0) break;
+            const slots = sr.slots[0];
+            for (slots) |s| {
+                const k = a.dupe(u8, &s.hash) catch return error.OutOfMemory;
+                try sp.append(a, .{ .key = k, .value = try a.dupe(u8, s.data) });
+            }
+            const last = slots[slots.len - 1].hash;
+            if (sr.proof.len == 0 or std.mem.eql(u8, &last, &limit)) {
+                done = true;
+            } else {
+                var n = std.mem.readInt(u256, &last, .big);
+                n +%= 1;
+                std.mem.writeInt(u256, &sorigin, n, .big);
+            }
+        }
+        const sroot = zeth.trie.computeRoot(a, sp.items, false);
+        if (std.mem.eql(u8, &sroot, &ct.storage_root)) storage_ok += 1 else std.debug.print("  ✗ storage root mismatch for 0x{s}…\n", .{std.fmt.bytesToHex(ct.hash[0..6], .lower)});
+    }
+    std.debug.print("snap-sync storage: {d}/{d} contract storage tries verified\n", .{ storage_ok, contracts.items.len });
+
+    // Bytecodes: request all code hashes and verify keccak256(code) == hash.
+    var code_ok: usize = 0;
+    if (code_hashes.items.len > 0) {
+        const creq = try zeth.snap_proto.encodeGetByteCodes(a, reqid, code_hashes.items, 4_000_000);
+        try p.writeMessage(SNAP_BASE + zeth.snap_proto.snap.get_byte_codes, creq);
+        const cresp = try p.readUntil(gpa, SNAP_BASE + zeth.snap_proto.snap.byte_codes);
+        defer gpa.free(cresp);
+        const bc = try zeth.snap_proto.decodeByteCodes(a, cresp);
+        for (bc.codes, 0..) |code, i| {
+            if (i >= code_hashes.items.len) break;
+            if (std.mem.eql(u8, &zeth.crypto.keccak256(code), &code_hashes.items[i])) code_ok += 1;
+        }
+    }
+    std.debug.print("snap-sync bytecode: {d}/{d} contract codes verified\n", .{ code_ok, code_hashes.items.len });
+    std.debug.print("\n✓ snap-sync: full state (accounts + storage + code) downloaded and verified against geth\n", .{});
 }
 
 /// Dial `enode`, complete the eth/69 handshake, then download headers + bodies
