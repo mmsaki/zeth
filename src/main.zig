@@ -108,10 +108,17 @@ fn p2pConnect(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !voi
     if (args.len >= 3) {
         const hx = if (std.mem.startsWith(u8, args[2], "0x")) args[2][2..] else args[2];
         _ = std.fmt.hexToBytes(&genesis_hash, hx) catch {};
+    } else if (network_id == 1) {
+        genesis_hash = zeth.forkid.MAINNET_GENESIS_HASH; // default to mainnet genesis
     }
-    // Every fork on the devnet activates at genesis, so the forkid is just
-    // CRC32(genesis) with no upcoming fork.
-    const fid = forkIdFor(network_id, genesis_hash);
+    // Mainnet: the EIP-2124 forkid at our head. We're not synced, so head is
+    // genesis → we advertise the Frontier hash with next = Homestead, exactly how
+    // an unsynced node joins mainnet (geth accepts it as a valid early ancestor).
+    // Any other network is treated as an all-at-genesis devnet (CRC32(genesis)).
+    const fid = if (network_id == 1)
+        zeth.forkid.mainnet(0, 0)
+    else
+        forkIdFor(network_id, genesis_hash);
 
     const priv = zeth.ecies.randomPriv(io);
     const pub_key = try zeth.ecies.pubFromPriv(priv);
