@@ -1,8 +1,8 @@
-//! Precompiled contracts. Implemented: ecrecover (0x01), sha256 (0x02),
-//! ripemd160 (0x03), identity (0x04), modexp (0x05), bn254 ecadd/ecmul/ecpairing
-//! (0x06–0x08), blake2f (0x09), KZG point-eval (0x0a), and BLS12-381
-//! G1ADD/G1MSM/G2ADD/G2MSM/PAIRING/MAP_FP_TO_G1 (0x0b–0x10). Not yet:
-//! MAP_FP2_TO_G2).
+//! Precompiled contracts (0x01–0x11). Implemented: ecrecover (0x01), sha256
+//! (0x02), ripemd160 (0x03), identity (0x04), modexp (0x05), bn254
+//! ecadd/ecmul/ecpairing (0x06–0x08), blake2f (0x09), KZG point-eval (0x0a,
+//! Cancun), and the full BLS12-381 set (EIP-2537, Prague):
+//! G1ADD/G1MSM/G2ADD/G2MSM/PAIRING/MAP_FP_TO_G1/MAP_FP2_TO_G2 (0x0b–0x11).
 
 const std = @import("std");
 const crypto = @import("crypto.zig");
@@ -14,9 +14,9 @@ const Fork = @import("fork.zig").Fork;
 
 pub const Output = struct { data: []u8, gas: u64 };
 
-/// Return the precompile id if `addr` is an implemented precompile, else null.
-/// 0x01–0x09 (classic), 0x0b (BLS12-381 G1ADD). 0x0a (KZG) and the rest of the
-/// BLS set are not yet implemented, so they are not treated as precompiles.
+/// Return the precompile id if `addr` is an implemented precompile, else null:
+/// 0x01–0x09 (classic, every fork), 0x0a (KZG, Cancun+), 0x0b–0x11 (BLS12-381,
+/// Prague+).
 pub fn idOf(addr: Address, fork: Fork) ?u8 {
     for (addr[0..19]) |b| if (b != 0) return null;
     const id = addr[19];
@@ -54,7 +54,7 @@ pub fn run(allocator: std.mem.Allocator, id: u8, input: []const u8, gas_availabl
         0x0f => blsPairing(allocator, input, gas_available),
         0x10 => blsMapFpToG1(allocator, input, gas_available),
         0x11 => blsMapFp2ToG2(allocator, input, gas_available),
-        else => null, // unimplemented precompile (kzg / map)
+        else => null, // 0x12+ : not a precompile
     };
 }
 

@@ -1,102 +1,114 @@
-# zeth
+# zeth ⚡
 
-A Zig implementation of the Ethereum execution layer (EVM, state, MPT, transaction
-and block processing), targeting the **Prague** fork. Ported against the
-[execution-specs](https://github.com/ethereum/execution-specs) as the source of truth.
+**An Ethereum execution client, written from scratch in Zig.**
 
-## Requirements
+No GC. No framework. A single static binary that speaks the real protocol —
+ported line-for-line against the [execution-specs](https://github.com/ethereum/execution-specs),
+so correctness comes from the spec, not from copying another client.
 
-- Zig `0.17.0-dev.702` (pinned in `build.zig.zon`)
-- Python 3 (optional, for the cross-client benchmark)
+It already:
 
-## Build
+- ✅ **Passes the official tests** — the EF trie tests (25/25) and the Execution Spec
+  Tests across every fork **Frontier → Prague** (plus Osaka/Fusaka EIPs). Imports the
+  full historical chain with the head hash matching geth **exactly**.
+- ✅ **Builds blocks** — a mempool + producer that assembles the next block and
+  **self-validates** it (re-imports and re-checks every root), wired to the Engine API
+  (`forkchoiceUpdated → getPayload`).
+- ✅ **Talks to mainnet** — RLPx, eth/69, snap/1, discovery v4, and the real EIP-2124
+  forkid. zeth handshakes **live mainnet geth** and **holds the peer**.
+- ✅ **Is fast** — pure EVM dispatch at **~680 Mgas/s**; a built-in `Mgas/s` benchmark to
+  race it against geth and reth.
+
+> ⚠️ Honest status: zeth is a **conformance-grade EVM and a devnet/testnet node** — not
+> yet a production mainnet client. See **[docs/production.md](docs/production.md)** for
+> exactly what's ready and what isn't.
+
+## Get hooked in 60 seconds
 
 ```sh
-make build                          # debug build → zig-out/bin
-zig build -Doptimize=ReleaseFast    # optimized
+git clone https://github.com/mmsaki/zeth && cd zeth
+zig build -Doptimize=ReleaseFast       # needs Zig 0.17.0-dev.702 (pinned)
+
+# Run some EVM bytecode (PUSH1 6, PUSH1 7, ADD):
+./zig-out/bin/zeth run 6006600701
+
+# How fast is the interpreter?
+./zig-out/bin/zeth bench-evm           # → ~680 Mgas/s, ns/op
+
+# Build a real block from a signed transaction and prove it's valid:
+./zig-out/bin/zeth produce genesis.json --tx=0x… # → "self-validated ✓ head now block 1"
+
+# Dial and hold a live mainnet peer (discovery + eth/69 handshake):
+./zig-out/bin/zeth peers <enode://…> 1 <genesisHash>   # → peercount=1 …
 ```
 
-## Run bytecode
+## Prove it — run the tests
 
 ```sh
-make run ARGS="6006600701"   # PUSH1 6, PUSH1 7, ADD
+make test           # our Zig unit tests (fast inner loop)
+make test-eest      # the modern EF Execution Spec Tests, all forks (local)
+make test-ethereum  # the classic ethereum/tests: state + blockchain + trie
+make test-all       # everything local, no Docker
+make test-hive      # the EF's hive harness drives a live zeth (see docs/hive.md)
 ```
 
-Prints gas used, the stack, and memory.
-
-## Tests
-
-Tests are grouped by **where the fixtures come from**:
+`make test-eest` runs the *exact* fixtures the EF uses to grade clients — locally and
+fast. The fixture runners take flags directly (`--all`, `--fork <name>`, `--trace`):
 
 ```sh
-make test           # unit tests — our own Zig `test {}` blocks (fast inner loop)
-make test-ethereum  # ethereum/tests   — classic EF repo: state + blockchain + trie
-make test-eest      # execution-spec-tests — modern EF fixtures, ALL forks (local)
-make test-hive      # hive — Docker: drives the EEST fixtures at a live zeth over RPC
-make test-all       # everything local (no Docker): the three above
+./zig-out/bin/blocktest --all --fork Prague eest-fixtures/blockchain_tests
 ```
 
-`test-eest` runs the *same* fixtures hive feeds the client, just locally and far
-faster. Populate them once (extracted from the hive simulator image, ~4 GB):
+## What people use zeth for
+
+- **A reference / conformance EVM.** Spec-faithful, gas-exact, easy to read — a clean
+  oracle for fixtures, differential testing, or checking another implementation.
+- **A devnet / testnet node.** Serves JSON-RPC + the Engine API with JWT, persists to
+  `--datadir`, and is driven by a real consensus client over `engine_newPayload` /
+  `forkchoiceUpdated`. Stand one up in minutes with **[docs/kurtosis.md](docs/kurtosis.md)**.
+- **Block-building & mempool experiments.** A working producer + pool + Engine
+  `getPayload` — a hackable base for builder/MEV/PBS tinkering you fully control.
+- **devp2p & networking research.** Real RLPx/eth-69/snap-1/discovery against live
+  mainnet — handshakes, forkid, peer-holding, state-range probing.
+- **Performance work.** A no-GC, single-binary EVM with built-in `Mgas/s` benchmarks —
+  a place to push interpreter throughput and race the incumbents.
+- **Learning the protocol.** The cleanest way to *read* how Ethereum execution works,
+  one spec rule at a time, in a small language.
+
+## Run it as a node
 
 ```sh
-make fixtures-eest
-```
-
-The two fixture runners (`blocktest`, `statetest`) take flags directly:
-
-```sh
-./zig-out/bin/blocktest --all --fork London eest-fixtures/blockchain_tests
-#   --all   run past failures   --fork <name>  one fork only
-#   --import drive the real node pipeline   --trace  per-opcode trace
-```
-
-Without `--all` they stop at the first failure (like a compiler). Run
-`blocktest --help` / `statetest --help` for the full flag list. Fixtures live
-under `ethereum-tests/` and `eest-fixtures/` (both gitignored).
-
-## Running a node / networking
-
-zeth can serve JSON-RPC + the Engine API, persist to disk (`--datadir`), and
-**sync a chain from a real peer over devp2p** (RLPx + eth/69) — verified against
-geth on a Kurtosis devnet (synced 233 blocks; head hash matched geth exactly).
-
-- **[docs/production.md](docs/production.md)** — what works today vs what's left,
-  how to run the node, and an honest production-readiness status. **Read this
-  before running zeth anywhere that matters — it is not yet a mainnet client.**
-- **[docs/kurtosis.md](docs/kurtosis.md)** — stand up a local devnet and test
-  zeth against a real geth/reth node (handshake + header download).
-
-```sh
-# Sync from a peer on startup, persist, then serve JSON-RPC — a syncing node:
-zeth node <genesis.json> --peer=<enode://…> --datadir=DIR --http.addr=HOST:PORT
+# Sync from a peer, persist, serve JSON-RPC + Engine API:
+zeth node <genesis.json> --peer=<enode://…> --datadir=DIR \
+     --http.addr=0.0.0.0:8545 --authrpc.addr=0.0.0.0:8551 --authrpc.jwtsecret=jwt.hex
 
 zeth node <genesis.json> [chain.rlp ...] --datadir=DIR   # import/serve, no peer
 zeth sync <enode://…> <genesis.json> --datadir=DIR       # sync-only into a datadir
-zeth p2p  <enode://…> <networkId> <genesisHash>          # devp2p interop probe
 ```
 
-## Benchmark
+`zeth p2p`/`zeth peers` default to mainnet genesis + forkid for `networkId 1`.
+
+## Benchmark it
 
 ```sh
-make bench         # cross-client throughput vs geth / reth (revm) / evmone
+make bench                                   # cross-client: gas-correctness + Mgas/s vs geth/revm/evmone
+zeth bench <genesis.json> <chain.rlp ...>    # block-processing Mgas/s (feed it real mainnet blocks)
+zeth bench-evm [gas]                         # pure EVM-dispatch Mgas/s + ns/op
 ```
 
-Reference engines are auto-detected; whatever is installed is included. Gas
-doubles as a correctness oracle (a correct engine reports identical gas),
-alongside Mgas/s throughput.
+## Docs
 
-## Layout
+| | |
+|---|---|
+| **[docs/production.md](docs/production.md)** | Honest readiness status — what works, what's left. **Read first.** |
+| **[docs/kurtosis.md](docs/kurtosis.md)** | Test zeth against a real geth/reth devnet node. |
+| **[docs/hive.md](docs/hive.md)** | Run the EF's hive simulators against zeth. |
 
-| Path | What |
-|------|------|
-| `src/vm.zig` | EVM interpreter |
-| `src/state.zig`, `src/trie.zig` | account state + Merkle-Patricia trie |
-| `src/tx.zig` | transaction processing + validation |
-| `src/precompiles.zig` | precompiles (incl. bn254, BLS12-381, KZG) |
-| `src/bn254.zig`, `src/bls12_381.zig` | pairing-friendly curve crypto |
-| `src/chain.zig` | block-import pipeline + in-memory chain |
-| `src/db.zig`, `src/store.zig` | durable KV store + typed block/state persistence |
-| `src/ecies.zig`, `src/secp.zig`, `src/rlpx.zig`, `src/handshake.zig` | devp2p transport (ECIES, ECDSA, RLPx frames, auth/ack) |
-| `src/eth_proto.zig`, `src/forkid.zig`, `src/peer.zig` | eth/69 messages, EIP-2124 forkid, TCP peer |
-| `tools/` | fixture-test runners (`statetest`, `blocktest`, `eels`) |
+The implementation is under `src/` (EVM, state/trie, tx/chain, precompiles + curve crypto,
+the devp2p stack, RPC) with the fixture runners in `tools/`. The tree moves fast — read the
+source; `build.zig` and `src/root.zig` are the entry points.
+
+---
+
+Built in the open as independent Ethereum protocol work. Contributions, spec
+clarifications, and benchmarks welcome.

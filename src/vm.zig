@@ -9,9 +9,9 @@
 //! with message-call recursion, state snapshots, the 63/64 gas rule, and
 //! static-context enforcement. Gas is validated against geth (`make bench`).
 //!
-//! Known gaps: precompiled contracts (0x01–0x12) are not yet wired in, and a
-//! handful of post-creation edge cases (EIP-6780 selfdestruct-same-tx) are
-//! approximated. Tracked for follow-up.
+//! Precompiles (0x01–0x11, incl. bn254, KZG, and the BLS12-381 set) are wired in
+//! via `precompiles.zig`. Known gap: a handful of post-creation edge cases
+//! (EIP-6780 selfdestruct-same-tx) are approximated. Tracked for follow-up.
 
 const std = @import("std");
 const word = @import("word.zig");

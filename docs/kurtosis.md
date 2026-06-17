@@ -129,8 +129,5 @@ kurtosis clean -a
 
 ## Also useful for testing
 
-- **hive** (`make test-hive`) — runs the EEST `consume-rlp` / `consume-engine`
-  simulators against zeth in Docker; this is the post-merge, Engine-API-driven
-  path and is the most complete end-to-end exercise today.
-- **Local EEST fixtures** (`make test-eest`) — the same fixtures hive feeds,
-  run locally without Docker (much faster for iteration).
+- **hive** — the EF integration harness; see **[hive.md](./hive.md)**.
+- **Local EEST fixtures** (`make test-eest`) — run the spec tests locally, no Docker.
