@@ -469,6 +469,113 @@ fn idx_nibble(key: []const u8, idx: usize) usize {
     return key[idx];
 }
 
+// --- snap/1 range-proof verification ----------------------------------------
+
+fn keyLess(x: [32]u8, y: [32]u8) bool {
+    return std.mem.order(u8, &x, &y) == .lt;
+}
+
+pub const RangeError = error{ RangeInvalid, RangeUnsupported };
+
+/// Verify a snap/1 account/storage range proof against `root` (the analogue of
+/// geth's `trie.VerifyRangeProof`). `keys` are the sorted 32-byte, already-hashed
+/// leaf keys of the returned range and `values` their encoded bodies; `proof` is
+/// the boundary proof nodes the peer sent. Returns true iff the leaves are
+/// exactly the trie's slice for that range — i.e. the downloaded data is
+/// trustworthy under `root`.
+///
+/// COVERAGE (increment 1, fully unit-tested below) — the two SOUND cases a real
+/// snap sync already hits:
+///   • empty proof  → the leaves ARE the whole (sub)trie: rebuild + compare root.
+///   • single key   → a degenerate range == an inclusion proof (verifyProof).
+/// The general BOUNDED case (reconstruct a sparse trie from the two boundary
+/// proofs, prune the interior, re-insert the leaves, recompute the root, and
+/// report whether more elements exist to the right) is the next increment; it
+/// returns error.RangeUnsupported rather than ever returning a wrong answer.
+pub fn verifyRangeProof(
+    a: std.mem.Allocator,
+    root: [32]u8,
+    keys: []const [32]u8,
+    values: []const []const u8,
+    proof: []const []const u8,
+) RangeError!bool {
+    if (keys.len != values.len) return error.RangeInvalid;
+    // Keys must be strictly increasing (sorted, no duplicates).
+    var i: usize = 1;
+    while (i < keys.len) : (i += 1) {
+        if (!keyLess(keys[i - 1], keys[i])) return error.RangeInvalid;
+    }
+
+    // Case 1 — no boundary proof: the leaves are the entire (sub)trie.
+    if (proof.len == 0) {
+        if (keys.len == 0) return std.mem.eql(u8, &root, &EMPTY_TRIE_ROOT);
+        const pairs = a.alloc(KV, keys.len) catch @panic("oom");
+        for (0..keys.len) |j| pairs[j] = .{ .key = keys[j][0..], .value = values[j] };
+        const got = computeRoot(a, pairs, false); // keys already hashed → unsecured
+        return std.mem.eql(u8, &got, &root);
+    }
+
+    // Case 2 — single key: a degenerate range is just an inclusion proof.
+    if (keys.len == 1) {
+        const got = verifyProof(a, root, proof, bytesToNibbles(a, keys[0][0..]));
+        return if (got) |val| std.mem.eql(u8, val, values[0]) else error.RangeInvalid;
+    }
+
+    // General bounded case — sparse-trie reconstruction. Next increment.
+    return error.RangeUnsupported;
+}
+
+test "range proof: empty proof rebuilds the whole trie" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // Sorted, distinct 32-byte keys (snap keys are account/slot hashes).
+    var keys: [4][32]u8 = undefined;
+    var vals: [4][]const u8 = undefined;
+    for (0..4) |j| {
+        keys[j] = std.mem.zeroes([32]u8);
+        keys[j][0] = @intCast((j + 1) * 16); // 0x10,0x20,0x30,0x40 → distinct root nibble
+        vals[j] = "a-reasonably-long-account-body-value-exceeding-the-inline-threshold";
+    }
+    const pairs = al.alloc(KV, 4) catch unreachable;
+    for (0..4) |j| pairs[j] = .{ .key = keys[j][0..], .value = vals[j] };
+    const root = computeRoot(al, pairs, false);
+
+    try testing.expect(try verifyRangeProof(al, root, keys[0..], vals[0..], &.{}));
+    // Tampering any value must be caught.
+    vals[1] = "tampered-body";
+    try testing.expect(!try verifyRangeProof(al, root, keys[0..], vals[0..], &.{}));
+    // Unsorted keys are rejected outright.
+    const swapped = [_][32]u8{ keys[1], keys[0], keys[2], keys[3] };
+    try testing.expectError(error.RangeInvalid, verifyRangeProof(al, root, swapped[0..], vals[0..], &.{}));
+}
+
+test "range proof: single key equals an inclusion proof" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var keys: [3][32]u8 = undefined;
+    var vals: [3][]const u8 = undefined;
+    for (0..3) |j| {
+        keys[j] = std.mem.zeroes([32]u8);
+        keys[j][0] = @intCast((j + 1) * 32);
+        vals[j] = "value-body-long-enough-to-force-hashed-trie-nodes-xxxxxxxxxxxxxx";
+    }
+    const pairs = al.alloc(KV, 3) catch unreachable;
+    for (0..3) |j| pairs[j] = .{ .key = keys[j][0..], .value = vals[j] };
+    const root = computeRoot(al, pairs, false);
+
+    const proof = proveKey(al, pairs, false, keys[1][0..]);
+    try testing.expect(try verifyRangeProof(al, root, keys[1..2], vals[1..2], proof));
+    // Wrong value for the proven key → not verified.
+    const badv = [_][]const u8{"wrong-value"};
+    try testing.expect(!try verifyRangeProof(al, root, keys[1..2], badv[0..], proof));
+}
+
 test "proof verifies for included and excluded secured keys" {
     const a = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
