@@ -600,12 +600,19 @@ fn jU256opt(o: std.json.ObjectMap, k: []const u8) ?u256 {
 
 /// Apply an eth_simulateV1 `stateOverrides` map to `st`: per-account balance,
 /// nonce, code, and storage (`state` = full replace, `stateDiff` = merge).
-fn applyStateOverrides(a: std.mem.Allocator, st: *state_mod.State, ov: std.json.ObjectMap) void {
+const SimErr = struct { code: i32, msg: []const u8 };
+
+fn applyStateOverrides(a: std.mem.Allocator, st: *state_mod.State, ov: std.json.ObjectMap) ?SimErr {
     var it = ov.iterator();
     while (it.next()) |e| {
         if (e.value_ptr.* != .object) continue;
         const addr = parseAddr(e.key_ptr.*) orelse continue;
         const o = e.value_ptr.object;
+        // movePrecompileToAddress requires the source to be a precompile.
+        if (jstr(o, "movePrecompileToAddress")) |_| {
+            if (!isPrecompile(addr))
+                return .{ .code = -32000, .msg = std.fmt.allocPrint(a, "account {s} is not a precompile", .{dataHex(a, &addr)}) catch "not a precompile" };
+        }
         if (jU256opt(o, "balance")) |b| st.setBalance(addr, b) catch {};
         if (jU64opt(o, "nonce")) |n| st.setNonce(addr, n) catch {};
         if (jstr(o, "code")) |code| st.setCode(addr, hexBytes(a, code)) catch {};
@@ -622,9 +629,10 @@ fn applyStateOverrides(a: std.mem.Allocator, st: *state_mod.State, ov: std.json.
                 st.setStorage(addr, parseU256(kv.key_ptr.*), parseU256(kv.value_ptr.string)) catch {};
         };
     }
+    return null;
 }
 
-const SimBlock = struct { number: u64, time: u64, ov: ?std.json.ObjectMap, calls: []const std.json.Value };
+const SimBlock = struct { number: u64, time: u64, ov: ?std.json.ObjectMap, so: ?std.json.ObjectMap, calls: []const std.json.Value };
 
 const SIM_SYSTEM_ADDR: Address = .{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe };
 const SIM_BEACON_ROOTS: Address = .{ 0x00, 0x0F, 0x3d, 0xf6, 0xD7, 0x32, 0x80, 0x7E, 0xf1, 0x31, 0x9f, 0xB7, 0xB8, 0xbB, 0x85, 0x22, 0xd0, 0xBe, 0xac, 0x02 };
@@ -665,16 +673,18 @@ fn simulateV1(a: std.mem.Allocator, id: ?std.json.Value, c: *chain_mod.Chain, op
         const ov: ?std.json.ObjectMap = if (bo.get("blockOverrides")) |x| (if (x == .object) x.object else null) else null;
         const num = if (ov != null) (jU64opt(ov.?, "number") orelse prev_num + 1) else prev_num + 1;
         if (num <= prev_num) return err(a, id, -38020, "block numbers must be in order");
+        if (num - base.number > 256) return err(a, id, -38026, "too many blocks"); // maxSimulateBlocks
         // Fill gaps with empty blocks.
         var fill = prev_num + 1;
         while (fill < num) : (fill += 1) {
             prev_time += 12;
-            blocks.append(a, .{ .number = fill, .time = prev_time, .ov = null, .calls = &.{} }) catch return err(a, id, -32603, "oom");
+            blocks.append(a, .{ .number = fill, .time = prev_time, .ov = null, .so = null, .calls = &.{} }) catch return err(a, id, -32603, "oom");
         }
         const t = if (ov != null) (jU64opt(ov.?, "time") orelse prev_time + 12) else prev_time + 12;
         if (t <= prev_time) return err(a, id, -38021, "block timestamps must be in order");
         const calls: []const std.json.Value = if (bo.get("calls")) |cl| (if (cl == .array) cl.array.items else &.{}) else &.{};
-        blocks.append(a, .{ .number = num, .time = t, .ov = ov, .calls = calls }) catch return err(a, id, -32603, "oom");
+        const so: ?std.json.ObjectMap = if (bo.get("stateOverrides")) |x| (if (x == .object) x.object else null) else null;
+        blocks.append(a, .{ .number = num, .time = t, .ov = ov, .so = so, .calls = calls }) catch return err(a, id, -32603, "oom");
         prev_num = num;
         prev_time = t;
     }
@@ -688,6 +698,9 @@ fn simulateV1(a: std.mem.Allocator, id: ?std.json.Value, c: *chain_mod.Chain, op
     out.append(a, '[') catch return err(a, id, -32603, "oom");
     var coinbase = base.coinbase;
     var parent_hash = base_hash;
+    var prev_base_fee: u256 = base.base_fee_per_gas orelse 0;
+    var prev_gas_used: u64 = base.gas_used;
+    var prev_gas_limit: u64 = base.gas_limit;
 
     for (blocks.items, 0..) |blk, bidx| {
         const fork = c.schedule.forkAt(blk.number, blk.time);
@@ -696,7 +709,9 @@ fn simulateV1(a: std.mem.Allocator, id: ?std.json.Value, c: *chain_mod.Chain, op
         };
         const base_fee: ?u256 = if (fork.atLeast(.london)) blk: {
             if (blk.ov) |ov| if (jU256opt(ov, "baseFeePerGas")) |bf| break :blk bf;
-            break :blk 0; // non-validation default (validation calc not modeled)
+            // Validation mode computes EIP-1559 base fee from the parent;
+            // non-validation defaults to 0 (so gasPrice < baseFee is allowed).
+            break :blk if (validation) calcBaseFee(prev_base_fee, prev_gas_used, prev_gas_limit) else 0;
         } else null;
         var prev_randao = std.mem.zeroes([32]u8);
         if (blk.ov) |ov| if (jstr(ov, "prevRandao")) |pr| {
@@ -721,7 +736,9 @@ fn simulateV1(a: std.mem.Allocator, id: ?std.json.Value, c: *chain_mod.Chain, op
         // State overrides apply before execution.
         if (blk.ov == null) {} // no-op
         if (blk.calls.len == 0 and blk.ov == null) {} // empty block fast-path uses defaults
-        if (blk.ov) |ov| if (ov.get("stateOverrides")) |so| if (so == .object) applyStateOverrides(a, &st, so.object);
+        if (blk.so) |so| {
+            if (applyStateOverrides(a, &st, so)) |se| return err(a, id, se.code, se.msg);
+        }
 
         var env = vm.Environment{
             .fork = fork,
@@ -751,6 +768,7 @@ fn simulateV1(a: std.mem.Allocator, id: ?std.json.Value, c: *chain_mod.Chain, op
         for (blk.calls, 0..) |call_v, ci| {
             if (call_v != .object) continue;
             const cr = simExecCall(a, &st, &env, call_v.object, gas_pool, validation);
+            if (cr.err_code != 0) return err(a, id, cr.err_code, cr.err_msg);
             cum_gas += cr.gas_used;
             if (gas_pool >= cr.gas_used) gas_pool -= cr.gas_used else gas_pool = 0;
             receipts.append(a, .{ .tx_type = 2, .success = cr.success, .cumulative_gas_used = cum_gas, .logs = cr.logs }) catch {};
@@ -776,6 +794,9 @@ fn simulateV1(a: std.mem.Allocator, id: ?std.json.Value, c: *chain_mod.Chain, op
 
         const blk_hash = hdr.hash(a) catch return err(a, id, -32603, "hash");
         parent_hash = blk_hash;
+        prev_base_fee = base_fee orelse 0;
+        prev_gas_used = hdr.gas_used;
+        prev_gas_limit = hdr.gas_limit;
 
         if (bidx != 0) out.append(a, ',') catch {};
         out.appendSlice(a, simBlockJson(a, &hdr, blk_hash, calls_json.items)) catch {};
@@ -788,7 +809,38 @@ fn bytesToU256RPC(b: *const [32]u8) u256 {
     return std.mem.readInt(u256, b, .big);
 }
 
-const SimCallResult = struct { gas_used: u64, success: bool, logs: []const vm.Log, json: []const u8, tx_enc: []const u8 };
+/// EIP-1559 base fee of a block given its parent's base fee, gas used, and gas
+/// limit (validation mode; mirrors nextBaseFee but parameterized by the parent).
+fn calcBaseFee(parent_base: u256, gas_used: u64, gas_limit: u64) u256 {
+    const target: u64 = gas_limit / 2;
+    if (target == 0 or gas_used == target) return parent_base;
+    if (gas_used > target) {
+        const delta = (parent_base * (gas_used - target)) / target / 8;
+        return parent_base + @max(delta, 1);
+    }
+    const delta = (parent_base * (target - gas_used)) / target / 8;
+    return if (parent_base > delta) parent_base - delta else 0;
+}
+
+const SimCallResult = struct { gas_used: u64, success: bool, logs: []const vm.Log, json: []const u8, tx_enc: []const u8, err_code: i32 = 0, err_msg: []const u8 = "" };
+
+const SIM_GAS_CAP: u64 = 50_000_000; // geth's default RPCGasCap
+
+/// EIP-55 checksummed address string ("0x" + mixed-case hex), as geth prints
+/// addresses in error messages.
+fn checksumAddr(a: std.mem.Allocator, addr: Address) []const u8 {
+    const lower = std.fmt.bytesToHex(&addr, .lower); // 40 chars
+    const h = crypto.keccak256(&lower);
+    var out = a.alloc(u8, 42) catch @panic("oom");
+    out[0] = '0';
+    out[1] = 'x';
+    for (lower, 0..) |ch, i| {
+        const shift: u3 = if (i % 2 == 0) 4 else 0;
+        const nibble = (h[i / 2] >> shift) & 0x0f;
+        out[2 + i] = if (ch >= 'a' and ch <= 'f' and nibble >= 8) ch - 32 else ch;
+    }
+    return out;
+}
 
 fn rlpMinU256(a: std.mem.Allocator, v: u256) []const u8 {
     var buf: [32]u8 = undefined;
@@ -824,8 +876,9 @@ fn simExecCall(a: std.mem.Allocator, st: *state_mod.State, env: *vm.Environment,
     const value = if (jstr(call, "value")) |v| parseU256(v) else 0;
     const data = if (jstr(call, "data") orelse jstr(call, "input")) |d| hexBytes(a, d) else &.{};
     const nonce = jU64opt(call, "nonce") orelse st.nonceOf(from);
-    const call_gas = jU64opt(call, "gas") orelse gas_pool;
-    const gas = @min(call_gas, gas_pool);
+    // Default gas is the remaining block gas, clamped to the RPC gas cap.
+    const call_gas = jU64opt(call, "gas") orelse @min(gas_pool, SIM_GAS_CAP);
+    const gas = @min(@min(call_gas, gas_pool), SIM_GAS_CAP);
 
     var zero_b: u64 = 0;
     var nz: u64 = 0;
@@ -837,10 +890,24 @@ fn simExecCall(a: std.mem.Allocator, st: *state_mod.State, env: *vm.Environment,
     const is_create = to == null;
     const intrinsic: u64 = 21000 + zero_b * 4 + nz * 16 + (if (is_create) @as(u64, 32000) else 0);
 
+    const gas_price: u256 = if (validation) (if (jstr(call, "gasPrice") orelse jstr(call, "maxFeePerGas")) |gp| parseU256(gp) else env.base_fee) else 0;
+    // Validation-mode pre-checks: nonce overflow and fee cap below base fee.
+    if (validation) {
+        if (nonce == std.math.maxInt(u64))
+            return .{ .gas_used = 0, .success = false, .logs = &.{}, .json = "", .tx_enc = "", .err_code = -32603, .err_msg = std.fmt.allocPrint(a, "err: nonce has max value: address {s}, nonce: {d} (supplied gas {d})", .{ checksumAddr(a, from), nonce, gas }) catch "nonce has max value" };
+        const max_fee: u256 = if (jstr(call, "maxFeePerGas") orelse jstr(call, "gasPrice")) |gp| parseU256(gp) else 0;
+        if (max_fee < env.base_fee)
+            return .{ .gas_used = 0, .success = false, .logs = &.{}, .json = "", .tx_enc = "", .err_code = -38012, .err_msg = std.fmt.allocPrint(a, "err: max fee per gas less than block base fee: address {s}, maxFeePerGas: {d}, baseFee: {d} (supplied gas {d})", .{ checksumAddr(a, from), max_fee, env.base_fee, gas }) catch "max fee too low" };
+    }
+    // EIP-7756 pre-execution checks (apply even in non-validation mode):
+    if (gas < intrinsic) return .{ .gas_used = 0, .success = false, .logs = &.{}, .json = "", .tx_enc = "", .err_code = -38013, .err_msg = std.fmt.allocPrint(a, "err: intrinsic gas too low: have {d}, want {d} (supplied gas {d})", .{ gas, intrinsic, gas }) catch "intrinsic gas too low" };
+    const need: u256 = value + @as(u256, gas) * gas_price;
+    if (st.balanceOf(from) < need) return .{ .gas_used = 0, .success = false, .logs = &.{}, .json = "", .tx_enc = "", .err_code = -38014, .err_msg = std.fmt.allocPrint(a, "err: insufficient funds for gas * price + value: address {s} have {d} want {d} (supplied gas {d})", .{ checksumAddr(a, from), st.balanceOf(from), need, gas }) catch "insufficient funds" };
+
     env.origin = from;
-    env.gas_price = if (validation) (if (jstr(call, "gasPrice")) |gp| parseU256(gp) else env.base_fee) else 0;
+    env.gas_price = gas_price;
     st.beginTx();
-    st.setNonce(from, nonce + 1) catch {};
+    st.setNonce(from, nonce +% 1) catch {};
 
     const msg_gas: u64 = if (gas > intrinsic) gas - intrinsic else 0;
     const target = to orelse (state_mod.computeContractAddress(a, from, nonce) catch state_mod.zero_address);
