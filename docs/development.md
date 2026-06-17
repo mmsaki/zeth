@@ -2,18 +2,17 @@
 
 What a fresh clone needs, and how to get from zero to running tests.
 
-## 1. Install Zig (pinned nightly)
+## 1. Install Zig (nightly master)
 
-zeth pins **`0.17.0-dev.702+18b3c78a9`** (a Zig nightly, not a stable release). Match it
-exactly — other versions will fail to build. Easiest via a version manager:
+zeth needs a Zig nightly `0.17.0-dev.702` or newer (minimum set in `build.zig.zon`):
 
 ```sh
 # zvm (https://github.com/tristanisham/zvm)
-zvm install 0.17.0-dev.702+18b3c78a9 && zvm use 0.17.0-dev.702+18b3c78a9
+zvm i master && zvm use master
 ```
 
-Or download the matching build for your platform from <https://ziglang.org/download/>
-and put `zig` on your `PATH`. Check: `zig version`.
+Or grab the latest master build from <https://ziglang.org/download/> and put `zig` on
+your `PATH`. Check: `zig version`.
 
 ## 2. Build + the tests that need nothing else
 
