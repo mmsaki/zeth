@@ -143,10 +143,21 @@ pub fn load(a: std.mem.Allocator, st: *State, root: std.json.Value) !Genesis {
         sched.istanbul_block = jU64(cfg, "istanbulBlock");
         sched.berlin_block = jU64(cfg, "berlinBlock");
         sched.london_block = jU64(cfg, "londonBlock");
-        // The Merge.
+        // The Merge. "merged from genesis" means the chain is post-Merge at
+        // block 0 — i.e. a zero terminal total difficulty (geth's convention for
+        // a merged genesis). A *non-zero* TTD means PoW until that difficulty is
+        // reached, so it must NOT imply a merged genesis. Read TTD as a number
+        // (it is a JSON integer here, which `jstr` would miss).
         sched.merge_block = jU64(cfg, "mergeNetsplitBlock");
-        sched.merged_from_genesis = (jU64(cfg, "terminalTotalDifficulty") != null and hU256(jstr(cfg, "terminalTotalDifficulty")) == 0) or
-            (cfg.get("terminalTotalDifficultyPassed") != null and cfg.get("terminalTotalDifficultyPassed").? == .bool and cfg.get("terminalTotalDifficultyPassed").?.bool and sched.merge_block == null);
+        const ttd_is_zero: bool = if (cfg.get("terminalTotalDifficulty")) |v| switch (v) {
+            .integer => v.integer == 0,
+            .string => hU256(v.string) == 0,
+            .number_string => |s| std.mem.eql(u8, s, "0"),
+            else => false,
+        } else false;
+        const ttd_passed: bool = cfg.get("terminalTotalDifficultyPassed") != null and
+            cfg.get("terminalTotalDifficultyPassed").? == .bool and cfg.get("terminalTotalDifficultyPassed").?.bool;
+        sched.merged_from_genesis = ttd_is_zero or (ttd_passed and sched.merge_block == null);
         // Timestamp-activated post-Merge forks.
         sched.shanghai_time = jU64(cfg, "shanghaiTime");
         sched.cancun_time = jU64(cfg, "cancunTime");
