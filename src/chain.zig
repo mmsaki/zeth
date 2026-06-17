@@ -333,6 +333,11 @@ pub const Chain = struct {
             .blob_base_fee = txmod.blobGasPrice(h.excess_blob_gas orelse 0, fork),
         };
 
+        // EIP-161 touched-account set is per-block here (cleared per-tx by
+        // beginTx); reset it so an empty block can't carry stale touches into
+        // the block-level destroy.
+        self.state.touched.clearRetainingCapacity();
+
         // Block-start system calls (state writes before transactions).
         if (fork.atLeast(.cancun)) if (h.parent_beacon_block_root) |r| {
             _ = self.systemCall(a, &env, BEACON_ROOTS, &r);
@@ -380,7 +385,7 @@ pub const Chain = struct {
             const post_state: ?[32]u8 = if (fork.atLeast(.byzantium))
                 null
             else
-                trie.stateRoot(a, self.state, fork.atLeast(.spurious_dragon));
+                trie.stateRoot(a, self.state, false); // EIP-161 empties already destroyed per-tx
             receipts.append(a, .{
                 .tx_type = dt.tx_type,
                 .success = res.success,
@@ -464,7 +469,10 @@ pub const Chain = struct {
         }
 
         // Validate the execution result against the header (the consensus checks).
-        const state_root = trie.stateRoot(a, self.state, fork.atLeast(.spurious_dragon));
+        // EIP-161: destroy any empty accounts touched by block-level operations
+        // (the coinbase reward, withdrawals, system calls) before the root.
+        if (fork.atLeast(.spurious_dragon)) self.state.destroyTouchedEmpty();
+        const state_root = trie.stateRoot(a, self.state, false);
         if (!std.mem.eql(u8, &state_root, &h.state_root)) return error.StateRootMismatch;
         const tx_root = block.orderedTrieRoot(a, blk.transactions);
         if (!std.mem.eql(u8, &tx_root, &h.transactions_root)) return error.TransactionsRootMismatch;

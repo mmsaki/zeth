@@ -403,11 +403,13 @@ fn processImpl(allocator: std.mem.Allocator, state: *State, env: *const vm.Envir
         state.touch(env.coinbase) catch @panic("oom");
     }
 
-    // Self-destructed accounts are removed; empty accounts are excluded from
-    // the state root automatically (EIP-161).
+    // Self-destructed accounts are removed.
     if (success) {
         var dit = evm.accounts_to_delete.keyIterator();
         while (dit.next()) |addr| state.removeAccount(addr.*);
     }
+    // EIP-161 (Spurious Dragon): destroy any account touched this transaction
+    // that is now empty. Before this fork empty accounts persist.
+    if (env.fork.atLeast(.spurious_dragon)) state.destroyTouchedEmpty();
     return .{ .gas_used = gas_used, .success = success };
 }

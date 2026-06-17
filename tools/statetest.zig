@@ -274,7 +274,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
         if (blob_ok and zeth.tx.validate(&st, &env, tx, max_fee_cap, max_prio) == null) {
             _ = zeth.tx.process(a, &st, &env, tx);
         }
-        const got = zeth.trie.stateRoot(a, &st, env.fork.atLeast(.spurious_dragon));
+        const got = zeth.trie.stateRoot(a, &st, false);
 
         var want: [32]u8 = undefined;
         const hash = jstr(entry, "hash") orelse return .skip;

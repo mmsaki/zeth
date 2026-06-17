@@ -187,7 +187,7 @@ pub fn load(a: std.mem.Allocator, st: *State, root: std.json.Value) !Genesis {
 
     var h = block.Header{
         .coinbase = hFixed(20, jstr(obj, "coinbase")),
-        .state_root = trie.stateRoot(a, st, sched.forkAt(0, timestamp).atLeast(.spurious_dragon)),
+        .state_root = trie.stateRoot(a, st, false),
         .difficulty = hU256(jstr(obj, "difficulty")),
         .number = 0,
         .gas_limit = hU64(jstr(obj, "gasLimit")),
