@@ -44,7 +44,7 @@ must byte-match the peer's, which is why the same `genesis.json` is used.
 
 Tear down: `kurtosis clean -a`.
 
-## Gotchas
+## If the handshake fails
 
 - Modern geth advertises eth/69+ and dropped eth/68; zeth speaks eth/69.
 - A forkid/genesis mismatch shows up as the peer never sending its `Status` — confirm the
