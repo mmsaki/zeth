@@ -419,6 +419,23 @@ fn getProof(a: std.mem.Allocator, c: *chain_mod.Chain, addr: Address, keys: []co
     return buf.toOwnedSlice(a) catch @panic("oom");
 }
 
+/// The EIP-1559 base fee of the block that would follow the head.
+fn nextBaseFee(c: *chain_mod.Chain) u256 {
+    const parent = c.head.base_fee_per_gas orelse return 0;
+    const DENOM: u256 = 8; // BASE_FEE_MAX_CHANGE_DENOMINATOR
+    const ELASTICITY: u64 = 2;
+    const target: u64 = c.head.gas_limit / ELASTICITY;
+    if (target == 0) return parent;
+    const used = c.head.gas_used;
+    if (used == target) return parent;
+    if (used > target) {
+        const delta = (parent * (used - target)) / target / DENOM;
+        return parent + @max(delta, 1);
+    }
+    const delta = (parent * (target - used)) / target / DENOM;
+    return if (parent > delta) parent - delta else 0;
+}
+
 fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []const u8 {
     if (v != .object) return err(a, null, -32600, "invalid request");
     const obj = v.object;
@@ -442,6 +459,7 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
     if (std.mem.eql(u8, method, "eth_accounts")) return ok(a, id, "[]");
     if (std.mem.eql(u8, method, "eth_maxPriorityFeePerGas")) return okStr(a, id, qHex(a, 1_000_000_000));
     if (std.mem.eql(u8, method, "eth_gasPrice")) return okStr(a, id, qHex(a, (c.head.base_fee_per_gas orelse 0) + 1_000_000_000));
+    if (std.mem.eql(u8, method, "eth_baseFee")) return okStr(a, id, qHex(a, nextBaseFee(c)));
     if (std.mem.eql(u8, method, "eth_blobBaseFee")) {
         const f = c.schedule.forkAt(c.head.number, c.head.timestamp);
         return okStr(a, id, qHex(a, @import("tx.zig").blobGasPrice(c.head.excess_blob_gas orelse 0, f)));
