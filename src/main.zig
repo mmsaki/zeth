@@ -324,6 +324,9 @@ fn snapSync(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
     defer arena.deinit();
     const a = arena.allocator();
 
+    var snap = zeth.snap_state.SnapStore.init(gpa);
+    defer snap.deinit();
+
     const Contract = struct { hash: [32]u8, storage_root: [32]u8 };
     var pairs: std.ArrayList(zeth.trie.KV) = .empty;
     var contracts: std.ArrayList(Contract) = .empty;
@@ -344,6 +347,7 @@ fn snapSync(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
             const key = a.dupe(u8, &e.hash) catch return error.OutOfMemory;
             const val = zeth.trie.accountValueRlp(a, e.account.nonce, e.account.balance, e.account.storage_root.?, e.account.code_hash.?);
             try pairs.append(a, .{ .key = key, .value = val });
+            try snap.putAccount(e.hash, .{ .nonce = e.account.nonce, .balance = e.account.balance, .storage_root = e.account.storage_root.?, .code_hash = e.account.code_hash.? });
             if (!std.mem.eql(u8, &e.account.storage_root.?, &empty_root))
                 try contracts.append(a, .{ .hash = e.hash, .storage_root = e.account.storage_root.? });
             if (!std.mem.eql(u8, &e.account.code_hash.?, &empty_code))
@@ -389,6 +393,9 @@ fn snapSync(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
             for (slots) |s| {
                 const k = a.dupe(u8, &s.hash) catch return error.OutOfMemory;
                 try sp.append(a, .{ .key = k, .value = try a.dupe(u8, s.data) });
+                // slotData is RLP(value); decode to a u256 for the snap store.
+                const val: u256 = ((zeth.rlp.decode(a, s.data) catch continue).uint(u256) catch 0);
+                try snap.putSlot(ct.hash, s.hash, val);
             }
             const last = slots[slots.len - 1].hash;
             if (sr.proof.len == 0 or std.mem.eql(u8, &last, &limit)) {
@@ -414,11 +421,28 @@ fn snapSync(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
         const bc = try zeth.snap_proto.decodeByteCodes(a, cresp);
         for (bc.codes, 0..) |code, i| {
             if (i >= code_hashes.items.len) break;
-            if (std.mem.eql(u8, &zeth.crypto.keccak256(code), &code_hashes.items[i])) code_ok += 1;
+            if (std.mem.eql(u8, &zeth.crypto.keccak256(code), &code_hashes.items[i])) {
+                code_ok += 1;
+                try snap.putCode(code_hashes.items[i], a.dupe(u8, code) catch continue);
+            }
         }
     }
     std.debug.print("snap-sync bytecode: {d}/{d} contract codes verified\n", .{ code_ok, code_hashes.items.len });
     std.debug.print("\n✓ snap-sync: full state (accounts + storage + code) downloaded and verified against geth\n", .{});
+
+    // Demonstrate the verified state is usable BY ADDRESS (the read side of
+    // booting from snap): query known predeploys against the hashed store.
+    const known = [_]struct { name: []const u8, addr: zeth.snap_state.Address }{
+        .{ .name = "BEACON_ROOTS (4788) ", .addr = .{ 0x00, 0x0F, 0x3d, 0xf6, 0xD7, 0x32, 0x80, 0x7E, 0xf1, 0x31, 0x9f, 0xB7, 0xB8, 0xbB, 0x85, 0x22, 0xd0, 0xBe, 0xac, 0x02 } },
+        .{ .name = "HISTORY_STORAGE(2935)", .addr = .{ 0x00, 0x00, 0xF9, 0x08, 0x27, 0xF1, 0xC5, 0x3a, 0x10, 0xcb, 0x7A, 0x02, 0x33, 0x5B, 0x17, 0x53, 0x20, 0x00, 0x29, 0x35 } },
+        .{ .name = "WITHDRAWAL (7002)   ", .addr = .{ 0x00, 0x00, 0x09, 0x61, 0xEf, 0x48, 0x0E, 0xb5, 0x5e, 0x80, 0xD1, 0x9a, 0xd8, 0x35, 0x79, 0xA6, 0x4c, 0x00, 0x70, 0x02 } },
+    };
+    std.debug.print("\nstate queryable by address (faulting in via keccak):\n", .{});
+    for (known) |k| {
+        if (snap.account(k.addr)) |acc| {
+            std.debug.print("  {s}  balance={d} nonce={d} codeLen={d}\n", .{ k.name, acc.balance, acc.nonce, snap.codeOf(k.addr).len });
+        } else std.debug.print("  {s}  (not present)\n", .{k.name});
+    }
 }
 
 /// Dial `enode`, complete the eth/69 handshake, then download headers + bodies
