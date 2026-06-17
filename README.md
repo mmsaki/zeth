@@ -25,7 +25,8 @@ and isn't ready.
 
 ## Quickstart
 
-Requires Zig `0.17.0-dev.702` (pinned in `build.zig.zon`).
+Requires Zig `0.17.0-dev.702` (pinned in `build.zig.zon`). Full setup — including the
+test fixtures, which aren't in the repo — is in **[docs/development.md](docs/development.md)**.
 
 ```sh
 git clone https://github.com/mmsaki/zeth && cd zeth
@@ -47,8 +48,9 @@ make test-all       # everything local, no Docker
 make test-hive      # the hive harness drives a live zeth (see docs/hive.md)
 ```
 
-`make test-eest` runs the same fixtures the EF uses to test clients, locally. The
-runners take flags directly (`--all`, `--fork <name>`, `--trace`):
+Only `make test` runs on a bare clone; the fixture suites need data that isn't in the
+repo — see **[docs/development.md](docs/development.md)**. The runners take flags directly
+(`--all`, `--fork <name>`, `--trace`):
 
 ```sh
 ./zig-out/bin/blocktest --all --fork Prague eest-fixtures/blockchain_tests
@@ -93,7 +95,8 @@ zeth bench-evm [gas]                         # EVM-dispatch Mgas/s + ns/op
 
 | | |
 |---|---|
-| **[docs/production.md](docs/production.md)** | Readiness status — what works, what's left. Read first. |
+| **[docs/development.md](docs/development.md)** | Setup from a clean clone: Zig, build, fixtures. Start here. |
+| **[docs/production.md](docs/production.md)** | Readiness status — what works, what's left. |
 | **[docs/kurtosis.md](docs/kurtosis.md)** | Test zeth against a geth/reth devnet node. |
 | **[docs/hive.md](docs/hive.md)** | Run the hive simulators against zeth. |
 
