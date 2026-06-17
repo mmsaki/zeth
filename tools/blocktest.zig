@@ -49,7 +49,7 @@ var g_single: [1]ForkVariant = undefined;
 var g_fork: zeth.Fork = .prague; // set per-test from the matched network
 var g_check_hash = false; // ZETH_HASH=1: verify block hashes instead of state roots
 var g_check_receipts = false; // ZETH_RECEIPTS=1: also verify receipts root + logs bloom
-var g_import = false; // ZETH_IMPORT=1: drive the real chain.importBlock pipeline from RLP
+var g_import = true; // default: drive the real chain.importBlock pipeline from RLP (--json for the legacy JSON-reapplication path)
 
 /// A fork schedule pinned so `forkAt` always returns `f` (every block in a
 /// fixture shares one fork).
@@ -702,7 +702,8 @@ const USAGE =
     \\flags:
     \\  --all            run every fixture (don't stop at the first failure)
     \\  --fork <name>    run only fixtures for this fork (e.g. --fork London)
-    \\  --import         drive the real node import pipeline (chain.importBlock)
+    \\  --import         drive the real node import pipeline (chain.importBlock) — default
+    \\  --json           legacy JSON-reapplication path (incomplete; debugging only)
     \\  --receipts       also check the receipts root + logs bloom
     \\  --hash           check header RLP via the block hash (skip execution)
     \\  --trace          print an opcode trace
@@ -738,7 +739,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--all")) {
             g_stop = false;
         } else if (std.mem.eql(u8, arg, "--import")) {
-            g_import = true;
+            g_import = true; // default; kept for backward compatibility
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            g_import = false; // legacy JSON-reapplication path (incomplete; debugging only)
         } else if (std.mem.eql(u8, arg, "--receipts")) {
             g_check_receipts = true;
         } else if (std.mem.eql(u8, arg, "--hash")) {

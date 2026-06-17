@@ -44,7 +44,7 @@ test-ethereum:
 test-eest:
 	@test -d eest-fixtures || { echo "eest-fixtures/ missing — run 'make fixtures-eest' first"; exit 1; }
 	$(ZIG) build -Doptimize=ReleaseFast
-	./zig-out/bin/blocktest --all eest-fixtures/blockchain_tests
+	./zig-out/bin/blocktest --all --import eest-fixtures/blockchain_tests
 	./zig-out/bin/statetest --all eest-fixtures/state_tests
 
 ## hive — Docker integration: the same EEST fixtures driven against a running
