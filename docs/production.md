@@ -102,7 +102,14 @@ In rough dependency order:
    without a hardcoded enode. Discovery v5 (encrypted/ENR) not started.
 3. **Transaction pool + gossip** — accept, validate, propagate, and include txs.
 4. **Multi-peer + reorgs** — peer set, scoring, and robust fork choice.
-5. **snap sync** — state-range download for fast initial sync.
+5. **snap sync** (`snap/1`) — state-range download for fast initial sync, so a
+   node can join without replaying all history. Steps: a `snap/1` wire codec
+   (`GetAccountRange`/`GetStorageRanges`/`GetByteCodes`/`GetTrieNodes`); pick a
+   pivot block's state root; download account/storage ranges and verify each
+   against the pivot root with a **range Merkle proof** (building on the
+   `eth_getProof` MPT-proof code); reconstruct the state trie; then a **heal**
+   phase that fetches changed trie nodes as the head advances before switching
+   to full block execution. Depends on a multi-peer set (4) for throughput.
 6. **Hardening** — iterative EVM (drop the large-stack workaround), input
    fuzzing, resource/DoS limits, long-running soak tests.
 7. **Mainnet shadow-fork soak** — run alongside a reference client on a
