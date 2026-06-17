@@ -48,6 +48,10 @@ fn dispatch(ctx: *MainCtx) void {
         importChain(ctx.gpa, ctx.io, args[2..]) catch |e| {
             ctx.err = e;
         };
+    } else if (std.mem.eql(u8, cmd, "bench")) {
+        benchCmd(ctx.gpa, ctx.io, args[2..]) catch |e| {
+            ctx.err = e;
+        };
     } else if (std.mem.eql(u8, cmd, "produce")) {
         produceCmd(ctx.gpa, ctx.io, args[2..]) catch |e| {
             ctx.err = e;
@@ -936,6 +940,79 @@ fn importChain(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !vo
     std.debug.print("imported {d} block(s); head: number={d} hash=0x{s} stateRoot=0x{s}\n", .{
         imported, ch.head.number, std.fmt.bytesToHex(&head_hash, .lower), std.fmt.bytesToHex(&ch.head.state_root, .lower),
     });
+}
+
+/// `zeth bench <genesis.json> <chain.rlp ...>` — measure block-processing
+/// throughput in Mgas/s, the metric used to compare execution clients. Genesis
+/// load + RLP splitting are done up front (untimed); only the import loop
+/// (decode + execute + validate + index — everything a node does except the DB
+/// write) is timed. Feed it real mainnet block RLP (`geth export`) for a real
+/// number; the synthetic test chain works as a smoke test.
+fn benchCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (args.len < 2) {
+        std.debug.print("usage: zeth bench <genesis.json> <chain.rlp ...>\n", .{});
+        return error.MissingArgument;
+    }
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const gjson = try readFile(gpa, io, args[0]);
+    defer gpa.free(gjson);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, gjson, .{});
+    defer parsed.deinit();
+    var st = zeth.State.init(gpa);
+    defer st.deinit();
+    const g = try zeth.genesis.load(a, &st, parsed.value);
+    var ch = try zeth.chain.Chain.initGenesis(gpa, &st, g);
+    defer ch.deinit();
+
+    // Split every block out of the RLP files up front, so decoding the *outer*
+    // framing isn't counted against execution.
+    var blocks: std.ArrayList([]const u8) = .empty;
+    var buffers: std.ArrayList([]u8) = .empty;
+    defer for (buffers.items) |b| gpa.free(b);
+    for (args[1..]) |path| {
+        const data = try readFile(gpa, io, path);
+        try buffers.append(a, data);
+        var off: usize = 0;
+        while (off < data.len) {
+            const r = zeth.rlp.decodeItem(a, data[off..]) catch break;
+            try blocks.append(a, data[off .. off + r.consumed]);
+            off += r.consumed;
+        }
+    }
+    std.debug.print("benchmarking {d} blocks on chainId {d} …\n", .{ blocks.items.len, g.schedule.chain_id });
+
+    const t0 = std.Io.Clock.real.now(io).toNanoseconds();
+    var total_gas: u128 = 0;
+    var done: usize = 0;
+    for (blocks.items) |raw| {
+        const h = ch.importBlock(raw) catch |err| {
+            std.debug.print("import failed at block {d}: {s}\n", .{ ch.head.number + 1, @errorName(err) });
+            return err;
+        };
+        total_gas += h.gas_used;
+        done += 1;
+    }
+    const t1 = std.Io.Clock.real.now(io).toNanoseconds();
+
+    const dt_ns: i128 = @as(i128, t1) - @as(i128, t0);
+    const secs: f64 = @as(f64, @floatFromInt(dt_ns)) / 1_000_000_000.0;
+    const mgas_s: f64 = (@as(f64, @floatFromInt(total_gas)) / 1_000_000.0) / secs;
+    const blocks_s: f64 = @as(f64, @floatFromInt(done)) / secs;
+    const us_block: f64 = (secs * 1_000_000.0) / @as(f64, @floatFromInt(@max(done, 1)));
+    std.debug.print(
+        \\─────────────────────────────────────────────
+        \\ blocks      {d}
+        \\ total gas   {d}
+        \\ wall        {d:.3} s
+        \\ throughput  {d:.2} Mgas/s
+        \\ blocks/s    {d:.1}
+        \\ µs/block    {d:.1}
+        \\─────────────────────────────────────────────
+        \\
+    , .{ done, total_gas, secs, mgas_s, blocks_s, us_block });
 }
 
 /// `zeth produce <genesis.json> [chain.rlp ...] [--tx=0xRAW ...] [--coinbase=0x..]`
