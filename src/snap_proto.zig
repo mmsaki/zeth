@@ -128,6 +128,27 @@ pub fn encodeGetByteCodes(a: std.mem.Allocator, req_id: u64, hashes: []const [32
     return rlp.encodeList(a, &items);
 }
 
+/// snap/1 GetTrieNodes (0x06): request specific trie nodes by path under `root`.
+/// Each path set is a list of paths: `[accountPath]` for an account-trie node, or
+/// `[accountPath, slotPath, …]` for storage-trie nodes under that account (paths
+/// are the raw nibble/compact byte strings). The heal phase uses this to re-fetch
+/// nodes that changed as the pivot state root advanced during the range download.
+pub fn encodeGetTrieNodes(a: std.mem.Allocator, req_id: u64, root: [32]u8, path_sets: []const []const []const u8, response_bytes: u64) ![]u8 {
+    var sets = try a.alloc([]const u8, path_sets.len);
+    for (path_sets, 0..) |ps, i| {
+        var paths = try a.alloc([]const u8, ps.len);
+        for (ps, 0..) |p, j| paths[j] = try rlp.encodeBytes(a, p);
+        sets[i] = try rlp.encodeList(a, paths);
+    }
+    const items = [_][]const u8{
+        try rlp.encodeUint(a, req_id),
+        try rlp.encodeBytes(a, &root),
+        try rlp.encodeList(a, sets),
+        try rlp.encodeUint(a, response_bytes),
+    };
+    return rlp.encodeList(a, &items);
+}
+
 // ── response decoders (what a syncing node receives) ──────────────────────────
 
 pub const AccountEntry = struct { hash: [32]u8, account: Account };
@@ -199,6 +220,15 @@ pub fn decodeByteCodes(a: std.mem.Allocator, payload: []const u8) !struct { req_
     const f = try root.items();
     if (f.len < 2) return error.BadByteCodes;
     return .{ .req_id = try f[0].uint(u64), .codes = try decodeNodeList(a, f[1]) };
+}
+
+/// snap/1 TrieNodes (0x07): the raw trie-node blobs the peer returned, in the
+/// order requested. Verify each by keccak256 against the hash you asked for.
+pub fn decodeTrieNodes(a: std.mem.Allocator, payload: []const u8) !struct { req_id: u64, nodes: [][]const u8 } {
+    const root = try rlp.decode(a, payload);
+    const f = try root.items();
+    if (f.len < 2) return error.BadTrieNodes;
+    return .{ .req_id = try f[0].uint(u64), .nodes = try decodeNodeList(a, f[1]) };
 }
 
 fn decodeNodeList(a: std.mem.Allocator, item: rlp.Item) ![][]const u8 {
@@ -289,4 +319,37 @@ test "AccountRange decodes accounts + proof" {
     try testing.expectEqual(@as(u256, 99), ar.accounts[1].account.balance);
     try testing.expectEqual(@as(usize, 1), ar.proof.len);
     try testing.expectEqualStrings("proofnode", ar.proof[0]);
+}
+
+test "GetTrieNodes encodes path sets; TrieNodes decodes blobs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const root: [32]u8 = @splat(0xab);
+    const acct_path = [_]u8{ 0x01, 0x23 };
+    const slot_path = [_]u8{ 0x0a, 0xbc };
+    const path_sets = [_][]const []const u8{
+        &[_][]const u8{&acct_path}, // an account-trie node
+        &[_][]const u8{ &acct_path, &slot_path }, // a storage-trie node under it
+    };
+    const req = try encodeGetTrieNodes(a, 7, root, &path_sets, 64 * 1024);
+    // Re-decode the request envelope and check its shape.
+    const it = try rlp.decode(a, req);
+    const f = try it.items();
+    try testing.expectEqual(@as(u64, 7), try f[0].uint(u64));
+    try testing.expectEqualSlices(u8, &root, try f[1].bytes());
+    try testing.expectEqual(@as(usize, 2), (try f[2].items()).len);
+
+    // A TrieNodes response: [reqID, [node0, node1]].
+    const nodes = [_][]const u8{
+        try rlp.encodeBytes(a, "trie-node-blob-0"),
+        try rlp.encodeBytes(a, "trie-node-blob-1"),
+    };
+    const resp_items = [_][]const u8{ try rlp.encodeUint(a, 7), try rlp.encodeList(a, &nodes) };
+    const resp = try rlp.encodeList(a, &resp_items);
+    const tn = try decodeTrieNodes(a, resp);
+    try testing.expectEqual(@as(u64, 7), tn.req_id);
+    try testing.expectEqual(@as(usize, 2), tn.nodes.len);
+    try testing.expectEqualStrings("trie-node-blob-0", tn.nodes[0]);
 }
