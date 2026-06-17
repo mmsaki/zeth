@@ -34,7 +34,7 @@ test:
 test-ethereum:
 	$(ZIG) build -Doptimize=ReleaseFast
 	./zig-out/bin/statetest --all ethereum-tests/GeneralStateTests
-	./zig-out/bin/blocktest --all ethereum-tests/BlockchainTests
+	./zig-out/bin/blocktest --all --import ethereum-tests/BlockchainTests
 	bash scripts/eels.sh
 
 ## execution-spec-tests (EEST) — the modern EF fixtures, every fork. These are
