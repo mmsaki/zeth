@@ -1,4 +1,4 @@
-# zeth
+# 🦎 zeth
 
 An Ethereum execution-layer client written from scratch in Zig: EVM, state, Merkle-
 Patricia trie, transaction and block processing, JSON-RPC + Engine API, and a devp2p
