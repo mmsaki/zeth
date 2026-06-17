@@ -76,6 +76,10 @@ fn dispatch(ctx: *MainCtx) void {
         snapDump(ctx.gpa, ctx.io, args[2..]) catch |e| {
             ctx.err = e;
         };
+    } else if (std.mem.eql(u8, cmd, "snap-find")) {
+        snapFind(ctx.gpa, ctx.io, args[2..]) catch |e| {
+            ctx.err = e;
+        };
     } else {
         ctx.err = usage(args[0]);
     }
@@ -281,6 +285,99 @@ fn snapDump(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
         std.debug.print("\n", .{});
     }
     std.debug.print("===== END FIXTURE =====\n", .{});
+}
+
+/// Try one peer: eth/69 handshake, then a snap/1 GetAccountRange. On a real
+/// AccountRange response, dump the fixture and return true. Bounded reads so a
+/// silent peer can't hang the search indefinitely.
+fn tryPeerSnap(gpa: std.mem.Allocator, io: std.Io, enode: zeth.peer.Enode, network_id: u64, genesis_hash: [32]u8, fid: zeth.forkid.ForkId, root: [32]u8) bool {
+    const SNAP_BASE: u64 = 34;
+    const priv = zeth.ecies.randomPriv(io);
+    const pub_key = zeth.ecies.pubFromPriv(priv) catch return false;
+    const p = zeth.peer.Peer.dial(gpa, io, enode, priv) catch return false;
+    defer p.destroy();
+    p.sendHello(pub_key) catch return false;
+    gpa.free(p.readUntil(gpa, zeth.eth_proto.p2p.hello) catch return false);
+    var ha = std.heap.ArenaAllocator.init(gpa);
+    defer ha.deinit();
+    const st = zeth.eth_proto.Status69{ .version = 69, .network_id = network_id, .genesis_hash = genesis_hash, .fork_hash = fid.hash, .fork_next = fid.next, .latest_block_hash = genesis_hash };
+    p.writeMessage(zeth.eth_proto.eth.status, st.encode(ha.allocator()) catch return false) catch return false;
+    gpa.free(p.readUntil(gpa, zeth.eth_proto.eth.status) catch return false); // accepted (forkid ok)
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const origin = std.mem.zeroes([32]u8);
+    const limit: [32]u8 = @splat(0xff);
+    const req = zeth.snap_proto.encodeGetAccountRange(a, 1, root, origin, limit, 2000) catch return false;
+    p.writeMessage(SNAP_BASE + zeth.snap_proto.snap.get_account_range, req) catch return false;
+    // Bounded wait for the AccountRange (id 35).
+    var reads: usize = 0;
+    while (reads < 12) : (reads += 1) {
+        const msg = p.readMessage(gpa) catch return false;
+        defer gpa.free(msg.payload);
+        if (msg.id == SNAP_BASE + zeth.snap_proto.snap.account_range) {
+            const ar = zeth.snap_proto.decodeAccountRange(a, msg.payload) catch return false;
+            std.debug.print("\n===== REAL MAINNET AccountRange FIXTURE =====\n", .{});
+            std.debug.print("peer   = {s}:{d}\n", .{ enode.host, enode.port });
+            std.debug.print("root   = 0x{s}\n", .{std.fmt.bytesToHex(&root, .lower)});
+            std.debug.print("origin = 0x{s}\n", .{std.fmt.bytesToHex(&origin, .lower)});
+            std.debug.print("accounts = {d}, proofNodes = {d}\n", .{ ar.accounts.len, ar.proof.len });
+            for (ar.accounts) |e| {
+                const v = zeth.trie.accountValueRlp(a, e.account.nonce, e.account.balance, e.account.storage_root.?, e.account.code_hash.?);
+                std.debug.print("key 0x{s}  val 0x", .{std.fmt.bytesToHex(&e.hash, .lower)});
+                for (v) |b| std.debug.print("{x:0>2}", .{b});
+                std.debug.print("\n", .{});
+            }
+            for (ar.proof) |nd| {
+                std.debug.print("proof 0x", .{});
+                for (nd) |b| std.debug.print("{x:0>2}", .{b});
+                std.debug.print("\n", .{});
+            }
+            std.debug.print("===== END MAINNET FIXTURE =====\n", .{});
+            return true;
+        }
+        if (msg.id == zeth.eth_proto.p2p.ping) p.writeMessage(zeth.eth_proto.p2p.pong, "\xc0") catch {};
+        if (msg.id == zeth.eth_proto.p2p.disconnect) return false;
+    }
+    return false; // accepted eth but didn't serve snap in time
+}
+
+/// `zeth snap-find <bootnode-enode> <networkId> <genesisHash> <stateRoot>` —
+/// discover peers and try each until one accepts AND serves a snap AccountRange,
+/// then dump the fixture. The way to capture a real mainnet snap fixture.
+fn snapFind(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (args.len < 4) {
+        std.debug.print("usage: zeth snap-find <bootnode-enode> <networkId> <genesisHash> <stateRoot>\n", .{});
+        return;
+    }
+    const boot = try zeth.peer.parseEnode(args[0]);
+    const network_id = std.fmt.parseInt(u64, args[1], 10) catch 1;
+    const genesis_hash = hex32(args[2]);
+    const root = hex32(args[3]);
+    const fid = forkIdFor(network_id, genesis_hash);
+    const boot_ip = (net.Ip4Address.parse(boot.host, 0) catch return).bytes;
+
+    const priv = zeth.ecies.randomPriv(io);
+    var target: [64]u8 = undefined;
+    io.random(&target);
+    var nodes: [16]zeth.discv4.Node = undefined;
+    const n = zeth.discv4.bondAndFindNode(gpa, io, priv, boot_ip, boot.port, target, &nodes) catch |e| {
+        std.debug.print("✗ discovery failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    std.debug.print("discovery: {d} neighbors; searching for one that serves snap …\n", .{n});
+    for (nodes[0..n]) |node| {
+        if (node.ip_len != 4 or node.tcp == 0) continue;
+        var hostbuf: [16]u8 = undefined;
+        const host = std.fmt.bufPrint(&hostbuf, "{d}.{d}.{d}.{d}", .{ node.ip[0], node.ip[1], node.ip[2], node.ip[3] }) catch continue;
+        std.debug.print("  trying {s}:{d} …\n", .{ host, node.tcp });
+        if (tryPeerSnap(gpa, io, .{ .pubkey = node.id, .host = host, .port = node.tcp }, network_id, genesis_hash, fid, root)) {
+            std.debug.print("✓ captured a real snap fixture from {s}:{d}\n", .{ host, node.tcp });
+            return;
+        }
+    }
+    std.debug.print("\nno discovered peer served snap this round (all full/unreachable or eth-only).\n", .{});
 }
 
 /// `zeth discover <bootnode-enode> <networkId> <genesisHash>` — UDP discovery v4

@@ -17,6 +17,7 @@ py_ecc
 hive-python-api
 execution-apis
 ethereum-package-kurtosis
+mev-boost
 devp2p
 
 # Python

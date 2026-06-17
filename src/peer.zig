@@ -61,6 +61,9 @@ pub const Peer = struct {
     /// move); free it with `destroy`.
     pub fn dial(gpa: std.mem.Allocator, io: Io, enode: Enode, our_priv: [32]u8) !*Peer {
         var addr = try net.IpAddress.parse(enode.host, enode.port);
+        // NB: std.Io connect timeout is unimplemented in the pinned Zig
+        // (netConnectIpPosix panics on a non-none timeout), so dead peers use
+        // the OS default connect timeout — slow when sweeping many peers.
         const stream = try addr.connect(io, .{ .mode = .stream });
 
         const self = try gpa.create(Peer);
