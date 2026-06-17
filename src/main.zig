@@ -120,8 +120,18 @@ fn p2pConnect(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !voi
     else
         forkIdFor(network_id, genesis_hash);
 
-    const priv = zeth.ecies.randomPriv(io);
+    // Optional stable identity (`--key=<64hex>`); otherwise a fresh random key.
+    // A stable node id lets a peer add us with `admin.addTrustedPeer` so it
+    // accepts us past its peer limit — handy for a deterministic handshake test.
+    var priv = zeth.ecies.randomPriv(io);
+    for (args) |arg| if (std.mem.startsWith(u8, arg, "--key=")) {
+        const hx = arg["--key=".len..];
+        _ = std.fmt.hexToBytes(&priv, if (std.mem.startsWith(u8, hx, "0x")) hx[2..] else hx) catch {};
+    };
     const pub_key = try zeth.ecies.pubFromPriv(priv);
+    var id_hex: [128]u8 = undefined;
+    for (pub_key, 0..) |b, i| _ = std.fmt.bufPrint(id_hex[i * 2 ..][0..2], "{x:0>2}", .{b}) catch {};
+    std.debug.print("our node id: {s}\n", .{id_hex});
     std.debug.print("dialing {s}:{d} …\n", .{ enode.host, enode.port });
     const p = try zeth.peer.Peer.dial(gpa, io, enode, priv);
     defer p.destroy();
