@@ -23,7 +23,7 @@ brew uninstall zig && hash -r   # if you installed zig via Homebrew
 
 (or put `~/.zvm/bin` ahead of it on your `PATH`).
 
-## 2. Build + the tests that need nothing else
+## 2. Build + Zig tests
 
 ```sh
 git clone https://github.com/mmsaki/zeth && cd zeth
