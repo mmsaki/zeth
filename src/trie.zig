@@ -521,8 +521,318 @@ pub fn verifyRangeProof(
         return if (got) |val| std.mem.eql(u8, val, values[0]) else error.RangeInvalid;
     }
 
-    // General bounded case — sparse-trie reconstruction. Next increment.
-    return error.RangeUnsupported;
+    // General bounded case — sparse-trie reconstruction (geth VerifyRangeProof).
+    const first = bytesToNibblesTerm(a, keys[0][0..], false); // hex path (no terminator)
+    const last = bytesToNibblesTerm(a, keys[keys.len - 1][0..], false);
+
+    // Index proof nodes by hash, then reconstruct the two edge paths.
+    var by_hash = std.AutoHashMap([32]u8, rlp.Item).init(a);
+    for (proof) |node| {
+        const item = rlp.decode(a, node) catch return error.RangeInvalid;
+        by_hash.put(crypto.keccak256(node), item) catch @panic("oom");
+    }
+    var rootn = proofToPath(a, &by_hash, root, .nil, first);
+    if (rootn == .nil) return error.RangeInvalid;
+    rootn = proofToPath(a, &by_hash, root, rootn, last);
+
+    // Remove everything strictly between the two edges, then re-insert the leaves.
+    const emptied = unsetInternal(a, &rootn, first, last) catch return error.RangeInvalid;
+    if (emptied) rootn = .nil;
+    for (0..keys.len) |j| {
+        const path = bytesToNibblesTerm(a, keys[j][0..], true); // with leaf terminator
+        rootn = insertRN(a, rootn, path, values[j]);
+    }
+    const got = rootHashOf(a, rootn);
+    return std.mem.eql(u8, &got, &root);
+}
+
+// --- mutable sparse trie used only by verifyRangeProof -----------------------
+
+const TERM: u8 = 16; // hex-path leaf terminator nibble
+
+const RNode = union(enum) {
+    nil,
+    hash: [32]u8,
+    value: []const u8,
+    short: *RShort,
+    full: *RFull,
+};
+const RShort = struct { key: []u8, val: RNode }; // key in nibbles; leaf iff key ends in TERM
+const RFull = struct { ch: [17]RNode }; // ch[16] = value slot
+
+fn bytesToNibblesTerm(a: std.mem.Allocator, bytes: []const u8, leaf: bool) []u8 {
+    const base = bytesToNibbles(a, bytes);
+    if (!leaf) return base;
+    const out = a.alloc(u8, base.len + 1) catch @panic("oom");
+    @memcpy(out[0..base.len], base);
+    out[base.len] = TERM;
+    return out;
+}
+
+fn isLeafKey(key: []const u8) bool {
+    return key.len > 0 and key[key.len - 1] == TERM;
+}
+
+/// Decode a child-reference position of an RLP node into an RNode.
+fn decodeRef(a: std.mem.Allocator, it: rlp.Item) RNode {
+    switch (it) {
+        .list => return decodeNodeItem(a, it),
+        .str => |s| {
+            if (s.len == 0) return .nil;
+            if (s.len == 32) {
+                var h: [32]u8 = undefined;
+                @memcpy(&h, s);
+                return .{ .hash = h };
+            }
+            return .nil;
+        },
+    }
+}
+
+/// Decode a full RLP node (2-item short or 17-item full) into an RNode.
+fn decodeNodeItem(a: std.mem.Allocator, it: rlp.Item) RNode {
+    const items = it.items() catch return .nil;
+    if (items.len == 2) {
+        const raw = items[0].bytes() catch return .nil;
+        const cd = compactDecode(a, raw);
+        const s = a.create(RShort) catch @panic("oom");
+        if (cd.is_leaf) {
+            const key = a.alloc(u8, cd.nibbles.len + 1) catch @panic("oom");
+            @memcpy(key[0..cd.nibbles.len], cd.nibbles);
+            key[cd.nibbles.len] = TERM;
+            s.* = .{ .key = key, .val = .{ .value = items[1].bytes() catch "" } };
+        } else {
+            s.* = .{ .key = cd.nibbles, .val = decodeRef(a, items[1]) };
+        }
+        return .{ .short = s };
+    }
+    if (items.len == 17) {
+        const f = a.create(RFull) catch @panic("oom");
+        for (0..16) |k| f.ch[k] = decodeRef(a, items[k]);
+        const v = items[16].bytes() catch "";
+        f.ch[16] = if (v.len == 0) .nil else .{ .value = v };
+        return .{ .full = f };
+    }
+    return .nil;
+}
+
+/// Resolve the trie nodes along `key` from the proof set, returning the root.
+fn proofToPath(a: std.mem.Allocator, by_hash: *std.AutoHashMap([32]u8, rlp.Item), root_hash: [32]u8, existing: RNode, key: []const u8) RNode {
+    var r = existing;
+    if (r == .nil) {
+        const it = by_hash.get(root_hash) orelse return .nil;
+        r = decodeNodeItem(a, it);
+    }
+    resolvePath(a, by_hash, &r, key, 0);
+    return r;
+}
+
+fn resolvePath(a: std.mem.Allocator, by_hash: *std.AutoHashMap([32]u8, rlp.Item), np: *RNode, key: []const u8, pos: usize) void {
+    switch (np.*) {
+        .short => |s| {
+            if (isLeafKey(s.key)) return;
+            if (pos + s.key.len > key.len) return;
+            if (!std.mem.eql(u8, key[pos .. pos + s.key.len], s.key)) return;
+            resolveChild(a, by_hash, &s.val, key, pos + s.key.len);
+        },
+        .full => |f| {
+            if (pos >= key.len) return;
+            resolveChild(a, by_hash, &f.ch[key[pos]], key, pos + 1);
+        },
+        else => {},
+    }
+}
+
+fn resolveChild(a: std.mem.Allocator, by_hash: *std.AutoHashMap([32]u8, rlp.Item), cp: *RNode, key: []const u8, pos: usize) void {
+    switch (cp.*) {
+        .hash => |h| {
+            if (by_hash.get(h)) |it| {
+                cp.* = decodeNodeItem(a, it);
+                resolvePath(a, by_hash, cp, key, pos);
+            }
+        },
+        .short, .full => resolvePath(a, by_hash, cp, key, pos),
+        else => {},
+    }
+}
+
+/// Remove every node strictly between `left` and `right` paths. Returns true if
+/// the whole trie became empty (the range spans everything).
+fn unsetInternal(a: std.mem.Allocator, np: *RNode, left: []const u8, right: []const u8) !bool {
+    var pos: usize = 0;
+    var cur = np;
+    while (true) {
+        switch (cur.*) {
+            .short => |s| {
+                if (isLeafKey(s.key)) {
+                    // Leaf at the fork: both edges terminate here → range is all of it.
+                    cur.* = .nil;
+                    return true;
+                }
+                if (pos + s.key.len > left.len or pos + s.key.len > right.len) return error.RangeInvalid;
+                const lmatch = std.mem.eql(u8, left[pos .. pos + s.key.len], s.key);
+                const rmatch = std.mem.eql(u8, right[pos .. pos + s.key.len], s.key);
+                if (lmatch and rmatch) {
+                    pos += s.key.len;
+                    cur = &s.val;
+                    continue;
+                }
+                // The edges diverge inside this extension → everything under it is
+                // in range; drop the whole subtrie.
+                cur.* = .nil;
+                return true;
+            },
+            .full => |f| {
+                const ln = left[pos];
+                const rn = right[pos];
+                if (ln == rn) {
+                    pos += 1;
+                    cur = &f.ch[ln];
+                    continue;
+                }
+                // Fork: clear children strictly between the two edges.
+                var i: usize = @as(usize, ln) + 1;
+                while (i < rn) : (i += 1) f.ch[i] = .nil;
+                unsetSide(a, &f.ch[ln], left, pos + 1, false); // keep left edge, drop its right
+                unsetSide(a, &f.ch[rn], right, pos + 1, true); // keep right edge, drop its left
+                return false;
+            },
+            else => return error.RangeInvalid,
+        }
+    }
+}
+
+/// Walk `key` down `np`; drop all branches to one side of the path. `dropLeft`
+/// removes children with index < the path nibble (used on the right edge);
+/// otherwise removes children with index > the path nibble (the left edge).
+fn unsetSide(a: std.mem.Allocator, np: *RNode, key: []const u8, pos: usize, dropLeft: bool) void {
+    switch (np.*) {
+        .full => |f| {
+            const k = key[pos];
+            if (dropLeft) {
+                var i: usize = 0;
+                while (i < k) : (i += 1) f.ch[i] = .nil;
+            } else {
+                var i: usize = @as(usize, k) + 1;
+                while (i < 16) : (i += 1) f.ch[i] = .nil;
+                f.ch[16] = .nil; // the value at this node is left-of nothing → keep? see note
+            }
+            unsetSide(a, &f.ch[k], key, pos + 1, dropLeft);
+        },
+        .short => |s| {
+            if (isLeafKey(s.key)) {
+                np.* = .nil; // the edge leaf itself is part of the range; re-inserted later
+                return;
+            }
+            if (pos + s.key.len <= key.len and std.mem.eql(u8, key[pos .. pos + s.key.len], s.key)) {
+                unsetSide(a, &s.val, key, pos + s.key.len, dropLeft);
+            } else {
+                np.* = .nil; // diverging extension on the dropped side
+            }
+        },
+        .hash, .value => np.* = .nil,
+        .nil => {},
+    }
+}
+
+/// Standard MPT insert of (hex `key` with terminator → `value`) into `node`.
+fn insertRN(a: std.mem.Allocator, node: RNode, key: []const u8, value: []const u8) RNode {
+    switch (node) {
+        .nil => {
+            const s = a.create(RShort) catch @panic("oom");
+            s.* = .{ .key = a.dupe(u8, key) catch @panic("oom"), .val = .{ .value = value } };
+            return .{ .short = s };
+        },
+        .short => |s| {
+            const ml = commonPrefix(key, s.key);
+            if (ml == s.key.len and isLeafKey(s.key)) {
+                s.val = .{ .value = value }; // exact leaf overwrite
+                return node;
+            }
+            if (ml == s.key.len and !isLeafKey(s.key)) {
+                s.val = insertRN(a, s.val, key[ml..], value);
+                return node;
+            }
+            // Split the short node at ml.
+            const branch = a.create(RFull) catch @panic("oom");
+            for (&branch.ch) |*c| c.* = .nil;
+            placeRemainder(a, branch, s.key[ml..], s.val);
+            placeRemainder(a, branch, key[ml..], .{ .value = value });
+            if (ml == 0) return .{ .full = branch };
+            const ext = a.create(RShort) catch @panic("oom");
+            ext.* = .{ .key = a.dupe(u8, key[0..ml]) catch @panic("oom"), .val = .{ .full = branch } };
+            return .{ .short = ext };
+        },
+        .full => |f| {
+            f.ch[key[0]] = insertRN(a, f.ch[key[0]], key[1..], value);
+            return node;
+        },
+        else => {
+            // Overwriting a hash/value edge with a concrete leaf (range interior).
+            const s = a.create(RShort) catch @panic("oom");
+            s.* = .{ .key = a.dupe(u8, key) catch @panic("oom"), .val = .{ .value = value } };
+            return .{ .short = s };
+        },
+    }
+}
+
+/// Attach `rest` (a key suffix) → `val` under `branch`, either at the value slot
+/// (suffix is just the terminator) or as a short node at the suffix's first nibble.
+fn placeRemainder(a: std.mem.Allocator, branch: *RFull, rest: []const u8, val: RNode) void {
+    if (rest.len == 1 and rest[0] == TERM) {
+        branch.ch[16] = val; // leaf value sits directly in the branch value slot
+        return;
+    }
+    const s = a.create(RShort) catch @panic("oom");
+    s.* = .{ .key = a.dupe(u8, rest[1..]) catch @panic("oom"), .val = val };
+    branch.ch[rest[0]] = .{ .short = s };
+}
+
+// --- hashing the mutable trie (mirrors encodeSubtree) ------------------------
+
+fn rnRef(a: std.mem.Allocator, node: RNode) Item {
+    switch (node) {
+        .nil => return .{ .bytes = "" },
+        .hash => |h| return .{ .bytes = a.dupe(u8, &h) catch @panic("oom") },
+        .value => |v| return .{ .bytes = v },
+        else => {
+            const item = rnItem(a, node);
+            const enc = rlpEncode(a, item);
+            if (enc.len < 32) return item;
+            const h = a.create([32]u8) catch @panic("oom");
+            h.* = crypto.keccak256(enc);
+            return .{ .bytes = h };
+        },
+    }
+}
+
+fn rnItem(a: std.mem.Allocator, node: RNode) Item {
+    switch (node) {
+        .short => |s| {
+            const items = a.alloc(Item, 2) catch @panic("oom");
+            if (isLeafKey(s.key)) {
+                items[0] = .{ .bytes = compact(a, s.key[0 .. s.key.len - 1], true) };
+                items[1] = rnRef(a, s.val);
+            } else {
+                items[0] = .{ .bytes = compact(a, s.key, false) };
+                items[1] = rnRef(a, s.val);
+            }
+            return .{ .list = items };
+        },
+        .full => |f| {
+            const items = a.alloc(Item, 17) catch @panic("oom");
+            for (0..17) |k| items[k] = rnRef(a, f.ch[k]);
+            return .{ .list = items };
+        },
+        .value => |v| return .{ .bytes = v },
+        else => return .{ .bytes = "" },
+    }
+}
+
+fn rootHashOf(a: std.mem.Allocator, node: RNode) [32]u8 {
+    if (node == .nil) return EMPTY_TRIE_ROOT;
+    const enc = rlpEncode(a, rnItem(a, node));
+    return crypto.keccak256(enc);
 }
 
 test "range proof: empty proof rebuilds the whole trie" {
@@ -574,6 +884,43 @@ test "range proof: single key equals an inclusion proof" {
     // Wrong value for the proven key → not verified.
     const badv = [_][]const u8{"wrong-value"};
     try testing.expect(!try verifyRangeProof(al, root, keys[1..2], badv[0..], proof));
+}
+
+test "range proof: bounded range verifies and rejects tampering + gaps" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // 8 sorted 32-byte keys, distinct root nibbles; values long enough to hash.
+    var keys: [8][32]u8 = undefined;
+    var vals: [8][]const u8 = undefined;
+    for (0..8) |j| {
+        keys[j] = std.mem.zeroes([32]u8);
+        keys[j][0] = @intCast((j + 1) * 16);
+        keys[j][1] = @intCast(j);
+        vals[j] = "snap-account-body-value-long-enough-to-be-hashed-not-inlined-xxxx";
+    }
+    const pairs = al.alloc(KV, 8) catch unreachable;
+    for (0..8) |j| pairs[j] = .{ .key = keys[j][0..], .value = vals[j] };
+    const root = computeRoot(al, pairs, false);
+
+    // Range covering keys 2..5, with boundary proofs of key 2 (origin) and key 5.
+    const lo = 2;
+    const hi = 5;
+    var proof = std.ArrayList([]const u8).empty;
+    for (proveKey(al, pairs, false, keys[lo][0..])) |n| proof.append(al, n) catch unreachable;
+    for (proveKey(al, pairs, false, keys[hi][0..])) |n| proof.append(al, n) catch unreachable;
+
+    // Honest range → verifies.
+    try testing.expect(try verifyRangeProof(al, root, keys[lo .. hi + 1], vals[lo .. hi + 1], proof.items));
+    // Tampered interior value → rejected.
+    const tampered = [_][]const u8{ vals[2], "tampered-body", vals[4], vals[5] };
+    try testing.expect(!try verifyRangeProof(al, root, keys[lo .. hi + 1], tampered[0..], proof.items));
+    // Missing interior leaf (a gap the peer tried to hide) → rejected.
+    const gapKeys = [_][32]u8{ keys[2], keys[4], keys[5] };
+    const gapVals = [_][]const u8{ vals[2], vals[4], vals[5] };
+    try testing.expect(!try verifyRangeProof(al, root, gapKeys[0..], gapVals[0..], proof.items));
 }
 
 test "proof verifies for included and excluded secured keys" {
