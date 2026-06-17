@@ -43,6 +43,10 @@ pub const Tx = struct {
     /// EIP-4844 blob data fee (total_blob_gas × blob_gas_price), paid upfront
     /// and burned (never refunded).
     blob_data_fee: u256 = 0,
+    /// EIP-4844 worst-case blob fee for the balance-sufficiency check:
+    /// total_blob_gas × max_fee_per_blob_gas (the sender's cap, not the current
+    /// price). The sender must be able to afford their bid, like the gas fee cap.
+    blob_fee_cap: u256 = 0,
     /// EIP-7702 (type-4) authorizations. Applied as delegations at tx start.
     authorizations: []const Authorization = &.{},
 };
@@ -285,7 +289,7 @@ pub fn validate(state: *State, env: *const vm.Environment, tx: Tx, max_fee_cap: 
 
     // The sender must be able to cover the worst-case fee plus value. Compute in
     // u512 since gas_limit * max_fee_cap can exceed u256 for adversarial prices.
-    const max_gas_fee: u512 = @as(u512, tx.gas_limit) * max_fee_cap + tx.blob_data_fee + tx.value;
+    const max_gas_fee: u512 = @as(u512, tx.gas_limit) * max_fee_cap + tx.blob_fee_cap + tx.value;
     if (@as(u512, state.balanceOf(tx.sender)) < max_gas_fee) return .insufficient_funds;
 
     // EIP-3607: the sender must be an EOA (no code). Prague (EIP-7702) makes one

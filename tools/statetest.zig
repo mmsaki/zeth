@@ -209,6 +209,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
         // EIP-4844 blob transaction: compute the (burned) blob data fee, expose
         // the versioned hashes + blob base fee, and validate the blob fields.
         var blob_data_fee: u256 = 0;
+        var blob_fee_cap: u256 = 0;
         var blob_ok = true;
         if (tx_o.get("maxFeePerBlobGas") != null or tx_o.get("blobVersionedHashes") != null) {
             const excess = u256FromHex(jstr(env_o, "currentExcessBlobGas") orelse "0x0");
@@ -218,6 +219,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
             const bh = jarr(tx_o, "blobVersionedHashes");
             const blob_count: usize = if (bh) |x| x.len else 0;
             blob_data_fee = @as(u256, zeth.tx.GAS_PER_BLOB) * blob_count * price;
+            blob_fee_cap = @as(u256, zeth.tx.GAS_PER_BLOB) * blob_count * max_fee_per_blob_gas;
 
             // EIP-4844 validity: non-empty, version 0x01, fee cap, blob-gas limit,
             // and blob txs may not be contract creations.
@@ -292,6 +294,7 @@ fn runTest(gpa: std.mem.Allocator, rep: *report.Reporter, path: []const u8, name
             .access_list = access_list.items,
             .authorizations = auth_list.items,
             .blob_data_fee = blob_data_fee,
+            .blob_fee_cap = blob_fee_cap,
         };
 
         // Reject invalid transactions outright (state stays at the pre-state).
