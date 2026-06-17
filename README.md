@@ -25,7 +25,8 @@ and isn't ready.
 
 ## Quickstart
 
-Requires Zig `0.17.0-dev.702` (pinned in `build.zig.zon`). Full setup — including the
+Requires Zig nightly `0.17.0-dev.702` or newer (minimum set in `build.zig.zon`; install
+with `zvm i master`). Full setup — including the
 test fixtures, which aren't in the repo — is in **[docs/development.md](docs/development.md)**.
 
 ```sh
