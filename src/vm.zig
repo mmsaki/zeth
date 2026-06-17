@@ -1569,7 +1569,7 @@ pub fn processMessage(
     // Precompiled contracts (0x01–0x0a) run natively instead of the bytecode.
     if (message.code_address) |ca| {
         if (precompiles.idOf(ca, env.fork)) |id| {
-            if (precompiles.run(allocator, id, message.data, frame.gas_left)) |res| {
+            if (precompiles.run(allocator, id, message.data, frame.gas_left, env.fork)) |res| {
                 frame.gas_left -= res.gas;
                 frame.output = res.data;
                 frame.owned_output = res.data;

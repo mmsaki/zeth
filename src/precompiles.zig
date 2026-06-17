@@ -14,18 +14,19 @@ const Fork = @import("fork.zig").Fork;
 
 pub const Output = struct { data: []u8, gas: u64 };
 
-/// Return the precompile id if `addr` is an implemented precompile, else null:
-/// 0x01–0x09 (classic, every fork), 0x0a (KZG, Cancun+), 0x0b–0x11 (BLS12-381,
-/// Prague+).
+/// Return the precompile id if `addr` is a precompile *active at `fork`*, else
+/// null. Each is gated to the fork that introduced it, so on earlier forks the
+/// address is an ordinary (empty) account, not a precompile.
 pub fn idOf(addr: Address, fork: Fork) ?u8 {
     for (addr[0..19]) |b| if (b != 0) return null;
-    const id = addr[19];
-    // 0x01–0x09 are active for every fork we currently target (Cancun+).
-    if (id >= 1 and id <= 0x09) return id;
-    if (id == 0x0a) return if (fork.atLeast(.cancun)) id else null; // KZG (EIP-4844)
-    // BLS12-381 (EIP-2537): G1ADD/G1MSM/G2ADD/G2MSM/PAIRING/MAP_FP/MAP_FP2 — Prague.
-    if (id >= 0x0b and id <= 0x11) return if (fork.atLeast(.prague)) id else null;
-    return null;
+    return switch (addr[19]) {
+        0x01...0x04 => addr[19], // ecrecover/sha256/ripemd160/identity — Frontier
+        0x05...0x08 => if (fork.atLeast(.byzantium)) addr[19] else null, // modexp + bn254 (EIP-198/196/197)
+        0x09 => if (fork.atLeast(.istanbul)) addr[19] else null, // blake2f (EIP-152)
+        0x0a => if (fork.atLeast(.cancun)) addr[19] else null, // KZG (EIP-4844)
+        0x0b...0x11 => if (fork.atLeast(.prague)) addr[19] else null, // BLS12-381 (EIP-2537)
+        else => null,
+    };
 }
 
 fn words(len: usize) u64 {
@@ -35,16 +36,16 @@ fn words(len: usize) u64 {
 /// Run precompile `id` on `input` with `gas_available`. Returns the output and
 /// gas consumed, or null on out-of-gas / failure (which the caller turns into a
 /// reverted sub-call with empty output, per spec).
-pub fn run(allocator: std.mem.Allocator, id: u8, input: []const u8, gas_available: u64) ?Output {
+pub fn run(allocator: std.mem.Allocator, id: u8, input: []const u8, gas_available: u64, fork: Fork) ?Output {
     return switch (id) {
         0x01 => ecrecover(allocator, input, gas_available),
         0x02 => sha256(allocator, input, gas_available),
         0x03 => ripemd160(allocator, input, gas_available),
         0x04 => identity(allocator, input, gas_available),
-        0x05 => modexp(allocator, input, gas_available),
-        0x06 => bnAdd(allocator, input, gas_available),
-        0x07 => bnMul(allocator, input, gas_available),
-        0x08 => bnPairing(allocator, input, gas_available),
+        0x05 => modexp(allocator, input, gas_available, fork),
+        0x06 => bnAdd(allocator, input, gas_available, fork),
+        0x07 => bnMul(allocator, input, gas_available, fork),
+        0x08 => bnPairing(allocator, input, gas_available, fork),
         0x09 => blake2f(allocator, input, gas_available),
         0x0a => kzgPointEval(allocator, input, gas_available),
         0x0b => blsG1Add(allocator, input, gas_available),
@@ -129,6 +130,16 @@ fn mulmod(allocator: std.mem.Allocator, r: *Managed, a: *const Managed, b: *cons
 
 /// First min(32, exp_len) bytes of the exponent, as a big-endian integer (the
 /// "exponent head" the EIP-2565 iteration count is based on). Zero-padded.
+/// EIP-198 (pre-Berlin) modexp "multiplication complexity" of a byte length.
+/// Computed in u1024 so a huge declared length can't overflow before the gas
+/// guard rejects it.
+fn multComplexity198(x: u512) u1024 {
+    const xx: u1024 = @as(u1024, x) * @as(u1024, x);
+    if (x <= 64) return xx;
+    if (x <= 1024) return xx / 4 + 96 * @as(u1024, x) - 3072;
+    return xx / 16 + 480 * @as(u1024, x) - 199680;
+}
+
 fn modexpExpHead(input: []const u8, base_len: u256, exp_len: u256) u256 {
     if (exp_len == 0) return 0;
     const off_u: u256 = 96 + base_len;
@@ -144,35 +155,38 @@ fn modexpExpHead(input: []const u8, base_len: u256, exp_len: u256) u256 {
     return head;
 }
 
-/// EIP-2565 modexp. Input: base_len(32) ‖ exp_len(32) ‖ mod_len(32) ‖ base ‖ exp ‖ mod.
-fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64) ?Output {
+/// modexp (0x05). EIP-198 (Byzantium) gas, switched to the cheaper EIP-2565
+/// schedule from Berlin. Input: base_len(32) ‖ exp_len(32) ‖ mod_len(32) ‖ base ‖ exp ‖ mod.
+fn modexp(allocator: std.mem.Allocator, input: []const u8, gas_available: u64, fork: Fork) ?Output {
     var hdr: [96]u8 = std.mem.zeroes([96]u8);
     @memcpy(hdr[0..@min(input.len, 96)], input[0..@min(input.len, 96)]);
     const base_len = read32(hdr[0..32]);
     const exp_len = read32(hdr[32..64]);
     const mod_len = read32(hdr[64..96]);
 
-    // Gas (EIP-2565), computed without materializing huge operands. Work in u512
-    // so adversarial multi-thousand-bit lengths cannot overflow the arithmetic.
+    // Gas, in u1024 without materializing operands (a huge declared length can't
+    // overflow before the guard rejects it). Berlin (EIP-2565): complexity
+    // ceil(maxlen/8)^2, divisor 3, 200-gas floor. Byzantium (EIP-198): piecewise
+    // complexity, divisor 20, no floor.
     const max_len: u512 = @max(base_len, mod_len);
-    const w: u512 = (max_len + 7) / 8;
-    const mult_complexity: u512 = w * w;
-    // The cost is max(200, mult_complexity * max(iters,1) / 3), so its lower
-    // bound (iters == 1) is floor(mult_complexity / 3). If even that exceeds the
-    // gas available, reject before the (potentially enormous) iteration-count
-    // multiply. Comparing the *floored* term — not `mult_complexity > gas*3` —
-    // avoids rejecting inputs whose true cost is affordable (e.g. a 1024-byte
-    // operand costing exactly floor(16384/3) gas). After this guard passes,
-    // mult_complexity <= 3*gas + 2, so the iteration multiply stays within u512.
-    if (mult_complexity / 3 > gas_available) return null;
-    const iters: u512 = blk: {
+    const eip2565 = fork.atLeast(.berlin);
+    const mult_complexity: u1024 = if (eip2565) blk: {
+        const w: u1024 = (@as(u1024, max_len) + 7) / 8;
+        break :blk w * w;
+    } else multComplexity198(max_len);
+    const divisor: u1024 = if (eip2565) 3 else 20;
+    // Lower bound (iters == 1) is floor(mult_complexity / divisor); reject before
+    // the iteration multiply if even that exceeds the gas available. After this
+    // guard mult_complexity is bounded by ~divisor*gas, so the multiply stays small.
+    if (mult_complexity / divisor > gas_available) return null;
+    const iters: u1024 = blk: {
         const head = modexpExpHead(input, base_len, exp_len);
-        const head_bits: u512 = if (head == 0) 0 else 256 - @clz(head);
-        const adj: u512 = if (head_bits == 0) 0 else head_bits - 1;
-        break :blk if (exp_len <= 32) adj else 8 * (@as(u512, exp_len) - 32) + adj;
+        const head_bits: u1024 = if (head == 0) 0 else 256 - @clz(head);
+        const adj: u1024 = if (head_bits == 0) 0 else head_bits - 1;
+        break :blk if (exp_len <= 32) adj else 8 * (@as(u1024, exp_len) - 32) + adj;
     };
-    const dyn: u512 = mult_complexity * @max(iters, 1) / 3;
-    const cost_u: u512 = @max(@as(u512, 200), dyn);
+    const dyn: u1024 = mult_complexity * @max(iters, 1) / divisor;
+    const cost_u: u1024 = if (eip2565) @max(@as(u1024, 200), dyn) else dyn;
     if (cost_u > gas_available) return null;
     const cost: u64 = @intCast(cost_u);
 
@@ -374,16 +388,18 @@ fn encodeG1(allocator: std.mem.Allocator, p: bn254.G1) []u8 {
     return out;
 }
 
-fn bnAdd(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
-    const cost: u64 = 150;
+fn bnAdd(allocator: std.mem.Allocator, input: []const u8, gas: u64, fork: Fork) ?Output {
+    // EIP-1108 (Istanbul) repriced bn254 ecadd from 500 to 150.
+    const cost: u64 = if (fork.atLeast(.istanbul)) 150 else 500;
     if (cost > gas) return null;
     const p0 = decodeG1(input, 0) orelse return null;
     const p1 = decodeG1(input, 64) orelse return null;
     return .{ .data = encodeG1(allocator, p0.add(p1)), .gas = cost };
 }
 
-fn bnMul(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
-    const cost: u64 = 6000;
+fn bnMul(allocator: std.mem.Allocator, input: []const u8, gas: u64, fork: Fork) ?Output {
+    // EIP-1108 (Istanbul) repriced bn254 ecmul from 40000 to 6000.
+    const cost: u64 = if (fork.atLeast(.istanbul)) 6000 else 40000;
     if (cost > gas) return null;
     const p0 = decodeG1(input, 0) orelse return null;
     const n = word32(input, 64);
@@ -406,10 +422,11 @@ fn decodeG2(input: []const u8, off: usize) ?bn254.G2 {
     return q;
 }
 
-fn bnPairing(allocator: std.mem.Allocator, input: []const u8, gas: u64) ?Output {
+fn bnPairing(allocator: std.mem.Allocator, input: []const u8, gas: u64, fork: Fork) ?Output {
     if (input.len % 192 != 0) return null;
     const n_points: u64 = @intCast(input.len / 192);
-    const cost: u64 = 45000 + 34000 * n_points;
+    // EIP-1108 (Istanbul) repriced bn254 pairing: base 100000→45000, per-point 80000→34000.
+    const cost: u64 = if (fork.atLeast(.istanbul)) 45000 + 34000 * n_points else 100000 + 80000 * n_points;
     if (cost > gas) return null;
 
     const pts = allocator.alloc(bn254.PairPoint, @intCast(n_points)) catch @panic("oom");
@@ -818,7 +835,7 @@ test "modexp 3^2 mod 5 = 4" {
     input[96] = 3; // base
     input[97] = 2; // exp
     input[98] = 5; // mod
-    const out = run(testing.allocator, 5, &input, 100000).?;
+    const out = run(testing.allocator, 5, &input, 100000, .prague).?;
     defer testing.allocator.free(out.data);
     try testing.expectEqual(@as(usize, 1), out.data.len);
     try testing.expectEqual(@as(u8, 4), out.data[0]);
