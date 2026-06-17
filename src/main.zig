@@ -68,6 +68,10 @@ fn dispatch(ctx: *MainCtx) void {
         snapSync(ctx.gpa, ctx.io, args[2..]) catch |e| {
             ctx.err = e;
         };
+    } else if (std.mem.eql(u8, cmd, "discover")) {
+        discoverPeers(ctx.gpa, ctx.io, args[2..]) catch |e| {
+            ctx.err = e;
+        };
     } else {
         ctx.err = usage(args[0]);
     }
@@ -91,7 +95,7 @@ fn p2pConnect(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !voi
     }
     // Every fork on the devnet activates at genesis, so the forkid is just
     // CRC32(genesis) with no upcoming fork.
-    const fid = zeth.forkid.compute(genesis_hash, &.{}, 0);
+    const fid = forkIdFor(network_id, genesis_hash);
 
     const priv = zeth.ecies.randomPriv(io);
     const pub_key = try zeth.ecies.pubFromPriv(priv);
@@ -211,6 +215,88 @@ fn hex32(s: []const u8) [32]u8 {
     return out;
 }
 
+/// `zeth discover <bootnode-enode> <networkId> <genesisHash>` — UDP discovery v4
+/// against a bootnode to find fresh peers, then try the eth/69 handshake against
+/// each until one has a free slot (bootnodes are always full). Prints which
+/// peers accept us — the path to a usable mainnet peer.
+fn discoverPeers(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (args.len < 3) {
+        std.debug.print("usage: zeth discover <bootnode-enode> <networkId> <genesisHash>\n", .{});
+        return;
+    }
+    const boot = try zeth.peer.parseEnode(args[0]);
+    const network_id = std.fmt.parseInt(u64, args[1], 10) catch 1;
+    const genesis_hash = hex32(args[2]);
+    const fid = forkIdFor(network_id, genesis_hash);
+
+    const boot_ip = (net.Ip4Address.parse(boot.host, 0) catch {
+        std.debug.print("bootnode host must be an IPv4 literal\n", .{});
+        return;
+    }).bytes;
+
+    const priv = zeth.ecies.randomPriv(io);
+    const our_id = try zeth.ecies.pubFromPriv(priv);
+
+    // discovery v4: bond with the bootnode (ping/pong endpoint proof) and ask
+    // for neighbors near a random target.
+    std.debug.print("discovery v4: bonding with bootnode {s}:{d} …\n", .{ boot.host, boot.port });
+    var target: [64]u8 = undefined;
+    io.random(&target);
+    var nodes: [16]zeth.discv4.Node = undefined;
+    const n = zeth.discv4.bondAndFindNode(gpa, io, priv, boot_ip, boot.port, target, &nodes) catch |e| {
+        std.debug.print("✗ discovery failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    std.debug.print("✓ discovery returned {d} neighbor(s); trying the eth/69 handshake on each …\n", .{n});
+    _ = our_id;
+
+    var accepted: usize = 0;
+    for (nodes[0..n]) |node| {
+        if (node.ip_len != 4 or node.tcp == 0) continue;
+        var hostbuf: [16]u8 = undefined;
+        const host = std.fmt.bufPrint(&hostbuf, "{d}.{d}.{d}.{d}", .{ node.ip[0], node.ip[1], node.ip[2], node.ip[3] }) catch continue;
+        const enode = zeth.peer.Enode{ .pubkey = node.id, .host = host, .port = node.tcp };
+        const ok = tryHandshake(gpa, io, enode, network_id, genesis_hash, fid) catch false;
+        std.debug.print("  {s}:{d}  {s}\n", .{ host, node.tcp, if (ok) "✓ ACCEPTED — usable peer" else "✗ (dropped)" });
+        if (ok) accepted += 1;
+    }
+    std.debug.print("\n{d}/{d} discovered peers accepted our handshake\n", .{ accepted, n });
+}
+
+/// Dial a peer, run the eth/69 handshake, and report whether it accepted us
+/// (got past the peer's Status without a Disconnect).
+fn tryHandshake(gpa: std.mem.Allocator, io: std.Io, enode: zeth.peer.Enode, network_id: u64, genesis_hash: [32]u8, fid: zeth.forkid.ForkId) !bool {
+    const priv = zeth.ecies.randomPriv(io);
+    const pub_key = try zeth.ecies.pubFromPriv(priv);
+    const p = zeth.peer.Peer.dial(gpa, io, enode, priv) catch return false;
+    defer p.destroy();
+    p.sendHello(pub_key) catch return false;
+    gpa.free(p.readUntil(gpa, zeth.eth_proto.p2p.hello) catch return false);
+    var ha = std.heap.ArenaAllocator.init(gpa);
+    defer ha.deinit();
+    const st = zeth.eth_proto.Status69{ .version = 69, .network_id = network_id, .genesis_hash = genesis_hash, .fork_hash = fid.hash, .fork_next = fid.next, .latest_block_hash = genesis_hash };
+    p.writeMessage(zeth.eth_proto.eth.status, st.encode(ha.allocator()) catch return false) catch return false;
+    gpa.free(p.readUntil(gpa, zeth.eth_proto.eth.status) catch return false);
+    return true; // got the peer's Status → accepted (forkid/genesis matched)
+}
+
+/// EIP-2124 fork id for the peer handshake. Mainnet (chain 1) needs the full
+/// historical activation list (block forks then timestamp forks); an
+/// all-at-genesis devnet is just CRC32(genesis).
+fn forkIdFor(network_id: u64, genesis_hash: [32]u8) zeth.forkid.ForkId {
+    if (network_id == 1) {
+        // Homestead, DAO, Tangerine, SpuriousDragon, Byzantium, Constantinople/
+        // Petersburg (same block, deduped), Istanbul, MuirGlacier, Berlin,
+        // London, ArrowGlacier, GrayGlacier, then Shanghai/Cancun/Prague times.
+        const acts = [_]u64{
+            1150000, 1920000, 2463000, 2675000, 4370000, 7280000, 9069000, 9200000,
+            12244000, 12965000, 13773000, 15050000, 1681338455, 1710338135, 1746612311,
+        };
+        return zeth.forkid.compute(genesis_hash, &acts, 0);
+    }
+    return zeth.forkid.compute(genesis_hash, &.{}, 0);
+}
+
 /// `zeth snap <enode> <networkId> <genesisHash> <stateRoot>` — dial a peer,
 /// complete the eth/69 handshake, then issue a snap/1 GetAccountRange and decode
 /// the real AccountRange response (the first live exercise of the snap codec).
@@ -224,7 +310,7 @@ fn snapDemo(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
     const genesis_hash = hex32(args[2]);
     const state_root = hex32(args[3]);
     // All-at-genesis devnet forkid = CRC32(genesis); pass passed_forks for a real chain.
-    const fid = zeth.forkid.compute(genesis_hash, &.{}, 0);
+    const fid = forkIdFor(network_id, genesis_hash);
 
     // snap/1 rides the negotiated message-id range: 16 (p2p) + 18 (eth/69) = 34.
     const SNAP_BASE: u64 = 34;
@@ -302,7 +388,7 @@ fn snapSync(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
     const network_id = std.fmt.parseInt(u64, args[1], 10) catch 1;
     const genesis_hash = hex32(args[2]);
     const root = hex32(args[3]);
-    const fid = zeth.forkid.compute(genesis_hash, &.{}, 0);
+    const fid = forkIdFor(network_id, genesis_hash);
     const SNAP_BASE: u64 = 34;
 
     const priv = zeth.ecies.randomPriv(io);
@@ -563,7 +649,7 @@ fn syncCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     defer ch.deinit();
     const genesis_hash = try ch.head.hash(gpa);
     const network_id = g.schedule.chain_id;
-    const fid = zeth.forkid.compute(genesis_hash, &.{}, 0);
+    const fid = forkIdFor(network_id, genesis_hash);
     std.debug.print("genesis #0 0x{s} (chainId={d} forkid=0x{s})\n", .{ std.fmt.bytesToHex(&genesis_hash, .lower), network_id, std.fmt.bytesToHex(&fid.hash, .lower) });
 
     // Optional persistence: open the store and resume from a prior sync so we
