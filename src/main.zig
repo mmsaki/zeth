@@ -52,6 +52,14 @@ fn dispatch(ctx: *MainCtx) void {
         benchCmd(ctx.gpa, ctx.io, args[2..]) catch |e| {
             ctx.err = e;
         };
+    } else if (std.mem.eql(u8, cmd, "bench-evm")) {
+        benchEvm(ctx.gpa, ctx.io, args[2..]) catch |e| {
+            ctx.err = e;
+        };
+    } else if (std.mem.eql(u8, cmd, "peers")) {
+        peersCmd(ctx.gpa, ctx.io, args[2..]) catch |e| {
+            ctx.err = e;
+        };
     } else if (std.mem.eql(u8, cmd, "produce")) {
         produceCmd(ctx.gpa, ctx.io, args[2..]) catch |e| {
             ctx.err = e;
@@ -1030,6 +1038,106 @@ fn benchCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
         \\─────────────────────────────────────────────
         \\
     , .{ done, total_gas, secs, mgas_s, blocks_s, us_block });
+}
+
+/// `zeth bench-evm [gas]` — pure EVM-interpreter throughput. Runs a tight
+/// gas-bounded loop (JUMPDEST; PUSH1 1; PUSH1 1; ADD; POP; PUSH1 0; JUMP) with no
+/// state/trie/DB, isolating opcode dispatch + the stack machine. Reports Mgas/s,
+/// Mops/s, and ns/op — the baseline to optimize the dispatch loop against.
+fn benchEvm(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    const gas: u64 = if (args.len >= 1) (std.fmt.parseInt(u64, args[0], 10) catch 1_000_000_000) else 1_000_000_000;
+    const code = [_]u8{ 0x5b, 0x60, 0x01, 0x60, 0x01, 0x01, 0x50, 0x60, 0x00, 0x56 };
+    var evm = try zeth.Evm.init(gpa, &code, gas);
+    defer evm.deinit();
+
+    const t0 = std.Io.Clock.real.now(io).toNanoseconds();
+    evm.run();
+    const t1 = std.Io.Clock.real.now(io).toNanoseconds();
+
+    const gas_used = gas - evm.gas_left;
+    const dt_ns: i128 = @as(i128, t1) - @as(i128, t0);
+    const secs: f64 = @as(f64, @floatFromInt(dt_ns)) / 1_000_000_000.0;
+    const mgas: f64 = (@as(f64, @floatFromInt(gas_used)) / 1_000_000.0) / secs;
+    const mops: f64 = (@as(f64, @floatFromInt(evm.op_count)) / 1_000_000.0) / secs;
+    const ns_op: f64 = @as(f64, @floatFromInt(dt_ns)) / @as(f64, @floatFromInt(@max(evm.op_count, 1)));
+    std.debug.print(
+        \\EVM dispatch micro-benchmark (tight ADD loop)
+        \\ ops         {d}
+        \\ gas         {d}
+        \\ wall        {d:.3} s
+        \\ throughput  {d:.1} Mgas/s
+        \\ op rate     {d:.1} Mops/s
+        \\ per op      {d:.2} ns
+        \\
+    , .{ evm.op_count, gas_used, secs, mgas, mops, ns_op });
+}
+
+/// `zeth peers <bootnode-enode> <networkId> <genesisHash> [maxPeers]` — a
+/// discovery crawl: starting from a bootnode, repeatedly findnode for neighbors
+/// (growing the candidate set) and run the eth/69 handshake on each, logging a
+/// live peer count — the discovery+handshake pipeline that a persistent peer
+/// manager is built on. Sequential (no connect timeout in std yet, so dead nodes
+/// are slow); capped to keep the crawl bounded.
+fn peersCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (args.len < 3) {
+        std.debug.print("usage: zeth peers <bootnode-enode> <networkId> <genesisHash> [maxPeers]\n", .{});
+        return error.MissingArgument;
+    }
+    const boot = try zeth.peer.parseEnode(args[0]);
+    const network_id = std.fmt.parseInt(u64, args[1], 10) catch 1;
+    var genesis_hash = hex32(args[2]);
+    if (network_id == 1 and std.mem.eql(u8, &genesis_hash, &std.mem.zeroes([32]u8)))
+        genesis_hash = zeth.forkid.MAINNET_GENESIS_HASH;
+    const max_peers: usize = if (args.len >= 4) (std.fmt.parseInt(usize, args[3], 10) catch 8) else 8;
+    const fid = if (network_id == 1) zeth.forkid.mainnet(0, 0) else forkIdFor(network_id, genesis_hash);
+
+    const boot_ip = (net.Ip4Address.parse(boot.host, 0) catch {
+        std.debug.print("bootnode host must be an IPv4 literal\n", .{});
+        return error.InvalidArgument;
+    }).bytes;
+    const priv = zeth.ecies.randomPriv(io);
+
+    var seen = std.AutoHashMap([64]u8, void).init(gpa);
+    defer seen.deinit();
+    var queue: std.ArrayList(zeth.discv4.Node) = .empty;
+    defer queue.deinit(gpa);
+    var seed = zeth.discv4.Node{ .id = boot.pubkey, .ip_len = 4, .udp = boot.port, .tcp = boot.port };
+    @memcpy(seed.ip[0..4], &boot_ip);
+    try queue.append(gpa, seed);
+    try seen.put(boot.pubkey, {});
+
+    var live: usize = 0;
+    var discovered: usize = 0;
+    var queried: usize = 0;
+    const max_queries: usize = 16;
+    std.debug.print("peer crawl on network {d} — target {d} eth/69 peers …\n", .{ network_id, max_peers });
+    while (queue.items.len > 0 and live < max_peers and queried < max_queries) {
+        const node = queue.orderedRemove(0); // breadth-first
+        queried += 1;
+
+        // Ask this node for neighbours; enqueue any we haven't seen.
+        var target: [64]u8 = undefined;
+        io.random(&target);
+        var buf: [16]zeth.discv4.Node = undefined;
+        const n = zeth.discv4.bondAndFindNode(gpa, io, priv, node.ip[0..4].*, node.udp, target, &buf) catch 0;
+        for (buf[0..n]) |nb| {
+            if (seen.contains(nb.id)) continue;
+            seen.put(nb.id, {}) catch {};
+            discovered += 1;
+            queue.append(gpa, nb) catch {};
+        }
+
+        // Try the eth/69 handshake on this node.
+        if (node.ip_len == 4 and node.tcp != 0) {
+            var hostbuf: [16]u8 = undefined;
+            if (std.fmt.bufPrint(&hostbuf, "{d}.{d}.{d}.{d}", .{ node.ip[0], node.ip[1], node.ip[2], node.ip[3] })) |host| {
+                const enode = zeth.peer.Enode{ .pubkey = node.id, .host = host, .port = node.tcp };
+                if (tryHandshake(gpa, io, enode, network_id, genesis_hash, fid) catch false) live += 1;
+            } else |_| {}
+        }
+        std.debug.print("  peercount={d} discovered={d} queried={d} queue={d}\n", .{ live, discovered, queried, queue.items.len });
+    }
+    std.debug.print("\ncrawl done: {d} eth/69 peer(s) held, {d} node(s) discovered across {d} queries\n", .{ live, discovered, queried });
 }
 
 /// `zeth produce <genesis.json> [chain.rlp ...] [--tx=0xRAW ...] [--coinbase=0x..]`
