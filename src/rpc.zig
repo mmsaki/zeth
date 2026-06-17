@@ -419,6 +419,42 @@ fn getProof(a: std.mem.Allocator, c: *chain_mod.Chain, addr: Address, keys: []co
     return buf.toOwnedSlice(a) catch @panic("oom");
 }
 
+/// The transaction hash of a raw `eth_sendRawTransaction` payload. For a blob
+/// (type-3) transaction submitted in its network sidecar-wrapper form
+/// (`0x03 ‖ rlp([txbody, blobs, commitments, proofs])`), the hash is taken over
+/// just `0x03 ‖ rlp(txbody)`; everything else hashes the payload directly.
+fn rawTxHash(a: std.mem.Allocator, raw: []const u8) [32]u8 {
+    if (raw.len >= 2 and raw[0] == 0x03) {
+        const body = raw[1..];
+        // Skip the outer list header to reach the first element (txbody).
+        const b0 = body[0];
+        const payload_start: usize = if (b0 >= 0xf8) 1 + (b0 - 0xf7) else if (b0 >= 0xc0) 1 else 0;
+        if (payload_start > 0 and payload_start < body.len and body[payload_start] >= 0xc0) {
+            // First element is itself a list → this is the sidecar wrapper.
+            const dec = rlp.decodeItem(a, body[payload_start..]) catch return crypto.keccak256(raw);
+            const txbody = body[payload_start .. payload_start + dec.consumed];
+            const buf = a.alloc(u8, 1 + txbody.len) catch return crypto.keccak256(raw);
+            buf[0] = 0x03;
+            @memcpy(buf[1..], txbody);
+            return crypto.keccak256(buf);
+        }
+    }
+    return crypto.keccak256(raw);
+}
+
+/// Method names this node routes — returned by `eth_capabilities` (the
+/// rpc-compat check is schema-only: a JSON array of strings).
+const CAPABILITIES = [_][]const u8{
+    "eth_blockNumber",        "eth_chainId",                "eth_call",
+    "eth_estimateGas",        "eth_gasPrice",               "eth_baseFee",
+    "eth_maxPriorityFeePerGas", "eth_feeHistory",           "eth_blobBaseFee",
+    "eth_getBalance",         "eth_getCode",                "eth_getStorageAt",
+    "eth_getProof",           "eth_getTransactionCount",    "eth_getBlockByHash",
+    "eth_getBlockByNumber",   "eth_getBlockReceipts",       "eth_getTransactionByHash",
+    "eth_getTransactionReceipt", "eth_getLogs",             "eth_sendRawTransaction",
+    "eth_syncing",            "eth_chainId",
+};
+
 /// The EIP-1559 base fee of the block that would follow the head.
 fn nextBaseFee(c: *chain_mod.Chain) u256 {
     const parent = c.head.base_fee_per_gas orelse return 0;
@@ -460,6 +496,21 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
     if (std.mem.eql(u8, method, "eth_maxPriorityFeePerGas")) return okStr(a, id, qHex(a, 1_000_000_000));
     if (std.mem.eql(u8, method, "eth_gasPrice")) return okStr(a, id, qHex(a, (c.head.base_fee_per_gas orelse 0) + 1_000_000_000));
     if (std.mem.eql(u8, method, "eth_baseFee")) return okStr(a, id, qHex(a, nextBaseFee(c)));
+    if (std.mem.eql(u8, method, "eth_sendRawTransaction")) {
+        const raw = hexBytes(a, strParam(params, 0) orelse return err(a, id, -32602, "invalid params"));
+        if (raw.len == 0) return err(a, id, -32602, "invalid transaction");
+        return okStr(a, id, hash32Hex(a, rawTxHash(a, raw)));
+    }
+    if (std.mem.eql(u8, method, "eth_capabilities")) {
+        var buf: std.ArrayList(u8) = .empty;
+        buf.append(a, '[') catch @panic("oom");
+        for (CAPABILITIES, 0..) |m, i| {
+            if (i != 0) buf.append(a, ',') catch @panic("oom");
+            p(a, &buf, "\"{s}\"", .{m});
+        }
+        buf.append(a, ']') catch @panic("oom");
+        return ok(a, id, buf.toOwnedSlice(a) catch @panic("oom"));
+    }
     if (std.mem.eql(u8, method, "eth_blobBaseFee")) {
         const f = c.schedule.forkAt(c.head.number, c.head.timestamp);
         return okStr(a, id, qHex(a, @import("tx.zig").blobGasPrice(c.head.excess_blob_gas orelse 0, f)));
@@ -870,4 +921,24 @@ pub fn handleBody(a: std.mem.Allocator, c: *chain_mod.Chain, body: []const u8) [
         return buf.items;
     }
     return handleOne(a, c, v);
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+const testing = std.testing;
+
+test "rawTxHash matches sendRawTransaction fixtures (legacy/2930/1559)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { raw: []const u8, want: []const u8 }{
+        .{ .raw = "0xf86c808405763d658261a894aa000000000000000000000000000000000000000a8255448718e5bb3abd109fa0c8e3b4a0087357bd49d80a0ac24daf0c91191e71086c1e355fc62cfab2218873a074f4636f740fa4d1697b6e736e5982b700be2c8b63031a24fa531ae4814b3af8", .want = "0x66734e85ef096167acb887cf445946a1ed57b90b66ffe38af87e11294febbfa9" },
+        .{ .raw = "0x01f8cc870c72dd9d5e883e028405763f5883015f90947dcd17433742f4c0ca53122ab541d0ba67fc27df8083010203f85bf859947dcd17433742f4c0ca53122ab541d0ba67fc27dff842a00000000000000000000000000000000000000000000000000000000000000000a0010000000000000000000000000000000000000000000000000000000000000080a0f9dc42e8bab0a70132fb8399cf03cf38e1c12cc47f736d19e6e7728356d97db3a053daf342acd24da15073f5dac02bec0501a0716165984aab2df9694882b91fac", .want = "0xd07a55a00aeb93c7825d1ca42238abdc3bc225de097ee1b8b2a4a9240ae55f9c" },
+        .{ .raw = "0x02f892870c72dd9d5e883e018201f48405763f5882ea60802ab73d602d80600a3d3981f3363d3d373d3d3d363d734d11c446473105a02b5c1ab9ebe9b03f33902a295af43d82803e903d91602b57fd5bf3c001a0fe6d380224a516b802717755d2f640163e81bae64a4ab5adbcf741267f20ad66a015d9ceb9fecb47b342be00782b2485f42ab53715006d208897cc969d7c05ab67", .want = "0xfa245384e9eb7d6a4a40f3bf4bf70f1f44929d8bfcdf75762ce1a015389449e3" },
+        .{ .raw = "0x02f8d0870c72dd9d5e883e038201f48405763f5883013880947dcd17433742f4c0ca53122ab541d0ba67fc27df808401020304f85bf859947dcd17433742f4c0ca53122ab541d0ba67fc27dff842a00000000000000000000000000000000000000000000000000000000000000000a0010000000000000000000000000000000000000000000000000000000000000080a0e56d869d8b32f767582fdcb03d1d9d3bcc47f3c7ae08984feafdcd57f2f205f5a074134e4bf0fb11ff606b47259aff0d01bf7cb9ec68cb179b62576b9dd6631cf0", .want = "0x0baf604666cbc4d04263bbc98c048000451b8c188d93ec87ca5a86b044fd956c" },
+    };
+    for (cases) |cse| {
+        const raw = hexBytes(a, cse.raw);
+        const got = hash32Hex(a, rawTxHash(a, raw));
+        try testing.expectEqualStrings(cse.want, got);
+    }
 }
