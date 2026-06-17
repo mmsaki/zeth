@@ -1271,11 +1271,31 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
         for (c.hashes.items) |h| if (std.mem.eql(u8, &h, &head)) {
             known = true;
         };
-        const body = if (known)
-            std.fmt.allocPrint(a, "{{\"payloadStatus\":{{\"status\":\"VALID\",\"latestValidHash\":\"{s}\",\"validationError\":null}},\"payloadId\":null}}", .{hash32Hex(a, head)}) catch @panic("oom")
-        else
-            "{\"payloadStatus\":{\"status\":\"SYNCING\",\"latestValidHash\":null,\"validationError\":null},\"payloadId\":null}";
+        if (!known)
+            return ok(a, id, "{\"payloadStatus\":{\"status\":\"SYNCING\",\"latestValidHash\":null,\"validationError\":null},\"payloadId\":null}");
+
+        // payloadAttributes present (and head is our head) → start building a block,
+        // return a payloadId the CL collects with engine_getPayload.
+        var payload_id_json: []const u8 = "null";
+        if (params.len > 1 and params[1] == .object and std.mem.eql(u8, &head, &(c.head.hash(a) catch std.mem.zeroes([32]u8)))) {
+            const at = params[1].object;
+            const fork = c.schedule.forkAt(c.head.number + 1, parseU64(jstr(at, "timestamp") orelse "0x0"));
+            const attrs = chain_mod.Chain.ProduceAttrs{
+                .timestamp = parseU64(jstr(at, "timestamp") orelse "0x0"),
+                .prev_randao = fixed(32, jstr(at, "prevRandao")),
+                .fee_recipient = fixed(20, jstr(at, "suggestedFeeRecipient")),
+                .withdrawals = parseWithdrawals(a, at.get("withdrawals")),
+                .parent_beacon_block_root = if (fork.atLeast(.cancun)) fixed(32, jstr(at, "parentBeaconBlockRoot")) else null,
+            };
+            const pid = c.buildPayload(attrs) catch return err(a, id, -38003, "invalid payload attributes");
+            payload_id_json = std.fmt.allocPrint(a, "\"{s}\"", .{dataHex(a, &pid)}) catch @panic("oom");
+        }
+        const body = std.fmt.allocPrint(a, "{{\"payloadStatus\":{{\"status\":\"VALID\",\"latestValidHash\":\"{s}\",\"validationError\":null}},\"payloadId\":{s}}}", .{ hash32Hex(a, head), payload_id_json }) catch @panic("oom");
         return ok(a, id, body);
+    }
+    if (std.mem.startsWith(u8, method, "engine_getPayloadV")) {
+        const ver: u8 = std.fmt.parseInt(u8, method["engine_getPayloadV".len..], 10) catch 1;
+        return getPayload(a, c, id, params, ver);
     }
     if (std.mem.eql(u8, method, "engine_exchangeCapabilities")) {
         return ok(a, id,
@@ -1440,6 +1460,88 @@ fn computeRequestsHash(a: std.mem.Allocator, reqs: []std.json.Value) [32]u8 {
     return out;
 }
 
+/// Parse an Engine API payloadAttributes `withdrawals` array into raw RLP
+/// withdrawals (`[index, validatorIndex, address, amount]`), the form
+/// chain.produceBlock expects. Null/absent → empty.
+fn parseWithdrawals(a: std.mem.Allocator, wv: ?std.json.Value) []const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    if (wv) |v| if (v == .array) for (v.array.items) |w| if (w == .object) {
+        const o = w.object;
+        const items = [_][]const u8{
+            rlp.encodeUint(a, parseU64(jstr(o, "index") orelse "0x0")) catch @panic("oom"),
+            rlp.encodeUint(a, parseU64(jstr(o, "validatorIndex") orelse "0x0")) catch @panic("oom"),
+            rlp.encodeBytes(a, &fixed(20, jstr(o, "address"))) catch @panic("oom"),
+            rlp.encodeUint(a, parseU64(jstr(o, "amount") orelse "0x0")) catch @panic("oom"),
+        };
+        out.append(a, rlp.encodeList(a, &items) catch @panic("oom")) catch @panic("oom");
+    };
+    return out.items;
+}
+
+/// engine_getPayloadV* → return the block built under this payloadId as an
+/// ExecutionPayload, plus its blockValue (and, V3+, an empty blobsBundle).
+fn getPayload(a: std.mem.Allocator, c: *chain_mod.Chain, id: ?std.json.Value, params: []const std.json.Value, version: u8) []const u8 {
+    if (params.len < 1 or params[0] != .string) return err(a, id, -32602, "invalid params");
+    const pid = fixed(8, params[0].string);
+    const built = c.takePayload(pid) orelse return err(a, id, -38001, "unknown payload");
+    const h = built.block.header;
+
+    var ep: std.ArrayList(u8) = .empty;
+    p(a, &ep, "{{\"parentHash\":\"{s}\"", .{hash32Hex(a, h.parent_hash)});
+    p(a, &ep, ",\"feeRecipient\":\"{s}\"", .{dataHex(a, &h.coinbase)});
+    p(a, &ep, ",\"stateRoot\":\"{s}\"", .{hash32Hex(a, h.state_root)});
+    p(a, &ep, ",\"receiptsRoot\":\"{s}\"", .{hash32Hex(a, h.receipts_root)});
+    p(a, &ep, ",\"logsBloom\":\"{s}\"", .{dataHex(a, &h.logs_bloom)});
+    p(a, &ep, ",\"prevRandao\":\"{s}\"", .{dataHex(a, &h.prev_randao)});
+    p(a, &ep, ",\"blockNumber\":\"{s}\"", .{qHex(a, h.number)});
+    p(a, &ep, ",\"gasLimit\":\"{s}\"", .{qHex(a, h.gas_limit)});
+    p(a, &ep, ",\"gasUsed\":\"{s}\"", .{qHex(a, h.gas_used)});
+    p(a, &ep, ",\"timestamp\":\"{s}\"", .{qHex(a, h.timestamp)});
+    p(a, &ep, ",\"extraData\":\"{s}\"", .{dataHex(a, h.extra_data)});
+    p(a, &ep, ",\"baseFeePerGas\":\"{s}\"", .{qHex(a, h.base_fee_per_gas orelse 0)});
+    p(a, &ep, ",\"blockHash\":\"{s}\"", .{hash32Hex(a, h.hash(a) catch std.mem.zeroes([32]u8))});
+    ep.appendSlice(a, ",\"transactions\":[") catch @panic("oom");
+    for (built.block.transactions, 0..) |t, i| {
+        if (i > 0) ep.append(a, ',') catch @panic("oom");
+        p(a, &ep, "\"{s}\"", .{dataHex(a, t)});
+    }
+    ep.append(a, ']') catch @panic("oom");
+    if (version >= 2) { // Shanghai: withdrawals
+        ep.appendSlice(a, ",\"withdrawals\":[") catch @panic("oom");
+        for (built.block.withdrawals, 0..) |w, i| {
+            if (i > 0) ep.append(a, ',') catch @panic("oom");
+            ep.appendSlice(a, withdrawalJson(a, w)) catch @panic("oom");
+        }
+        ep.append(a, ']') catch @panic("oom");
+    }
+    if (version >= 3) { // Cancun: blob gas accounting
+        p(a, &ep, ",\"blobGasUsed\":\"{s}\"", .{qHex(a, h.blob_gas_used orelse 0)});
+        p(a, &ep, ",\"excessBlobGas\":\"{s}\"", .{qHex(a, h.excess_blob_gas orelse 0)});
+    }
+    ep.append(a, '}') catch @panic("oom");
+
+    var res: std.ArrayList(u8) = .empty;
+    p(a, &res, "{{\"executionPayload\":{s},\"blockValue\":\"{s}\"", .{ ep.items, qHex(a, built.fees) });
+    if (version >= 3) // empty blobs bundle (we don't build blob txs yet)
+        res.appendSlice(a, ",\"blobsBundle\":{\"commitments\":[],\"proofs\":[],\"blobs\":[]},\"shouldOverrideBuilder\":false") catch @panic("oom");
+    res.append(a, '}') catch @panic("oom");
+    return ok(a, id, res.items);
+}
+
+/// Decode a raw RLP withdrawal back to the Engine API JSON object form.
+fn withdrawalJson(a: std.mem.Allocator, raw: []const u8) []const u8 {
+    const item = rlp.decode(a, raw) catch return "{}";
+    const f = item.items() catch return "{}";
+    if (f.len != 4) return "{}";
+    const idx = f[0].uint(u64) catch 0;
+    const vi = f[1].uint(u64) catch 0;
+    const addr_b = f[2].bytes() catch return "{}";
+    const amt = f[3].uint(u64) catch 0;
+    var addr: [20]u8 = std.mem.zeroes([20]u8);
+    if (addr_b.len == 20) @memcpy(&addr, addr_b);
+    return std.fmt.allocPrint(a, "{{\"index\":\"{s}\",\"validatorIndex\":\"{s}\",\"address\":\"{s}\",\"amount\":\"{s}\"}}", .{ qHex(a, idx), qHex(a, vi), dataHex(a, &addr), qHex(a, amt) }) catch @panic("oom");
+}
+
 /// engine_newPayloadV* → import the payload, return the payload status.
 fn newPayload(a: std.mem.Allocator, c: *chain_mod.Chain, id: ?std.json.Value, params: []const std.json.Value, version: u8) []const u8 {
     if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
@@ -1532,6 +1634,68 @@ test "eth_sendRawTransaction admits the tx to the pending pool" {
     const resp = handleBody(a, &ch, body);
     try testing.expect(std.mem.indexOf(u8, resp, "\"result\"") != null); // hash returned
     try testing.expectEqual(@as(usize, 1), ch.txpool.count()); // and it's pending
+}
+
+test "engine: forkchoiceUpdated(attrs) → getPayload → newPayload round-trips VALID" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const priv = ecies.randomPriv(io);
+    const pk = try ecies.pubFromPriv(priv);
+    const sh = crypto.keccak256(&pk);
+    var addr_hex: [40]u8 = undefined;
+    for (sh[12..32], 0..) |byte, i| _ = std.fmt.bufPrint(addr_hex[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable;
+    const gjson = try std.fmt.allocPrint(a,
+        \\{{"config":{{"chainId":1,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"mergeNetsplitBlock":0,"terminalTotalDifficulty":0,"shanghaiTime":0}},
+        \\"gasLimit":"0x1000000","difficulty":"0x0","timestamp":"0x0",
+        \\"alloc":{{"{s}":{{"balance":"0xde0b6b3a7640000"}}}}}}
+    , .{addr_hex});
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, gjson, .{});
+    defer parsed.deinit();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    const g = try genesis_mod.load(a, &st, parsed.value);
+    var ch = try chain_mod.Chain.initGenesis(testing.allocator, &st, g);
+    defer ch.deinit();
+    const genesis_hash = hash32Hex(a, try ch.head.hash(a));
+
+    // A pending tx to include in the built block.
+    var to = std.mem.zeroes(state_mod.Address);
+    to[19] = 0x42;
+    try ch.txpool.add(try testsign.signLegacy(a, io, priv, 1, 0, 2_000_000_000, 21000, to, 1000));
+
+    // forkchoiceUpdatedV2 with payloadAttributes → expect a payloadId.
+    const fcu_body = try std.fmt.allocPrint(a,
+        \\{{"jsonrpc":"2.0","id":1,"method":"engine_forkchoiceUpdatedV2","params":[{{"headBlockHash":"{s}","safeBlockHash":"{s}","finalizedBlockHash":"{s}"}},{{"timestamp":"0xc","prevRandao":"0x0000000000000000000000000000000000000000000000000000000000000001","suggestedFeeRecipient":"0x00000000000000000000000000000000000000ee","withdrawals":[]}}]}}
+    , .{ genesis_hash, genesis_hash, genesis_hash });
+    const fcu_resp = handleBody(a, &ch, fcu_body);
+    var fcu = try std.json.parseFromSlice(std.json.Value, a, fcu_resp, .{});
+    defer fcu.deinit();
+    const payload_id = fcu.value.object.get("result").?.object.get("payloadId").?.string;
+    try testing.expect(!std.mem.eql(u8, payload_id, "null"));
+
+    // engine_getPayloadV2 → ExecutionPayload with our tx.
+    const gp_body = try std.fmt.allocPrint(a,
+        \\{{"jsonrpc":"2.0","id":2,"method":"engine_getPayloadV2","params":["{s}"]}}
+    , .{payload_id});
+    const gp_resp = handleBody(a, &ch, gp_body);
+    var gp = try std.json.parseFromSlice(std.json.Value, a, gp_resp, .{});
+    defer gp.deinit();
+    const exec_payload = gp.value.object.get("result").?.object.get("executionPayload").?;
+    try testing.expectEqualStrings("0x1", exec_payload.object.get("blockNumber").?.string);
+    try testing.expectEqual(@as(usize, 1), exec_payload.object.get("transactions").?.array.items.len);
+
+    // Feed it straight back into engine_newPayloadV2 → must validate.
+    var np_params: std.ArrayList(u8) = .empty;
+    try np_params.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"engine_newPayloadV2\",\"params\":[");
+    try np_params.appendSlice(a, gp_resp[std.mem.indexOf(u8, gp_resp, "\"executionPayload\":").? + "\"executionPayload\":".len .. std.mem.indexOf(u8, gp_resp, ",\"blockValue\"").?]);
+    try np_params.appendSlice(a, "]}");
+    const np_resp = handleBody(a, &ch, np_params.items);
+    try testing.expect(std.mem.indexOf(u8, np_resp, "\"VALID\"") != null);
 }
 
 test "rawTxHash matches sendRawTransaction fixtures (legacy/2930/1559)" {

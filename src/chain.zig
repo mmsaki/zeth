@@ -119,6 +119,11 @@ pub const Chain = struct {
     /// Pending transactions accepted via eth_sendRawTransaction, drawn on by the
     /// block producer and pruned (mined/stale nonces) after each import.
     txpool: mempool_mod.Mempool = undefined,
+    /// The most recent block built for the Engine API (forkchoiceUpdated →
+    /// payloadId), held until engine_getPayload collects it. Lives in its own
+    /// arena so its slices outlive the building RPC request.
+    payload: ?BuiltPayload = null,
+    payload_arena: ?std.heap.ArenaAllocator = null,
 
     pub fn initGenesis(gpa: std.mem.Allocator, state: *State, g: genesis_mod.Genesis) !Chain {
         var c = Chain{
@@ -157,6 +162,7 @@ pub const Chain = struct {
         self.sizes.deinit(self.gpa);
         self.tx_index.deinit(self.gpa);
         self.txpool.deinit();
+        if (self.payload_arena) |*pa| pa.deinit();
         if (self.genesis_state) |*gs| gs.deinit();
     }
 
@@ -531,12 +537,16 @@ pub const Chain = struct {
         return if (base > delta) base - delta else 0;
     }
 
+    /// A built block plus its value to the proposer (sum of priority fees), which
+    /// the Engine API reports as `blockValue` in engine_getPayload.
+    pub const ProduceResult = struct { block: block.Block, fees: u256 };
+
     /// Build the next block on top of the head (the producer/proposer side):
     /// apply the payload attributes, run the block-start system calls, include
     /// the given txs *skipping any that fail validation or don't fit*, apply
     /// withdrawals, and compute the full header. Built on a clone of the state so
     /// the chain head is untouched — import the returned block to apply it.
-    pub fn produceBlock(self: *Chain, a: std.mem.Allocator, attrs: ProduceAttrs, txs: []const []const u8) !block.Block {
+    pub fn produceBlock(self: *Chain, a: std.mem.Allocator, attrs: ProduceAttrs, txs: []const []const u8) !ProduceResult {
         const parent = self.head;
         const number = parent.number + 1;
         const fork = self.schedule.forkAt(number, attrs.timestamp);
@@ -583,6 +593,7 @@ pub const Chain = struct {
         var receipts: std.ArrayList(block.Receipt) = .empty;
         var cumulative_gas: u64 = 0;
         var blob_gas_used: u64 = 0;
+        var fees: u256 = 0; // proposer's take: Σ gas_used × (effective_price − base_fee)
         for (txs) |enc| {
             const dt = transaction.decode(a, enc) catch continue;
             const gas_price = dt.effectiveGasPrice(env.base_fee);
@@ -596,6 +607,7 @@ pub const Chain = struct {
             var logs: std.ArrayList(vm.Log) = .empty;
             const res = txmod.processWithReceipt(a, self.state, &env, tx, &logs);
             cumulative_gas += res.gas_used;
+            fees += @as(u256, res.gas_used) * (gas_price - env.base_fee);
             blob_gas_used += @as(u64, txmod.GAS_PER_BLOB) * dt.blob_versioned_hashes.len;
             const post_state: ?[32]u8 = if (fork.atLeast(.byzantium)) null else trie.stateRoot(a, self.state, false);
             try receipts.append(a, .{ .tx_type = dt.tx_type, .success = res.success, .cumulative_gas_used = cumulative_gas, .logs = logs.items, .post_state = post_state });
@@ -652,13 +664,51 @@ pub const Chain = struct {
             .parent_beacon_block_root = if (fork.atLeast(.cancun)) (attrs.parent_beacon_block_root orelse std.mem.zeroes([32]u8)) else null,
             .requests_hash = requests_hash,
         };
-        return block.Block{
+        return .{ .block = .{
             .header = hdr,
-            .transactions = try a.dupe([]const u8, included.items),
-            .withdrawals = attrs.withdrawals,
+            // Deep-copy into `a` so the block owns its bytes (the Engine path holds
+            // it past the building request; pool txs may be pruned meanwhile).
+            .transactions = try dupeSlices(a, included.items),
+            .withdrawals = try dupeSlices(a, attrs.withdrawals),
             .has_withdrawals = fork.atLeast(.shanghai),
             .ommers = &.{},
-        };
+        }, .fees = fees };
+    }
+
+    /// Engine API building: a payloadId plus the block it points at, held until
+    /// the consensus client fetches it with engine_getPayload. We keep only the
+    /// most recent build (one outstanding payload), in its own arena.
+    const BuiltPayload = struct { id: [8]u8, block: block.Block, fees: u256 };
+
+    /// Build a block from payload attributes (drawing pending txs from the pool)
+    /// and stash it under a fresh payloadId for engine_getPayload to collect.
+    pub fn buildPayload(self: *Chain, attrs: ProduceAttrs) ![8]u8 {
+        if (self.payload_arena) |*pa| pa.deinit();
+        self.payload_arena = std.heap.ArenaAllocator.init(self.gpa);
+        const a = self.payload_arena.?.allocator();
+
+        const fork = self.schedule.forkAt(self.head.number + 1, attrs.timestamp);
+        const base_fee: u256 = if (fork.atLeast(.london)) nextBaseFee(self.head) else 0;
+        const batch = try self.txpool.select(a, self.state, self.head.gas_limit, base_fee);
+        const res = try self.produceBlock(a, attrs, batch);
+
+        // payloadId = first 8 bytes of keccak(parentHash ‖ timestamp ‖ randao ‖ feeRecipient).
+        var pre: [92]u8 = undefined;
+        @memcpy(pre[0..32], &res.block.header.parent_hash);
+        std.mem.writeInt(u64, pre[32..40], attrs.timestamp, .big);
+        @memcpy(pre[40..72], &attrs.prev_randao);
+        @memcpy(pre[72..92], &attrs.fee_recipient);
+        var id: [8]u8 = undefined;
+        @memcpy(&id, crypto.keccak256(&pre)[0..8]);
+        self.payload = .{ .id = id, .block = res.block, .fees = res.fees };
+        return id;
+    }
+
+    /// The block previously built under `id` (engine_getPayload), or null.
+    pub fn takePayload(self: *Chain, id: [8]u8) ?BuiltPayload {
+        const p = self.payload orelse return null;
+        if (!std.mem.eql(u8, &p.id, &id)) return null;
+        return p;
     }
 
     /// Run a system call (caller = SYSTEM_ADDRESS, 30M gas, no fees) and return
@@ -681,6 +731,13 @@ pub const Chain = struct {
 
 fn bytesToU256(b: *const [32]u8) u256 {
     return std.mem.readInt(u256, b, .big);
+}
+
+/// Deep-copy a slice-of-byte-slices into `a` (outer array + each inner slice).
+fn dupeSlices(a: std.mem.Allocator, slices: []const []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, slices.len);
+    for (slices, 0..) |s, i| out[i] = try a.dupe(u8, s);
+    return out;
 }
 
 /// Deep-copy a tx's logs into `gpa` so they outlive the per-block arena.
@@ -755,9 +812,11 @@ test "produceBlock: include a signed tx, then self-validate by import" {
     try testing.expectEqual(@as(usize, 1), batch.len);
 
     // Build block 1 and self-validate it by importing (re-execution checks roots).
-    const blk = try ch.produceBlock(a, .{ .timestamp = ch.head.timestamp + 12 }, batch);
+    const built = try ch.produceBlock(a, .{ .timestamp = ch.head.timestamp + 12 }, batch);
+    const blk = built.block;
     try testing.expectEqual(@as(usize, 1), blk.transactions.len);
     try testing.expectEqual(@as(u64, 21000), blk.header.gas_used);
+    try testing.expectEqual(@as(u256, 21000) * (2_000_000_000 - blk.header.base_fee_per_gas.?), built.fees); // tip = gas × (price − base)
     const h = try ch.importDecoded(a, blk);
     try testing.expectEqual(@as(u64, 1), h.number);
     // The transfer + nonce bump landed.

@@ -1013,11 +1013,12 @@ fn produceCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !voi
         .fee_recipient = coinbase,
         .parent_beacon_block_root = if (next_fork.atLeast(.cancun)) std.mem.zeroes([32]u8) else null,
     };
-    const blk = try ch.produceBlock(a, attrs, batch);
+    const built = try ch.produceBlock(a, attrs, batch);
+    const blk = built.block;
     const ph = try ch.head.hash(gpa);
     std.debug.print("built block {d} on parent 0x{s}\n", .{ blk.header.number, std.fmt.bytesToHex(&ph, .lower) });
-    std.debug.print("  txs={d} gasUsed={d} stateRoot=0x{s} txRoot=0x{s} receiptsRoot=0x{s}\n", .{
-        blk.transactions.len, blk.header.gas_used,
+    std.debug.print("  txs={d} gasUsed={d} value={d} wei stateRoot=0x{s} txRoot=0x{s} receiptsRoot=0x{s}\n", .{
+        blk.transactions.len, blk.header.gas_used, built.fees,
         std.fmt.bytesToHex(&blk.header.state_root, .lower),
         std.fmt.bytesToHex(&blk.header.transactions_root, .lower),
         std.fmt.bytesToHex(&blk.header.receipts_root, .lower),
