@@ -72,6 +72,10 @@ fn dispatch(ctx: *MainCtx) void {
         discoverPeers(ctx.gpa, ctx.io, args[2..]) catch |e| {
             ctx.err = e;
         };
+    } else if (std.mem.eql(u8, cmd, "snap-dump")) {
+        snapDump(ctx.gpa, ctx.io, args[2..]) catch |e| {
+            ctx.err = e;
+        };
     } else {
         ctx.err = usage(args[0]);
     }
@@ -213,6 +217,70 @@ fn hex32(s: []const u8) [32]u8 {
     const b = if (std.mem.startsWith(u8, s, "0x")) s[2..] else s;
     _ = std.fmt.hexToBytes(&out, b) catch {};
     return out;
+}
+
+/// `zeth snap-dump <enode> <networkId> <genesisHash> <stateRoot>` — fetch one
+/// small AccountRange from a peer and dump the verifier fixture (root, origin,
+/// keys, values, proof nodes) as hex, for unit-testing verifyRangeProof against
+/// a real geth boundary proof.
+fn snapDump(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (args.len < 4) {
+        std.debug.print("usage: zeth snap-dump <enode> <networkId> <genesisHash> <stateRoot>\n", .{});
+        return;
+    }
+    const enode = try zeth.peer.parseEnode(args[0]);
+    const network_id = std.fmt.parseInt(u64, args[1], 10) catch 1;
+    const genesis_hash = hex32(args[2]);
+    const root = hex32(args[3]);
+    const fid = forkIdFor(network_id, genesis_hash);
+    const SNAP_BASE: u64 = 34;
+
+    const priv = zeth.ecies.randomPriv(io);
+    const pub_key = try zeth.ecies.pubFromPriv(priv);
+    const p = try zeth.peer.Peer.dial(gpa, io, enode, priv);
+    defer p.destroy();
+    try p.sendHello(pub_key);
+    gpa.free(try p.readUntil(gpa, zeth.eth_proto.p2p.hello));
+    {
+        var ha = std.heap.ArenaAllocator.init(gpa);
+        defer ha.deinit();
+        const our_status = zeth.eth_proto.Status69{ .version = 69, .network_id = network_id, .genesis_hash = genesis_hash, .fork_hash = fid.hash, .fork_next = fid.next, .latest_block_hash = genesis_hash };
+        try p.writeMessage(zeth.eth_proto.eth.status, try our_status.encode(ha.allocator()));
+        gpa.free(try p.readUntil(gpa, zeth.eth_proto.eth.status));
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const origin = std.mem.zeroes([32]u8);
+    const limit: [32]u8 = @splat(0xff);
+    // Small responseBytes → a handful of accounts + a real boundary proof.
+    const req = try zeth.snap_proto.encodeGetAccountRange(a, 1, root, origin, limit, 2000);
+    try p.writeMessage(SNAP_BASE + zeth.snap_proto.snap.get_account_range, req);
+    const resp = try p.readUntil(gpa, SNAP_BASE + zeth.snap_proto.snap.account_range);
+    defer gpa.free(resp);
+    const ar = try zeth.snap_proto.decodeAccountRange(a, resp);
+
+    std.debug.print("\n===== REAL GETH AccountRange FIXTURE (verifyRangeProof) =====\n", .{});
+    std.debug.print("root   = 0x{s}\n", .{std.fmt.bytesToHex(&root, .lower)});
+    std.debug.print("origin = 0x{s}\n", .{std.fmt.bytesToHex(&origin, .lower)});
+    std.debug.print("accounts = {d}, proofNodes = {d}\n", .{ ar.accounts.len, ar.proof.len });
+    std.debug.print("\nkeys (account hashes):\n", .{});
+    for (ar.accounts) |e| std.debug.print("  0x{s}\n", .{std.fmt.bytesToHex(&e.hash, .lower)});
+    std.debug.print("\nvalues (full account RLP — [nonce, balance, storageRoot, codeHash]):\n", .{});
+    for (ar.accounts) |e| {
+        const v = zeth.trie.accountValueRlp(a, e.account.nonce, e.account.balance, e.account.storage_root.?, e.account.code_hash.?);
+        std.debug.print("  0x", .{});
+        for (v) |b| std.debug.print("{x:0>2}", .{b});
+        std.debug.print("\n", .{});
+    }
+    std.debug.print("\nproof nodes (RLP, in order):\n", .{});
+    for (ar.proof) |nd| {
+        std.debug.print("  0x", .{});
+        for (nd) |b| std.debug.print("{x:0>2}", .{b});
+        std.debug.print("\n", .{});
+    }
+    std.debug.print("===== END FIXTURE =====\n", .{});
 }
 
 /// `zeth discover <bootnode-enode> <networkId> <genesisHash>` — UDP discovery v4
