@@ -10,6 +10,21 @@ Simulators that apply to zeth:
 - `ethereum/eels/consume-engine` — feeds fixtures via `newPayload` / `forkchoiceUpdated`
 - `ethereum/rpc-compat` — `eth_*` RPC conformance
 
+## First-time setup
+
+`make test-hive` expects a built [ethereum/hive](https://github.com/ethereum/hive)
+checkout at `./hive` (it calls `cd hive && ./hive …`). The Makefile does **not** clone or
+build it — do that once. Needs Go and a running Docker daemon.
+
+```sh
+git clone https://github.com/ethereum/hive   # into ./hive
+cd hive && go build . && cd ..                # produces the ./hive binary
+docker info >/dev/null && echo "docker ready" # hive drives client containers
+```
+
+`make hive-stage` only creates `hive/clients/zeth/` and copies the adapter in — if you
+see `./hive: No such file or directory`, the checkout above is missing.
+
 ## Run
 
 ```sh

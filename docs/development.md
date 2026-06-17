@@ -85,8 +85,16 @@ image, which requires Docker + the hive checkout below.)
 
 ## 4. hive (optional, Docker)
 
-`make test-hive` drives a containerized zeth. Needs Docker and a hive checkout next to
-the repo; see [hive.md](./hive.md).
+`make test-hive` drives a containerized zeth. It expects a built
+[ethereum/hive](https://github.com/ethereum/hive) checkout at `./hive` — the Makefile
+doesn't clone or build it. Once, with Go + Docker:
+
+```sh
+git clone https://github.com/ethereum/hive   # into ./hive
+cd hive && go build . && cd ..                # produces the ./hive binary
+```
+
+Then `make test-hive`. See [hive.md](./hive.md) for simulators and the edit loop.
 
 ## 5. Cross-client benchmark (optional)
 
