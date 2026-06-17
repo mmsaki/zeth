@@ -64,6 +64,10 @@ fn dispatch(ctx: *MainCtx) void {
         snapDemo(ctx.gpa, ctx.io, args[2..]) catch |e| {
             ctx.err = e;
         };
+    } else if (std.mem.eql(u8, cmd, "snap-sync")) {
+        snapSync(ctx.gpa, ctx.io, args[2..]) catch |e| {
+            ctx.err = e;
+        };
     } else {
         ctx.err = usage(args[0]);
     }
@@ -281,6 +285,81 @@ fn snapDemo(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
         std.debug.print("    acct 0x{s}…  nonce={d} balance={d} wei\n", .{ std.fmt.bytesToHex(e.hash[0..6], .lower), e.account.nonce, e.account.balance });
     }
     std.debug.print("✓ decoded a real snap/1 AccountRange from geth — codec verified live\n", .{});
+}
+
+/// `zeth snap-sync <enode> <networkId> <genesisHash> <pivotStateRoot>` — download
+/// the entire account trie from a peer over snap/1 (walking the key-space), then
+/// rebuild the account trie locally and verify its root matches the pivot state
+/// root. This proves the full account state was downloaded and cryptographically
+/// verified end-to-end (storage tries + bytecodes + executable state are the
+/// next steps).
+fn snapSync(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (args.len < 4) {
+        std.debug.print("usage: zeth snap-sync <enode://...> <networkId> <genesisHash> <pivotStateRoot>\n", .{});
+        return;
+    }
+    const enode = try zeth.peer.parseEnode(args[0]);
+    const network_id = std.fmt.parseInt(u64, args[1], 10) catch 1;
+    const genesis_hash = hex32(args[2]);
+    const root = hex32(args[3]);
+    const fid = zeth.forkid.compute(genesis_hash, &.{}, 0);
+    const SNAP_BASE: u64 = 34;
+
+    const priv = zeth.ecies.randomPriv(io);
+    const pub_key = try zeth.ecies.pubFromPriv(priv);
+    const p = try zeth.peer.Peer.dial(gpa, io, enode, priv);
+    defer p.destroy();
+    try p.sendHello(pub_key);
+    gpa.free(try p.readUntil(gpa, zeth.eth_proto.p2p.hello));
+    {
+        var ha = std.heap.ArenaAllocator.init(gpa);
+        defer ha.deinit();
+        const our_status = zeth.eth_proto.Status69{ .version = 69, .network_id = network_id, .genesis_hash = genesis_hash, .fork_hash = fid.hash, .fork_next = fid.next, .latest_block_hash = genesis_hash };
+        try p.writeMessage(zeth.eth_proto.eth.status, try our_status.encode(ha.allocator()));
+        gpa.free(try p.readUntil(gpa, zeth.eth_proto.eth.status));
+    }
+    std.debug.print("✓ eth/69 handshake; snap-syncing account trie at root 0x{s}…\n", .{std.fmt.bytesToHex(root[0..6], .lower)});
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var pairs: std.ArrayList(zeth.trie.KV) = .empty;
+    var origin = std.mem.zeroes([32]u8);
+    const limit: [32]u8 = @splat(0xff);
+    var requests: usize = 0;
+    while (requests < 1000) : (requests += 1) {
+        const req = try zeth.snap_proto.encodeGetAccountRange(a, requests + 1, root, origin, limit, 200_000);
+        try p.writeMessage(SNAP_BASE + zeth.snap_proto.snap.get_account_range, req);
+        const resp = try p.readUntil(gpa, SNAP_BASE + zeth.snap_proto.snap.account_range);
+        defer gpa.free(resp);
+        const ar = try zeth.snap_proto.decodeAccountRange(a, resp);
+        if (ar.accounts.len == 0) break;
+        for (ar.accounts) |e| {
+            const key = a.dupe(u8, &e.hash) catch return error.OutOfMemory;
+            const val = zeth.trie.accountValueRlp(a, e.account.nonce, e.account.balance, e.account.storage_root.?, e.account.code_hash.?);
+            try pairs.append(a, .{ .key = key, .value = val });
+        }
+        const last = ar.accounts[ar.accounts.len - 1].hash;
+        std.debug.print("  ← AccountRange #{d}: {d} accounts (total {d}), last 0x{s}…\n", .{ requests + 1, ar.accounts.len, pairs.items.len, std.fmt.bytesToHex(last[0..6], .lower) });
+        // Done when the range was complete (no boundary proof) or reached the end.
+        if (ar.proof.len == 0 or std.mem.eql(u8, &last, &limit)) break;
+        var n = std.mem.readInt(u256, &last, .big);
+        n +%= 1;
+        std.mem.writeInt(u256, &origin, n, .big);
+    }
+
+    // Rebuild the account trie from the downloaded (hashedKey → account) pairs;
+    // the keys are already keccak(address), so the trie is unsecured here.
+    const got = zeth.trie.computeRoot(a, pairs.items, false);
+    const match = std.mem.eql(u8, &got, &root);
+    std.debug.print("\nsnap-sync: {d} accounts in {d} request(s)\n  rebuilt root = 0x{s}\n  pivot  root = 0x{s}\n  {s}\n", .{
+        pairs.items.len,
+        requests + 1,
+        std.fmt.bytesToHex(&got, .lower),
+        std.fmt.bytesToHex(&root, .lower),
+        if (match) "✓ ROOT MATCHES — account state downloaded and verified" else "✗ root mismatch",
+    });
 }
 
 /// Dial `enode`, complete the eth/69 handshake, then download headers + bodies
