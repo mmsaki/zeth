@@ -32,6 +32,16 @@ mine() { rpc evm_mine >/dev/null; }
 num()  { cast call "$1" "$2" "${@:3}" --rpc-url $RPC | awk '{print $1}'; }   # uint256 -> decimal
 send() { rpc eth_sendRawTransaction "$1" | tr -d '"'; }                       # -> tx hash (no wait)
 
+# verbose JSON-RPC: print the real request + response, keep the response in $LAST.
+LAST=""
+jrpc() { # $1 method  $2 params(JSON)
+  local req="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}"
+  echo "  → ${req:0:200}$([ ${#req} -gt 200 ] && echo " …(${#req}b)")"
+  LAST=$(curl -s -H 'content-type: application/json' -d "$req" "$RPC")
+  echo "  ← ${LAST:0:200}$([ ${#LAST} -gt 200 ] && echo " …(${#LAST}b)")"
+}
+res() { printf '%s' "$LAST" | jq -r "$1"; }
+
 BYTECODE=$(forge inspect src/MiniAMM.sol:MiniAMM bytecode)
 R=1000000000000000000000   # 1000e18 reserves
 deploy() { # -> deployed address
@@ -52,19 +62,20 @@ fund "$AMM" "$VICTIM"   100000000000000000000
 fund "$AMM" "$ATTACKER" 300000000000000000000
 echo "  MiniAMM @ $AMM  (reserves 1000/1000)"
 
-FID=$(rpc eth_newPendingTransactionFilter | tr -d '"')                       # searcher starts listening
+echo "  searcher starts listening:"
+jrpc eth_newPendingTransactionFilter "[]"; FID=$(res .result)
 VRAW=$(cast mktx --private-key $VICTIM_PK --rpc-url $RPC --gas-limit 300000 "$AMM" "swap0for1(uint256)" 100000000000000000000)
-send "$VRAW" >/dev/null                                                       # victim -> PUBLIC mempool (pending)
-echo "  victim broadcast swap (100) to the public mempool"
-
-VHASH=$(rpc eth_getFilterChanges "$FID" | jq -r '.[0]')                       # searcher sees it
-VSIG=$(rpc eth_getRawTransactionByHash "$VHASH" | tr -d '"')                  # pulls the signed tx
+echo "  victim broadcasts the swap to the public mempool:"
+jrpc eth_sendRawTransaction "[\"$VRAW\"]"
+echo "  searcher sees it on the filter and pulls the signed tx:"
+jrpc eth_getFilterChanges "[\"$FID\"]"; VHASH=$(res '.result[0]')
+jrpc eth_getRawTransactionByHash "[\"$VHASH\"]"; VSIG=$(res .result)
 r0=$(num "$AMM" "r0()(uint256)"); r1=$(num "$AMM" "r1()(uint256)")
 ATK1=$(python3 -c "print($r1-($r0*$r1)//($r0+300*10**18))")                   # simulate the front-run output
 FRONT=$(cast mktx --private-key $ATTACKER_PK --nonce 0 --rpc-url $RPC --gas-limit 300000 "$AMM" "swap0for1(uint256)" 300000000000000000000)
 BACK=$(cast mktx --private-key $ATTACKER_PK --nonce 1 --rpc-url $RPC --gas-limit 300000 "$AMM" "swap1for0(uint256)" "$ATK1")
-echo "  searcher saw $VHASH and bundled [front, victim, back]"
-rpc eth_sendBundle "{\"txs\":[\"$FRONT\",\"$VSIG\",\"$BACK\"]}" >/dev/null    # -> dev builder includes it
+echo "  searcher bundles [front, victim, back] -> the builder includes it:"
+jrpc eth_sendBundle "[{\"txs\":[\"$FRONT\",\"$VSIG\",\"$BACK\"]}]"
 
 V_CLEAR=$(num "$AMM" "bal1(address)(uint256)" "$VICTIM")
 A_PROFIT=$(python3 -c "print($(num "$AMM" "bal0(address)(uint256)" "$ATTACKER")-300*10**18)")
@@ -73,11 +84,13 @@ echo
 echo "== Stage 2: encrypted/private mempool =="
 AMM2=$(deploy)
 fund "$AMM2" "$VICTIM" 100000000000000000000
-FID2=$(rpc eth_newPendingTransactionFilter | tr -d '"')
+jrpc eth_newPendingTransactionFilter "[]"; FID2=$(res .result)
 VRAW2=$(cast mktx --private-key $VICTIM_PK --rpc-url $RPC --gas-limit 300000 "$AMM2" "swap0for1(uint256)" 100000000000000000000)
-rpc eth_sendBundle "{\"txs\":[\"$VRAW2\"]}" >/dev/null                        # victim -> PRIVATE (never public)
-SAW=$(rpc eth_getFilterChanges "$FID2" | jq 'length')
-echo "  victim sent privately; searcher filter saw $SAW pending txs -> nothing to sandwich"
+echo "  victim sends the swap PRIVATELY (eth_sendBundle, never hits the public pool):"
+jrpc eth_sendBundle "[{\"txs\":[\"$VRAW2\"]}]"
+echo "  searcher polls its filter:"
+jrpc eth_getFilterChanges "[\"$FID2\"]"; SAW=$(res '.result | length')
+echo "  -> filter saw $SAW pending txs (nothing to sandwich)"
 V_ENC=$(num "$AMM2" "bal1(address)(uint256)" "$VICTIM")
 
 fromwei() { cast from-wei "$1"; }
