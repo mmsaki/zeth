@@ -1336,7 +1336,16 @@ pub const Evm = struct {
                 deleg_gas = if (self.state.accessAddress(del)) Gas.WARM_ACCESS else Gas.COLD_ACCOUNT_ACCESS;
             }
         }
-        const create_gas: u64 = if (kind == .call and value != 0 and !self.accountAlive(to)) Gas.NEW_ACCOUNT else 0;
+        // CALL new-account surcharge. EIP-161 (Spurious Dragon+): only when value is
+        // sent to a dead (nonexistent or empty) account. Pre-EIP-158: charged whenever
+        // the callee account does not exist at all, regardless of value — so a 0-value
+        // CALL to an unfunded address (incl. a precompile not yet in state) costs it.
+        const create_gas: u64 = blk: {
+            if (kind != .call) break :blk 0;
+            if (self.env.fork.atLeast(.spurious_dragon))
+                break :blk if (value != 0 and !self.accountAlive(to)) Gas.NEW_ACCOUNT else 0;
+            break :blk if (!self.state.exists(to)) Gas.NEW_ACCOUNT else 0;
+        };
         const transfer_gas: u64 = if (transfers_value) Gas.CALL_VALUE else 0;
         const extra_gas: u64 = access_gas + deleg_gas + create_gas + transfer_gas;
 
