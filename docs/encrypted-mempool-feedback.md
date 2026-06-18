@@ -1,116 +1,155 @@
-# Encrypted mempool (EIP-8105 / 8141) — feedback
+# Encrypting the mempool — feedback on EIP-8105 (EEM) and EIP-8184 (LUCID)
 
-Feedback on the draft mempool-encryption EIPs (8105 / 8141), with two runnable
-demos against zeth: an end-to-end sandwich through zeth's own mempool + builder
-(showing why mempool visibility is the whole game), and the EIP-8105
-`0x05`→reveal→`0x06` envelope flow on zeth's RLP codec. Reviewed from two angles —
-an execution client ([zeth](https://github.com/mmsaki/zeth)) and an
-intent/limit-order DEX ([AsyncSwap](https://asyncswap.org)).
+Feedback on the two draft mempool-encryption EIPs, reviewed from two angles — an
+execution client ([zeth](https://github.com/mmsaki/zeth)) and an intent / limit-order
+DEX ([AsyncSwap](https://asyncswap.org)) — and backed by runnable demos against zeth's
+own RPC.
 
-- `docs/encrypted-mempool-feedback.md` — this writeup
-- `examples/zeth-sandwich/` — end-to-end sandwich against zeth's RPC: real signed txs, a real mempool, the searcher listens + bundles; encryption (private orderflow) neutralizes it
-- `examples/eip8105_encrypted_mempool.zig` — the `0x05`→reveal→`0x06` envelope flow on zeth's codec
-
-## Run
-
-Sandwich, end-to-end through zeth's own RPC — the victim broadcasts to the public
-mempool, the searcher listens (`eth_newPendingTransactionFilter`), pulls the signed
-tx (`eth_getRawTransactionByHash`), bundles `[front, victim, back]`
-(`eth_sendBundle`), and zeth's builder includes it. Stage 2 sends the victim's tx
-privately, so the searcher sees nothing:
+- `examples/zeth-sandwich/` — an end-to-end sandwich through zeth's mempool + builder:
+  real signed txs, a real pending pool, a searcher that listens and bundles
+  `[front, victim, back]`. A private bundle (the outcome every encrypted-mempool design
+  targets) neutralizes it. This is the empirical backbone — it shows mempool *visibility*
+  is the whole game, and what changes when you remove it.
+- `examples/eip8105_encrypted_mempool.zig` — the EIP-8105 `0x05`→reveal→`0x06` envelope
+  flow on zeth's RLP codec, including the key-withholding "paid DoS".
 
 ```sh
-cd examples/zeth-sandwich && ./demo.sh
+cd examples/zeth-sandwich && ./demo.sh     # sandwich, then the private-mempool fix
+zig build enc-demo                          # EIP-8105 envelope + withholding
 ```
 
 ```
-results (token1 out to the victim):
-  fair / encrypted        : 90.9
-  unencrypted (sandwiched): 54.9     <- ~40% worse
-  attacker MEV profit     : 41.9 token0
+Part 1 — plaintext mempool      user 54.9 token1 (sandwiched), attacker MEV 41.9
+Part 2 — encrypted mempool      user 90.9 token1 (fair — searcher saw nothing to wrap)
 ```
 
-EL codec — the envelope flow on zeth's RLP codec + the key-withholding DoS:
+## The two designs, in one paragraph
 
-```sh
-zig build enc-demo
-```
+**EIP-8105 (EEM)** is *social*: two new `0x05`/`0x06` tx types, an on-chain key-provider
+registry, and a trust graph that constrains sequencing; withholding is deterred by
+off-chain reputation. **EIP-8184 (LUCID)** is *cryptographic + economic*: sealed
+transactions (`ST_TICKET` + `ST` 2718 types) commit in the beacon block before reveal,
+keys are released by a designated *key publisher* after the schedule is fixed, and the
+PTC votes on key *timeliness*; withholding is priced through a top-of-block (ToB) fee
+(`TOB_FEE_FRACTION = 128`). LUCID is the stronger base — it prices what 8105 only shames
+— but the two share the decisive gap below.
 
-```
-EIP-8105 encrypted-mempool flow (zeth RLP codec)
-  reveal+decrypt -> 0x06 body 83B, matches source: true
-  key withheld    -> decrypted: none  (envelope fee already charged → paid DoS)
-```
+## First, the uncomfortable question: is enshrinement worth it?
 
-## Test
+The encrypted-mempool *outcome* already exists in production, off-chain: private RPCs,
+Flashbots Protect / MEV-Share, and TEE-builder networks (BuilderNet) give users an
+unsniped path to inclusion today. The sandwich demo proves it on an **unmodified L1** — a
+private bundle gets the victim a fair fill right now, no fork required. So the burden is on
+enshrinement to beat that status quo on the three things off-chain orderflow *cannot*
+credibly provide:
 
-```sh
-zig build test   # unit suite incl. the envelope demo + eth_sendBundle
-```
+1. **Credible neutrality** — anyone can submit, no allowlist, no relay to trust.
+2. **Censorship resistance** — inclusion guaranteed by consensus, not a relay's goodwill.
+3. **No new trusted third party** — today you trade a public-mempool adversary for a
+   trusted relay/builder; enshrinement is only worth it if it removes that trust, not
+   relocates it.
 
-## Position
+Judged against that bar, **both drafts currently relocate trust rather than remove it**
+(§ withholding), and **both leave MEV private rather than neutral** (§ backrunning). Until
+those two are closed, an enshrined encrypted mempool is strictly more complex than the
+private orderflow we already run, without delivering the neutrality that would justify the
+consensus surface. The recommendations below are what would tip that balance.
 
-- The unsolved part is the trust model, not the cipher. Every hard case (key
-  withholding, preceding-provider reveal advantage, reorg-time reveals) is pushed
-  to off-chain incentives. With no in-protocol consequence, orderflow re-centralizes
-  onto whichever providers bootstrap reputation first.
-- Use FRAME (8141) as the substrate instead of two bespoke tx types. The fee
-  commitment is a validation frame; the encrypted blob is the execution frame.
-  Reuses the frame loop, gas accounting, and mempool policy — no parallel
-  `0x05`/`0x06` path.
-- Encrypting the public mempool without a neutral, monetizable backrun channel
-  moves MEV private rather than removing it.
+## The decisive gap: withholding accountability lands on the wrong party
 
-## Application impact
+Both EIPs leave the *key holder* with no in-protocol cost for withholding.
 
-An AsyncSwap fill is a benign backrun: the filler settles a maker's order after the
-pool reaches its limit price. Under 8105 the maker's intent is hidden until inclusion
-(no sniping — good), but fillers can no longer see fillable orders, so fill timing
-collapses onto the key provider's reveal order. That is the preceding-provider
-advantage the spec names and does not mitigate; for an order-fill market it is the
-whole game, not "a single bit". Result: fills route private, recreating exclusive
-orderflow.
+- **8105**: the envelope fee is charged at inclusion even when the provider never reveals
+  (`withhold = true` → no `0x06`). The tx is paid for and never runs — a *paid DoS*. Only
+  reputation deters it, and a provider with exclusive orderflow has little reason to
+  protect its reputation. `keyId(signer)` namespacing stops id-reuse frontrunning (cheap,
+  keep it) but does nothing about a provider that simply declines.
+- **8184**: the non-reveal penalty is the **sender's** forfeited ToB fee (reveal refunds
+  `tob_fee · 127/128`; non-reveal forfeits the full `tob_fee`), *not* the key publisher's.
+  Publisher liability is explicitly out-of-protocol — a voluntary "sponsor" ST where the
+  publisher sets `max_tob_fee = n·d·TOB_FEE_FRACTION` to absorb the penalty. A user picks a
+  publisher; if that publisher withholds, **the user pays and the withholder loses nothing
+  in protocol.** LUCID prices *user-side* probabilistic frontrunning well, but the actual
+  adversary in the withholding threat — an exclusive publisher — is untouched. This is
+  8105's trust gap, relocated from reputation to the victim's wallet.
 
-Treat benign backrunning as first-class: a reveal-time, provider-neutral inclusion
-lane for fills that reference an already-included order.
+**Improvement (applies to both, and LUCID already has the primitive).** LUCID defines
+`LucidKeyTimelinessVote` — a PTC bitfield attesting which keys arrived on time, with a
+"missing" threshold `2·timely_1 ≤ timely_1 + timely_0 + late_0 + equivocated`. That is
+liveness *detection*; it stops one step short of *accountability*. Bind a **publisher
+bond, slashable when the PTC attests an unjustified non-reveal.** It turns the vote LUCID
+already collects into the consequence both designs lack, keeps the crypto swappable, and
+is the single change that most moves enshrinement past "relocates trust."
 
-## EL: two tx types vs FRAME
+## Use FRAME (8141) as the substrate, not an option
 
-8105 adds two EIP-2718 types and a second full lifecycle — envelope codec, a
-key-provider registry contract (source "TBD"), CL replication, PTC key-validation,
-a new attestation bitfield, and a cross-block `0x06`↔`0x05` correspondence check.
+8105 runs a parallel `0x05`/`0x06` lifecycle; LUCID adds `ST_TICKET`/`ST` types and
+mentions FRAME only as an optional reserved frame. Both re-derive validation / payment /
+execution that FRAME already decomposes, with a mempool validation prefix. Map encryption
+*onto* FRAME instead of alongside it: the ST ticket (or 8105 envelope) is a
+validation+payment frame; the ciphertext is the execution frame. One frame loop, one
+gas-accounting path, and the cipher and signature scheme become pluggable verifiers
+(post-quantum sigs, decryption-key checks) — no second tx-type lifecycle to keep in
+consensus. This is the cheapest future-proofing available to either EIP.
 
-- Gas accounting is unspecified ("decryption cost subtracted from allowance",
-  "hardcoded small gas limit per key" — no numbers). Two clients picking different
-  values is a consensus split. Needs exact constants before it is review-complete.
-- `0x06` adds a second signature path "for simplicity"; it is not simpler for the
-  EL. Using the envelope signer as the sender removes a verification path and the
-  unresolved envelope/payload cyclic reference.
+## Execution quality: the encrypted lane is a premium good
 
-FRAME already decomposes a tx into validation/payment/execution with a mempool
-validation prefix. Map encryption onto it instead of alongside it, and the crypto
-stays swappable (post-quantum sigs, decryption-key checks are just verifiers).
+LUCID gives sealed txs only `tob_gas_limit = block.gas_limit / 8`
+(`TOB_GAS_FRACTION_DENOMINATOR = 8`). Under load the encrypted lane congests while 7/8 of
+the block stays public, so encryption becomes a *premium* — and `max_preceding_commitments
+= 0` (absolute top-of-block) is settled by a ToB-fee auction. Protection that is auctioned
+re-centralizes on whoever can pay: MEV by another name, one layer up. Two further costs:
 
-## Key withholding
+- **`dual_gas_used = max(len(ciphertext_envelope), len(plaintext.data)) + execution_gas`**
+  charges for ciphertext size — a structural tax on privacy, paid by every sealed tx.
+- **Priority fee is not reconciled** (blockspace is consumed at commitment), so a sealed
+  tx cheap to execute still pays as if it filled its `gas_limit` — widening the price gap
+  between the encrypted and plaintext lanes.
 
-The demo shows both halves:
+Right-sizing `TOB_GAS_FRACTION_DENOMINATOR`, and publishing the **on-chain decryption gas
+cost** (LUCID decrypts ChaCha20-Poly1305 on-chain; 8105 says "decryption cost subtracted
+from allowance" / "hardcoded small gas limit per key" with no numbers) is a prerequisite
+for review — two clients picking different constants is a consensus split.
 
-- The attack is paid-for. A withholding provider keeps the envelope fee charged at
-  inclusion while the tx never runs (`withhold = true` → no `0x06`). Off-chain
-  reputation is the only deterrent, and a provider with exclusive orderflow has
-  little reason to protect it.
-- Key-id namespacing (`keyId(signer)`) stops id-reuse frontrunning — cheap, keep it
-  — but does nothing about a provider that simply declines, or reveals selectively.
-- The trust graph makes block building a reachability problem and concentrates flow
-  on well-connected providers.
+## Monetize benign backrunning, or it routes private anyway
 
-Ship in-protocol accountability (a provider bond, slashable on a PTC-attested
-unjustified withhold), not reputation. Off-chain incentives at L1 scale is a
-deferral, not a mitigation.
+A benign backrun — e.g. an AsyncSwap filler settling a maker's order once the pool reaches
+its limit price — is value-adding, not predatory. Neither EIP gives it a home. LUCID
+reveals and executes a sealed tx in the *next* block's ToB; by reveal time the schedule is
+fixed, so a fill that must reference the just-revealed order cannot be placed in a neutral,
+monetizable lane — it routes through a private relationship instead, recreating exclusive
+orderflow. The fix is symmetric to the withholding fix: a **reveal-time, provider-neutral
+Rest-of-Block lane** for txs that reference an already-revealed sealed tx. LUCID's existing
+ToB/RoB split is the natural place to host it; encrypting the public mempool without it
+moves MEV private rather than removing it.
+
+## Application impact (AsyncSwap, an intent/limit-order DEX)
+
+Under either design a maker's intent is hidden until inclusion — no sniping, which is the
+win. But fillers can then no longer see fillable orders, so fill timing collapses onto the
+reveal order: in 8105 the *preceding-provider advantage* the spec names and does not
+mitigate; in LUCID the `max_preceding_commitments` / ToB-fee auction. For an order-fill
+market that timing *is* the product, not "a single bit". `max_preceding_commitments` is
+actually a useful primitive here — a filler wanting to land immediately after a specific
+order can express it — but only if the backrun lane above keeps it neutral; otherwise fills
+re-centralize onto whoever wins the ToB auction.
+
+## Adoption & deployment
+
+LUCID is the larger consensus surface: it couples to FOCIL inclusion lists, PTC key-
+timeliness votes, beacon-block ST-commitments, recovery payloads (which "cannot commit to
+new STs"), and on-chain AEAD decryption — it lands only after FOCIL/PTC do. 8105's gas
+constants are "TBD". Both accelerate by (1) publishing exact gas constants first, and
+(2) validating incentives **off-chain** before enshrining — the private-orderflow path the
+demo exercises — then enshrining once withholding-accountability and the backrun lane are
+proven, i.e. once enshrinement actually clears the §"is it worth it?" bar.
 
 ## Recommendations
 
-- Rebase the encrypted-mempool design onto FRAME (8141), not `0x05`/`0x06`.
-- Make provider accountability in-protocol (bonded, PTC-attested).
-- Define a neutral, monetizable backrun/fill channel so intent fills stay public.
-- Publish exact gas constants for decryption and key validation.
+1. Enshrine **key-holder accountability**: a bond slashable on LUCID's PTC key-timeliness
+   attestation. Don't let the withholding penalty fall on the victim — this is the change
+   that justifies enshrinement over private orderflow.
+2. Make **FRAME (8141) the substrate**, not an option — one lifecycle, swappable crypto.
+3. Define a **neutral, reveal-time backrun/fill lane** so benign backrunning stays public.
+4. Publish **exact gas constants** for decryption, key validation, and the ToB lane size.
+5. Prove the economics with **off-chain encrypted orderflow first**; enshrine second.

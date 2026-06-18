@@ -130,6 +130,9 @@ pub const Chain = struct {
     /// Dev builder mode (`zeth node --dev`): eth_sendBundle / evm_mine build a
     /// block from the queued bundles + pending pool immediately.
     dev: bool = false,
+    /// RPC trace verbosity (`-v` … `-vvvv`): 0 off, 1–3 orderflow/mempool methods
+    /// + block builds, 4 every RPC. The node logs `method(params) ← result`.
+    trace_level: u8 = 0,
     /// Ordered atomic bundles submitted via eth_sendBundle (Flashbots / rbuilder
     /// RawBundle): each is a list of raw txs included in order, before pool txs.
     bundles: std.ArrayList(Bundle) = .empty,
@@ -594,6 +597,8 @@ pub const Chain = struct {
         };
         const built = try self.produceBlock(a, attrs, list.items);
         _ = try self.importDecoded(a, built.block);
+        if (self.trace_level > 0)
+            std.debug.print("\x1b[33m[builder]\x1b[0m block #{d}  txs={d}\n", .{ self.head.number, built.block.transactions.len });
         self.txpool.prune(self.state);
         for (self.bundles.items) |b| {
             for (b.txs) |t| self.gpa.free(t);

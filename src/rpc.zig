@@ -4,6 +4,7 @@
 //! response JSON. State reads resolve against the current (post-import) state.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const chain_mod = @import("chain.zig");
 const state_mod = @import("state.zig");
 const block = @import("block.zig");
@@ -1043,12 +1044,17 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
             raws[i] = hexBytes(a, tv.string);
         }
         const bh = c.addBundle(raws, null) catch return err(a, id, -32000, "bundle rejected");
-        if (c.dev) c.buildPending() catch {};
+        if (build_options.dev and c.dev) c.buildPending() catch {};
         return ok(a, id, std.fmt.allocPrint(a, "{{\"bundleHash\":\"0x{s}\"}}", .{std.fmt.bytesToHex(&bh, .lower)}) catch @panic("oom"));
     }
-    // evm_mine / anvil_mine: build one block now (dev builder trigger).
+    // evm_mine / anvil_mine: build one block now (dev builder trigger). Dev-only on
+    // two levels — the builder code is compiled out unless `-Ddev=true`, and even in
+    // a dev build it needs `--dev` at runtime. On a production node blocks come from
+    // consensus, never an RPC call.
     if (std.mem.eql(u8, method, "evm_mine") or std.mem.eql(u8, method, "anvil_mine")) {
-        if (c.dev) c.buildPending() catch return err(a, id, -32000, "build failed");
+        if (!build_options.dev) return err(a, id, -32601, "evm_mine/anvil_mine: not in this build (rebuild with -Ddev=true)");
+        if (!c.dev) return err(a, id, -32601, "evm_mine/anvil_mine require --dev (block production is consensus-driven)");
+        c.buildPending() catch return err(a, id, -32000, "build failed");
         return ok(a, id, "\"0x0\"");
     }
     // eth_newPendingTransactionFilter: the standard way to listen for new pending
@@ -1646,7 +1652,63 @@ pub fn handleBody(a: std.mem.Allocator, c: *chain_mod.Chain, body: []const u8) [
         buf.append(a, ']') catch @panic("oom");
         return buf.items;
     }
-    return handleOne(a, c, v);
+    const resp = handleOne(a, c, v);
+    if (c.trace_level > 0) traceRpc(c.trace_level, body, resp);
+    return resp;
+}
+
+/// Orderflow/mempool methods shown at `-v`..`-vvv`; `-vvvv` shows everything.
+fn isOrderflow(m: []const u8) bool {
+    const names = [_][]const u8{ "eth_sendRawTransaction", "eth_sendBundle", "eth_newPendingTransactionFilter", "eth_getFilterChanges", "eth_getRawTransactionByHash", "evm_mine", "anvil_mine" };
+    for (names) |n| if (std.mem.eql(u8, m, n)) return true;
+    return false;
+}
+
+/// Verbose RPC trace (`zeth node -v`..`-vvvv`): one `method(params) ← result` line
+/// per request, full values, no truncation.
+fn traceRpc(level: u8, body: []const u8, resp: []const u8) void {
+    const ms = (std.mem.indexOf(u8, body, "\"method\":\"") orelse return) + 10;
+    const me = std.mem.indexOfScalarPos(u8, body, ms, '"') orelse return;
+    const method = body[ms..me];
+    if (level < 4 and !isOrderflow(method)) return;
+    const params = jsonField(body, "\"params\":");
+    var result = jsonField(resp, "\"result\":");
+    if (result.len == 0) result = jsonField(resp, "\"error\":");
+    std.debug.print("\x1b[32m[{s}]\x1b[0m({s})\n  \x1b[2m└─ [result]\x1b[0m \x1b[36m{s}\x1b[0m\n", .{ method, params, result });
+}
+
+/// The JSON value following `key` in `s`, extracted by bracket/string-aware
+/// matching (so it stops at the value's end regardless of field order).
+fn jsonField(s: []const u8, key: []const u8) []const u8 {
+    const k = std.mem.indexOf(u8, s, key) orelse return "";
+    const start = k + key.len;
+    if (start >= s.len) return "";
+    if (s[start] == '[' or s[start] == '{') {
+        var depth: i32 = 0;
+        var in_str = false;
+        var esc = false;
+        var i = start;
+        while (i < s.len) : (i += 1) {
+            const ch = s[i];
+            if (esc) {
+                esc = false;
+            } else if (ch == '\\') {
+                esc = true;
+            } else if (ch == '"') {
+                in_str = !in_str;
+            } else if (!in_str) {
+                if (ch == '[' or ch == '{') depth += 1;
+                if (ch == ']' or ch == '}') {
+                    depth -= 1;
+                    if (depth == 0) return s[start .. i + 1];
+                }
+            }
+        }
+        return s[start..];
+    }
+    var i = start;
+    while (i < s.len and s[i] != ',' and s[i] != '}') : (i += 1) {}
+    return s[start..i];
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -1740,8 +1802,37 @@ test "eth_sendBundle queues an ordered bundle; the dev builder mines it" {
 
     const resp = handleBody(a, &ch, body);
     try testing.expect(std.mem.indexOf(u8, resp, "bundleHash") != null); // returns the bundle hash
-    try testing.expectEqual(@as(u64, 1), ch.head.number); // dev builder mined a block
-    try testing.expectEqual(@as(usize, 2), ch.block_txs.items[1].len); // both bundle txs, in order
+    if (build_options.dev) {
+        try testing.expectEqual(@as(u64, 1), ch.head.number); // dev builder mined a block
+        try testing.expectEqual(@as(usize, 2), ch.block_txs.items[1].len); // both bundle txs, in order
+    } else {
+        try testing.expectEqual(@as(u64, 0), ch.head.number); // production build: queued, never instamined
+        try testing.expectEqual(@as(usize, 1), ch.bundles.items.len);
+    }
+}
+
+test "evm_mine/anvil_mine are rejected on a production node (no --dev)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const gjson =
+        \\{"config":{"chainId":1,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"mergeNetsplitBlock":0,"terminalTotalDifficulty":0,"shanghaiTime":0},
+        \\"gasLimit":"0x1000000","difficulty":"0x0","timestamp":"0x0","alloc":{}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, gjson, .{});
+    defer parsed.deinit();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    const g = try genesis_mod.load(a, &st, parsed.value);
+    var ch = try chain_mod.Chain.initGenesis(testing.allocator, &st, g);
+    defer ch.deinit();
+    // ch.dev defaults to false → the instamine triggers are dev-only and must hard-fail.
+    inline for ([_][]const u8{ "evm_mine", "anvil_mine" }) |m| {
+        const body = try std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":[]}}", .{m});
+        const resp = handleBody(a, &ch, body);
+        try testing.expect(std.mem.indexOf(u8, resp, "-32601") != null);
+    }
+    try testing.expectEqual(@as(u64, 0), ch.head.number); // no block was produced
 }
 
 test "engine: forkchoiceUpdated(attrs) → getPayload → newPayload round-trips VALID" {
