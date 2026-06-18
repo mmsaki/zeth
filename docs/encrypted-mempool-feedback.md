@@ -23,6 +23,8 @@ Part 1 — plaintext mempool      user 54.9 token1 (sandwiched), attacker MEV 41
 Part 2 — encrypted mempool      user 90.9 token1 (fair — searcher saw nothing to wrap)
 ```
 
+![sandwich demo: the orderflow trace from `zeth node -v`](../examples/zeth-sandwich/demo-logs.png)
+
 ## The two designs, in one paragraph
 
 **EIP-8105 (EEM)** is *social*: two new `0x05`/`0x06` tx types, an on-chain key-provider
