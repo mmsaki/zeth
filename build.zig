@@ -35,6 +35,18 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    // EIP-8105 encrypted-mempool demo: `zig build enc-demo` (run) + its tests.
+    const enc_mod = b.createModule(.{
+        .root_source_file = b.path("examples/eip8105_encrypted_mempool.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zeth", .module = mod }},
+    });
+    const enc_demo = b.addExecutable(.{ .name = "enc-demo", .root_module = enc_mod });
+    const run_enc = b.addRunArtifact(enc_demo);
+    b.step("enc-demo", "Run the EIP-8105 encrypted-mempool demo").dependOn(&run_enc.step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = enc_mod })).step);
+
     // Benchmark: `zig build bench -Doptimize=ReleaseFast`
     const bench = b.addExecutable(.{
         .name = "bench",
