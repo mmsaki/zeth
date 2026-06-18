@@ -93,6 +93,9 @@ pub const TxRecord = struct {
 };
 const TxLoc = struct { block_number: u64, index: u32 };
 
+/// An eth_sendBundle bundle: raw txs included atomically and in order.
+pub const Bundle = struct { txs: [][]const u8, block_number: ?u64 = null };
+
 pub const Chain = struct {
     gpa: std.mem.Allocator,
     state: *State,
@@ -124,6 +127,15 @@ pub const Chain = struct {
     /// arena so its slices outlive the building RPC request.
     payload: ?BuiltPayload = null,
     payload_arena: ?std.heap.ArenaAllocator = null,
+    /// Dev builder mode (`zeth node --dev`): eth_sendBundle / evm_mine build a
+    /// block from the queued bundles + pending pool immediately.
+    dev: bool = false,
+    /// Ordered atomic bundles submitted via eth_sendBundle (Flashbots / rbuilder
+    /// RawBundle): each is a list of raw txs included in order, before pool txs.
+    bundles: std.ArrayList(Bundle) = .empty,
+    /// eth_newPendingTransactionFilter cursors: filter id (1-based index) → count
+    /// of pool txs already reported. eth_getFilterChanges returns newer hashes.
+    pending_filters: std.ArrayList(usize) = .empty,
 
     pub fn initGenesis(gpa: std.mem.Allocator, state: *State, g: genesis_mod.Genesis) !Chain {
         var c = Chain{
@@ -162,6 +174,12 @@ pub const Chain = struct {
         self.sizes.deinit(self.gpa);
         self.tx_index.deinit(self.gpa);
         self.txpool.deinit();
+        for (self.bundles.items) |b| {
+            for (b.txs) |t| self.gpa.free(t);
+            self.gpa.free(b.txs);
+        }
+        self.bundles.deinit(self.gpa);
+        self.pending_filters.deinit(self.gpa);
         if (self.payload_arena) |*pa| pa.deinit();
         if (self.genesis_state) |*gs| gs.deinit();
     }
@@ -542,6 +560,47 @@ pub const Chain = struct {
     /// A built block plus its value to the proposer (sum of priority fees), which
     /// the Engine API reports as `blockValue` in engine_getPayload.
     pub const ProduceResult = struct { block: block.Block, fees: u256 };
+
+    /// Queue an eth_sendBundle bundle; returns its Flashbots bundle hash
+    /// (keccak256 of the concatenated tx hashes). The txs are gpa-owned.
+    pub fn addBundle(self: *Chain, raw_txs: []const []const u8, block_number: ?u64) ![32]u8 {
+        const owned = try self.gpa.alloc([]const u8, raw_txs.len);
+        for (raw_txs, 0..) |t, i| owned[i] = try self.gpa.dupe(u8, t);
+        try self.bundles.append(self.gpa, .{ .txs = owned, .block_number = block_number });
+        var hsh = std.crypto.hash.sha3.Keccak256.init(.{});
+        for (raw_txs) |t| hsh.update(&crypto.keccak256(t));
+        var out: [32]u8 = undefined;
+        hsh.final(&out);
+        return out;
+    }
+
+    /// Dev builder: build + import one block placing queued bundles first (in
+    /// order), then pending-pool txs. produceBlock skips any that no longer
+    /// validate (e.g. a pool copy of a tx already taken by a bundle).
+    pub fn buildPending(self: *Chain) !void {
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const next_fork = self.schedule.forkAt(self.head.number + 1, self.head.timestamp + 1);
+        const base_fee: u256 = if (next_fork.atLeast(.london)) (self.head.base_fee_per_gas orelse 1_000_000_000) else 0;
+        var list: std.ArrayList([]const u8) = .empty;
+        for (self.bundles.items) |b| for (b.txs) |t| try list.append(a, t);
+        const pool = try self.txpool.select(a, self.state, self.head.gas_limit, base_fee);
+        for (pool) |t| try list.append(a, t);
+        if (list.items.len == 0) return;
+        const attrs = ProduceAttrs{
+            .timestamp = self.head.timestamp + 1,
+            .parent_beacon_block_root = if (next_fork.atLeast(.cancun)) std.mem.zeroes([32]u8) else null,
+        };
+        const built = try self.produceBlock(a, attrs, list.items);
+        _ = try self.importDecoded(a, built.block);
+        self.txpool.prune(self.state);
+        for (self.bundles.items) |b| {
+            for (b.txs) |t| self.gpa.free(t);
+            self.gpa.free(b.txs);
+        }
+        self.bundles.clearRetainingCapacity();
+    }
 
     /// Build the next block on top of the head (the producer/proposer side):
     /// apply the payload attributes, run the block-start system calls, include
