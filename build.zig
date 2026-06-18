@@ -55,6 +55,18 @@ pub fn build(b: *std.Build) void {
     b.step("enc-demo", "Run the EIP-8105 encrypted-mempool demo").dependOn(&run_enc.step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = enc_mod })).step);
 
+    // EIP-8184 (LUCID) sealed-transaction demo: `zig build lucid-demo` (run) + tests.
+    const lucid_mod = b.createModule(.{
+        .root_source_file = b.path("examples/eip8184_lucid.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zeth", .module = mod }},
+    });
+    const lucid_demo = b.addExecutable(.{ .name = "lucid-demo", .root_module = lucid_mod });
+    const run_lucid = b.addRunArtifact(lucid_demo);
+    b.step("lucid-demo", "Run the EIP-8184 (LUCID) sealed-transaction demo").dependOn(&run_lucid.step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lucid_mod })).step);
+
     // Benchmark: `zig build bench -Doptimize=ReleaseFast`
     const bench = b.addExecutable(.{
         .name = "bench",

@@ -12,10 +12,14 @@ own RPC.
   is the whole game, and what changes when you remove it.
 - `examples/eip8105_encrypted_mempool.zig` — the EIP-8105 `0x05`→reveal→`0x06` envelope
   flow on zeth's RLP codec, including the key-withholding "paid DoS".
+- `examples/eip8184_lucid.zig` — the EIP-8184 (LUCID) sealed-tx flow: ChaCha20-Poly1305
+  encryption + commit-before-reveal, and the ToB-fee accounting that shows the withholding
+  penalty landing on the *sender*, not the publisher (§ the decisive gap).
 
 ```sh
 cd examples/zeth-sandwich && ./demo.sh     # sandwich, then the private-mempool fix
 zig build enc-demo                          # EIP-8105 envelope + withholding
+zig build lucid-demo                        # EIP-8184 sealed tx + ToB-fee withholding
 ```
 
 ```
