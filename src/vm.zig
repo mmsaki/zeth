@@ -225,6 +225,9 @@ pub const Gas = struct {
 
     pub const SELFDESTRUCT_BASE: u64 = 5000;
     pub const SELFDESTRUCT_NEW_ACCOUNT: u64 = 25000;
+    /// R_selfdestruct: refunded once per destroyed account, pre-London only
+    /// (EIP-3529 removed it in London).
+    pub const SELFDESTRUCT_REFUND: i64 = 24000;
 };
 
 /// Account-touching opcodes whose pre-Berlin (pre-EIP-2929) gas was a flat,
@@ -1483,10 +1486,11 @@ pub const Evm = struct {
         const originator = self.message.current_target;
         const orig_balance = self.state.balanceOf(originator);
 
-        // Prague gas: base + cold-access of beneficiary + new-account surcharge
-        // when sending balance to a dead account. No refund (EIP-3529).
+        // Gas: base + (Berlin+ EIP-2929 cold-access of the beneficiary) + new-account
+        // surcharge when sending balance to a dead account. Refund handled below.
         var gas: u64 = Gas.SELFDESTRUCT_BASE;
-        if (!self.state.accessAddress(beneficiary)) gas += Gas.COLD_ACCOUNT_ACCESS;
+        const ben_warm = self.state.accessAddress(beneficiary);
+        if (self.env.fork.atLeast(.berlin) and !ben_warm) gas += Gas.COLD_ACCOUNT_ACCESS;
         if (orig_balance != 0 and !self.accountAlive(beneficiary)) gas += Gas.SELFDESTRUCT_NEW_ACCOUNT;
         try self.chargeGas(gas);
         if (self.is_static) return error.StaticStateChange;
@@ -1498,6 +1502,11 @@ pub const Evm = struct {
             self.state.setBalance(beneficiary, ben_balance + orig_balance) catch @panic("out of memory");
             self.state.setBalance(originator, 0) catch @panic("out of memory");
         }
+
+        // Pre-London (EIP-3529 removed it): refund R_selfdestruct once per account,
+        // the first time it is scheduled for deletion this tx.
+        if (!self.env.fork.atLeast(.london) and !self.accounts_to_delete.contains(originator))
+            self.refund_counter += Gas.SELFDESTRUCT_REFUND;
 
         // EIP-6780 (Cancun+): only delete the account (and burn its balance) if it
         // was created in this same transaction. Pre-Cancun, SELFDESTRUCT always
