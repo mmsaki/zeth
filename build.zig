@@ -11,6 +11,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Dev-only RPC (evm_mine / anvil_mine + the instamine bundle builder). Off by
+    // default: a production binary literally cannot build blocks over RPC, because
+    // the code is compiled out. Build with `-Ddev=true` for the dev tool / demo.
+    const dev = b.option(bool, "dev", "Compile in dev-only RPC: evm_mine/anvil_mine + instamine") orelse false;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "dev", dev);
+    mod.addOptions("build_options", build_options);
+
     // CLI: `zig build run -- <hex-bytecode> [gas]`
     const exe = b.addExecutable(.{
         .name = "zeth",

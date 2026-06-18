@@ -1332,6 +1332,7 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
     var peer_enode: ?[]const u8 = null;
     var genesis_path: ?[]const u8 = null;
     var dev_mode = false;
+    var trace_level: u8 = 0;
     var rlp_files: std.ArrayList([]const u8) = .empty;
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "--datadir=")) {
@@ -1358,6 +1359,13 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
             jwt_path = arg["--authrpc.jwtsecret=".len..];
         } else if (std.mem.eql(u8, arg, "--dev")) {
             dev_mode = true; // instamine bundles + pool via eth_sendBundle / evm_mine
+        } else if (std.mem.eql(u8, arg, "--trace")) {
+            trace_level = 4; // --trace = full RPC trace
+        } else if (arg.len >= 2 and arg[0] == '-' and (vlvl: {
+            for (arg[1..]) |ch| if (ch != 'v') break :vlvl false;
+            break :vlvl true;
+        })) {
+            trace_level = @intCast(@min(arg.len - 1, 4)); // -v=1 … -vvvv=4
         } else if (std.mem.startsWith(u8, arg, "--")) {
             // ignore other flags
         } else if (genesis_path == null) {
@@ -1381,6 +1389,7 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
     var ch = try zeth.chain.Chain.initGenesis(gpa, &st, g);
     defer ch.deinit();
     ch.dev = dev_mode;
+    ch.trace_level = trace_level;
 
     // Optional on-disk persistence (`--datadir`). Open the store; if it already
     // holds a head and no RLP files were given, resume from disk instead of
