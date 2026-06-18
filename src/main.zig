@@ -1331,6 +1331,7 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
     var datadir: ?[]const u8 = null;
     var peer_enode: ?[]const u8 = null;
     var genesis_path: ?[]const u8 = null;
+    var dev_mode = false;
     var rlp_files: std.ArrayList([]const u8) = .empty;
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "--datadir=")) {
@@ -1355,6 +1356,8 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
             } else auth_host = hp;
         } else if (std.mem.startsWith(u8, arg, "--authrpc.jwtsecret=")) {
             jwt_path = arg["--authrpc.jwtsecret=".len..];
+        } else if (std.mem.eql(u8, arg, "--dev")) {
+            dev_mode = true; // instamine bundles + pool via eth_sendBundle / evm_mine
         } else if (std.mem.startsWith(u8, arg, "--")) {
             // ignore other flags
         } else if (genesis_path == null) {
@@ -1377,6 +1380,7 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
     const g = try zeth.genesis.load(a, &st, parsed.value);
     var ch = try zeth.chain.Chain.initGenesis(gpa, &st, g);
     defer ch.deinit();
+    ch.dev = dev_mode;
 
     // Optional on-disk persistence (`--datadir`). Open the store; if it already
     // holds a head and no RLP files were given, resume from disk instead of

@@ -1030,6 +1030,67 @@ fn handleOne(a: std.mem.Allocator, c: *chain_mod.Chain, v: std.json.Value) []con
         c.txpool.add(raw) catch return err(a, id, -32000, "invalid transaction");
         return okStr(a, id, hash32Hex(a, hash));
     }
+    // eth_sendBundle (Flashbots / rbuilder RawBundle): an ordered atomic bundle of
+    // raw txs. Queued for the builder; in --dev mode a block is built immediately.
+    if (std.mem.eql(u8, method, "eth_sendBundle")) {
+        if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
+        const txs_v = params[0].object.get("txs") orelse return err(a, id, -32602, "missing txs");
+        if (txs_v != .array) return err(a, id, -32602, "txs must be an array");
+        const arr = txs_v.array.items;
+        const raws = a.alloc([]const u8, arr.len) catch @panic("oom");
+        for (arr, 0..) |tv, i| {
+            if (tv != .string) return err(a, id, -32602, "tx must be hex");
+            raws[i] = hexBytes(a, tv.string);
+        }
+        const bh = c.addBundle(raws, null) catch return err(a, id, -32000, "bundle rejected");
+        if (c.dev) c.buildPending() catch {};
+        return ok(a, id, std.fmt.allocPrint(a, "{{\"bundleHash\":\"0x{s}\"}}", .{std.fmt.bytesToHex(&bh, .lower)}) catch @panic("oom"));
+    }
+    // evm_mine / anvil_mine: build one block now (dev builder trigger).
+    if (std.mem.eql(u8, method, "evm_mine") or std.mem.eql(u8, method, "anvil_mine")) {
+        if (c.dev) c.buildPending() catch return err(a, id, -32000, "build failed");
+        return ok(a, id, "\"0x0\"");
+    }
+    // eth_newPendingTransactionFilter: the standard way to listen for new pending
+    // txs over HTTP (the poll form of eth_subscribe newPendingTransactions).
+    if (std.mem.eql(u8, method, "eth_newPendingTransactionFilter")) {
+        c.pending_filters.append(c.gpa, 0) catch @panic("oom");
+        return okStr(a, id, qHex(a, c.pending_filters.items.len)); // filter id = 1-based index
+    }
+    // eth_getFilterChanges: pending-tx hashes added since the filter's last poll.
+    if (std.mem.eql(u8, method, "eth_getFilterChanges")) {
+        const fid_s = strParam(params, 0) orelse return err(a, id, -32602, "invalid params");
+        const fid = std.fmt.parseInt(u64, if (std.mem.startsWith(u8, fid_s, "0x")) fid_s[2..] else fid_s, 16) catch return err(a, id, -32602, "bad filter id");
+        if (fid == 0 or fid > c.pending_filters.items.len) return ok(a, id, "[]");
+        const cursor = &c.pending_filters.items[fid - 1];
+        var buf: std.ArrayList(u8) = .empty;
+        buf.append(a, '[') catch @panic("oom");
+        var i = cursor.*;
+        while (i < c.txpool.txs.items.len) : (i += 1) {
+            if (i != cursor.*) buf.append(a, ',') catch @panic("oom");
+            buf.print(a, "\"{s}\"", .{hash32Hex(a, rawTxHash(a, c.txpool.txs.items[i].raw))}) catch @panic("oom");
+        }
+        cursor.* = c.txpool.txs.items.len;
+        buf.append(a, ']') catch @panic("oom");
+        return ok(a, id, buf.items);
+    }
+    // eth_getRawTransactionByHash: the signed tx bytes — what a searcher needs to
+    // wrap a victim's pending tx in a bundle. Looks in the pool, then mined blocks.
+    if (std.mem.eql(u8, method, "eth_getRawTransactionByHash")) {
+        const hs = strParam(params, 0) orelse return err(a, id, -32602, "invalid params");
+        const hb = hexBytes(a, hs);
+        if (hb.len != 32) return err(a, id, -32602, "bad hash");
+        for (c.txpool.txs.items) |pt| {
+            if (std.mem.eql(u8, hb, &rawTxHash(a, pt.raw))) return okStr(a, id, dataHex(a, pt.raw));
+        }
+        var key: [32]u8 = undefined;
+        @memcpy(&key, hb);
+        if (c.tx_index.get(key)) |loc| {
+            const rec = c.block_txs.items[loc.block_number][loc.index];
+            return okStr(a, id, dataHex(a, rec.raw));
+        }
+        return ok(a, id, "null");
+    }
     if (std.mem.eql(u8, method, "eth_createAccessList")) {
         if (params.len < 1 or params[0] != .object) return err(a, id, -32602, "invalid params");
         return ok(a, id, createAccessList(a, c, params[0].object));
@@ -1634,6 +1695,53 @@ test "eth_sendRawTransaction admits the tx to the pending pool" {
     const resp = handleBody(a, &ch, body);
     try testing.expect(std.mem.indexOf(u8, resp, "\"result\"") != null); // hash returned
     try testing.expectEqual(@as(usize, 1), ch.txpool.count()); // and it's pending
+}
+
+test "eth_sendBundle queues an ordered bundle; the dev builder mines it" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const priv = ecies.randomPriv(io);
+    const pk = try ecies.pubFromPriv(priv);
+    const sh = crypto.keccak256(&pk);
+    var addr_hex: [40]u8 = undefined;
+    for (sh[12..32], 0..) |byte, i| _ = std.fmt.bufPrint(addr_hex[i * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable;
+    const gjson = try std.fmt.allocPrint(a,
+        \\{{"config":{{"chainId":1,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"mergeNetsplitBlock":0,"terminalTotalDifficulty":0,"shanghaiTime":0}},
+        \\"gasLimit":"0x1000000","difficulty":"0x0","timestamp":"0x0",
+        \\"alloc":{{"{s}":{{"balance":"0xde0b6b3a7640000"}}}}}}
+    , .{addr_hex});
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, gjson, .{});
+    defer parsed.deinit();
+    var st = state_mod.State.init(testing.allocator);
+    defer st.deinit();
+    const g = try genesis_mod.load(a, &st, parsed.value);
+    var ch = try chain_mod.Chain.initGenesis(testing.allocator, &st, g);
+    defer ch.deinit();
+    ch.dev = true; // build a block on eth_sendBundle
+
+    var to = std.mem.zeroes(state_mod.Address);
+    to[19] = 0x42;
+    const raw0 = try testsign.signLegacy(a, io, priv, 1, 0, 2_000_000_000, 21000, to, 1000);
+    const raw1 = try testsign.signLegacy(a, io, priv, 1, 1, 2_000_000_000, 21000, to, 1000);
+    var h0 = std.ArrayList(u8).empty;
+    try h0.appendSlice(a, "0x");
+    for (raw0) |b| try h0.print(a, "{x:0>2}", .{b});
+    var h1 = std.ArrayList(u8).empty;
+    try h1.appendSlice(a, "0x");
+    for (raw1) |b| try h1.print(a, "{x:0>2}", .{b});
+    const body = try std.fmt.allocPrint(a,
+        \\{{"jsonrpc":"2.0","id":1,"method":"eth_sendBundle","params":[{{"txs":["{s}","{s}"]}}]}}
+    , .{ h0.items, h1.items });
+
+    const resp = handleBody(a, &ch, body);
+    try testing.expect(std.mem.indexOf(u8, resp, "bundleHash") != null); // returns the bundle hash
+    try testing.expectEqual(@as(u64, 1), ch.head.number); // dev builder mined a block
+    try testing.expectEqual(@as(usize, 2), ch.block_txs.items[1].len); // both bundle txs, in order
 }
 
 test "engine: forkchoiceUpdated(attrs) → getPayload → newPayload round-trips VALID" {
