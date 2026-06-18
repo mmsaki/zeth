@@ -5,14 +5,14 @@ execution client ([zeth](https://github.com/mmsaki/zeth)) and an intent / limit-
 DEX ([AsyncSwap](https://asyncswap.org)) — and backed by runnable demos against zeth's
 own RPC.
 
-- `examples/zeth-sandwich/` — an end-to-end sandwich through zeth's mempool + builder:
+- [`examples/zeth-sandwich/`](../examples/zeth-sandwich/) — an end-to-end sandwich through zeth's mempool + builder:
   real signed txs, a real pending pool, a searcher that listens and bundles
   `[front, victim, back]`. A private bundle (the outcome every encrypted-mempool design
   targets) neutralizes it. This is the empirical backbone — it shows mempool *visibility*
   is the whole game, and what changes when you remove it.
-- `examples/eip8105_encrypted_mempool.zig` — the EIP-8105 `0x05`→reveal→`0x06` envelope
+- [`examples/eip8105_encrypted_mempool.zig`](../examples/eip8105_encrypted_mempool.zig) — the EIP-8105 `0x05`→reveal→`0x06` envelope
   flow on zeth's RLP codec, including the key-withholding "paid DoS".
-- `examples/eip8184_lucid.zig` — the EIP-8184 (LUCID) sealed-tx flow: ChaCha20-Poly1305
+- [`examples/eip8184_lucid.zig`](../examples/eip8184_lucid.zig) — the EIP-8184 (LUCID) sealed-tx flow: ChaCha20-Poly1305
   encryption + commit-before-reveal, and the ToB-fee accounting that shows the withholding
   penalty landing on the *sender*, not the publisher (§ the decisive gap).
 
@@ -63,7 +63,11 @@ consensus surface. The recommendations below are what would tip that balance.
 
 ## The decisive gap: withholding accountability lands on the wrong party
 
-Both EIPs leave the *key holder* with no in-protocol cost for withholding.
+Both EIPs leave the *key holder* with no in-protocol cost for withholding. Both demos make
+this concrete: [`examples/eip8105_encrypted_mempool.zig`](../examples/eip8105_encrypted_mempool.zig)
+prints `key withheld -> decrypted: none (fee already charged → paid DoS)`, and
+[`examples/eip8184_lucid.zig`](../examples/eip8184_lucid.zig) prints `withheld -> sender
+forfeits 128, publisher loses 0`.
 
 - **8105**: the envelope fee is charged at inclusion even when the provider never reveals
   (`withhold = true` → no `0x06`). The tx is paid for and never runs — a *paid DoS*. Only
