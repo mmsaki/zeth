@@ -548,7 +548,7 @@ fn snapDemo(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void 
             std.debug.print("✗ peer rejected our Status (forkid/genesis mismatch?)\n", .{});
             return;
         };
-        std.debug.print("✓ eth/69 handshake — peer head #{d}\n", .{peer_status.latest_block});
+        std.debug.print("✓ eth/69 handshake — peer head block {d}\n", .{peer_status.latest_block});
     }
 
     // Issue the snap/1 GetAccountRange over the whole key-space at `state_root`.
@@ -788,8 +788,10 @@ fn syncFromPeer(
     fid: zeth.forkid.ForkId,
     follow: bool,
     store_opt: ?*zeth.store.Store,
+    key: ?[]const u8,
 ) !void {
-    const priv = zeth.ecies.randomPriv(io);
+    var priv = zeth.ecies.randomPriv(io);
+    if (key) |hx| _ = std.fmt.hexToBytes(&priv, if (std.mem.startsWith(u8, hx, "0x")) hx[2..] else hx) catch {};
     const pub_key = try zeth.ecies.pubFromPriv(priv);
     const p = try zeth.peer.Peer.dial(gpa, io, enode, priv);
     defer p.destroy();
@@ -817,7 +819,7 @@ fn syncFromPeer(
         var sa = std.heap.ArenaAllocator.init(gpa);
         defer sa.deinit();
         const peer_status = try zeth.eth_proto.Status69.decode(sa.allocator(), status_payload);
-        std.debug.print("✓ eth/69 handshake — peer head #{d}\n", .{peer_status.latest_block});
+        std.debug.print("✓ eth/69 handshake — peer head block {d}\n", .{peer_status.latest_block});
     }
 
     // Pull headers from head+1 in batches and execute them. When caught up,
@@ -853,11 +855,11 @@ fn syncFromPeer(
         for (0..n) |i| {
             const blk = try zeth.eth_proto.assembleBlock(ba, hresp.headers[i], bresp.bodies[i]);
             _ = ch.importBlock(blk) catch |e| {
-                std.debug.print("✗ import failed at #{d}: {s}{s}\n", .{ ch.head.number + 1, @errorName(e), if (ch.last_error) |le| le else "" });
+                std.debug.print("✗ import failed at block {d}: {s}{s}\n", .{ ch.head.number + 1, @errorName(e), if (ch.last_error) |le| le else "" });
                 return e;
             };
         }
-        std.debug.print("  synced → #{d}\n", .{ch.head.number});
+        std.debug.print("  synced → block {d}\n", .{ch.head.number});
         if (store_opt) |store| ch.persistTo(ba, store) catch |e| std.debug.print("warning: persist failed: {s}\n", .{@errorName(e)});
     }
 }
@@ -874,9 +876,11 @@ fn syncCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const enode = try zeth.peer.parseEnode(args[0]);
     var datadir: ?[]const u8 = null;
     var follow = false;
+    var sync_key: ?[]const u8 = null;
     for (args[2..]) |arg| {
         if (std.mem.startsWith(u8, arg, "--datadir=")) datadir = arg["--datadir=".len..];
         if (std.mem.eql(u8, arg, "--follow")) follow = true;
+        if (std.mem.startsWith(u8, arg, "--key=")) sync_key = arg["--key=".len..];
     }
 
     // Genesis → state + chain.
@@ -893,7 +897,9 @@ fn syncCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     defer ch.deinit();
     const genesis_hash = try ch.head.hash(gpa);
     const network_id = g.schedule.chain_id;
-    const fid = forkIdFor(network_id, genesis_hash);
+    // Forkid must reflect our actual head (genesis at the start), not a fully-synced
+    // node — geth accepts a genesis-forkid peer as a valid early ancestor.
+    const fid = if (network_id == 1) zeth.forkid.mainnet(ch.head.number, ch.head.timestamp) else forkIdFor(network_id, genesis_hash);
     std.debug.print("genesis #0 0x{s} (chainId={d} forkid=0x{s})\n", .{ std.fmt.bytesToHex(&genesis_hash, .lower), network_id, std.fmt.bytesToHex(&fid.hash, .lower) });
 
     // Optional persistence: open the store and resume from a prior sync so we
@@ -916,10 +922,10 @@ fn syncCmd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     }
 
     const store_ptr: ?*zeth.store.Store = if (store_opt) |*s| s else null;
-    try syncFromPeer(gpa, io, &ch, enode, network_id, genesis_hash, fid, follow, store_ptr);
+    try syncFromPeer(gpa, io, &ch, enode, network_id, genesis_hash, fid, follow, store_ptr, sync_key);
 
     const hh = try ch.head.hash(gpa);
-    std.debug.print("✓ sync complete: head #{d} 0x{s}\n", .{ ch.head.number, std.fmt.bytesToHex(&hh, .lower) });
+    std.debug.print("✓ sync complete: head block {d} 0x{s}\n", .{ ch.head.number, std.fmt.bytesToHex(&hh, .lower) });
 }
 
 fn usage(prog: []const u8) error{MissingArgument} {
@@ -1435,7 +1441,7 @@ fn nodeServe(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !void
             const store_ptr: ?*zeth.store.Store = if (store_opt) |*s| s else null;
             // Catch up to the peer's head, then serve. (Following the live head
             // while serving needs the chain guarded by a mutex — a follow-up.)
-            syncFromPeer(gpa, io, &ch, enode, g.schedule.chain_id, ghash, fid, false, store_ptr) catch |e|
+            syncFromPeer(gpa, io, &ch, enode, g.schedule.chain_id, ghash, fid, false, store_ptr, null) catch |e|
                 std.debug.print("peer sync ended: {s}\n", .{@errorName(e)});
         } else |e| std.debug.print("bad --peer enode: {s}\n", .{@errorName(e)});
     }
