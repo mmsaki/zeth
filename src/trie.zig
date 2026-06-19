@@ -687,7 +687,13 @@ fn nilChild(parent: *RNode, idx: u8) void {
 /// terminated). Faithful port of geth's trie.unsetInternal — walk to the fork
 /// point, then handle the short-node (five scenarios) or full-node fork. Returns
 /// true if the range spans the whole (sub)trie (caller resets the root to empty).
-fn unsetInternal(a: std.mem.Allocator, np: *RNode, left: []const u8, right: []const u8) !bool {
+fn unsetInternal(a: std.mem.Allocator, np: *RNode, left_full: []const u8, right_full: []const u8) !bool {
+    // geth removeTerminator: the fork/unset walk operates on the key path *without*
+    // the leaf terminator (edge keys arrive hex-encoded with a trailing TERM nibble).
+    // Skipping this is harmless when the origin is a real key but corrupts the fork
+    // comparison for a non-existent exclusion boundary (snap continuation chunks).
+    const left = if (left_full.len > 0 and left_full[left_full.len - 1] == TERM) left_full[0 .. left_full.len - 1] else left_full;
+    const right = if (right_full.len > 0 and right_full[right_full.len - 1] == TERM) right_full[0 .. right_full.len - 1] else right_full;
     var pos: usize = 0;
     var parent: ?*RNode = null;
     var cur: *RNode = np;
@@ -781,21 +787,25 @@ fn unsetSide(a: std.mem.Allocator, np: *RNode, key: []const u8, pos: usize, drop
             unsetSide(a, &f.ch[k], key, pos + 1, dropLeft);
         },
         .short => |s| {
-            if (isLeafKey(s.key)) {
-                np.* = .nil; // the edge leaf itself is part of the range; re-inserted later
+            const leaf = isLeafKey(s.key);
+            const klen = if (leaf) s.key.len - 1 else s.key.len; // leaf key without the terminator
+            const skey = s.key[0..klen];
+            const on_path = pos + klen <= key.len and std.mem.eql(u8, key[pos .. pos + klen], skey);
+            if (on_path) {
+                if (leaf) {
+                    np.* = .nil; // the edge key itself → in the range, re-inserted later
+                } else {
+                    unsetSide(a, &s.val, key, pos + klen, dropLeft); // extension on the edge path → descend
+                }
                 return;
             }
-            if (pos + s.key.len <= key.len and std.mem.eql(u8, key[pos .. pos + s.key.len], s.key)) {
-                unsetSide(a, &s.val, key, pos + s.key.len, dropLeft);
-            } else {
-                // Diverging extension (a non-existent branch off the edge). Per geth
-                // `unset`: drop it only if it lies *inside* the range, otherwise keep
-                // it with its cached hash. Right edge (dropLeft): in range iff its key
-                // sorts before the path; left edge: iff it sorts after.
-                const ord = std.mem.order(u8, s.key, key[pos..]);
-                const in_range = if (dropLeft) ord == .lt else ord == .gt;
-                if (in_range) np.* = .nil;
-            }
+            // Diverging sibling — including a leaf that is the predecessor/successor
+            // of a *non-existent* edge (a snap exclusion boundary). Keep it unless it
+            // sorts strictly inside the range. Right edge (dropLeft): in range iff it
+            // sorts before the path; left edge: iff it sorts after.
+            const ord = std.mem.order(u8, skey, key[pos..]);
+            const in_range = if (dropLeft) ord == .lt else ord == .gt;
+            if (in_range) np.* = .nil;
         },
         .hash, .value => np.* = .nil,
         .nil => {},
@@ -994,6 +1004,39 @@ test "range proof: bounded range verifies and rejects tampering + gaps" {
     const gapKeys = [_][32]u8{ keys[2], keys[4], keys[5] };
     const gapVals = [_][]const u8{ vals[2], vals[4], vals[5] };
     try testing.expect(!try verifyRangeProof(al, root, gapKeys[0], gapKeys[0..], gapVals[0..], proof.items));
+}
+
+test "range proof: continuation origin is a non-existent exclusion boundary (snap chunk 2+)" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    var keys: [8][32]u8 = undefined;
+    var vals: [8][]const u8 = undefined;
+    for (0..8) |j| {
+        keys[j] = std.mem.zeroes([32]u8);
+        keys[j][0] = @intCast((j + 1) * 16);
+        keys[j][1] = @intCast(j);
+        vals[j] = "snap-account-body-value-long-enough-to-be-hashed-not-inlined-xxxx";
+    }
+    const pairs = al.alloc(KV, 8) catch unreachable;
+    for (0..8) |j| pairs[j] = .{ .key = keys[j][0..], .value = vals[j] };
+    const root = computeRoot(al, pairs, false);
+
+    // Snap chunk #2: the previous chunk ended at keys[1], so this chunk's origin is
+    // keys[1]+1 — a key that does NOT exist (it sits strictly between keys[1] and
+    // keys[2]). The left boundary proof is an *exclusion* proof of that origin.
+    var origin = keys[1];
+    var n = std.mem.readInt(u256, &origin, .big);
+    n += 1;
+    std.mem.writeInt(u256, &origin, n, .big);
+    const lo = 2;
+    const hi = 5;
+    var proof = std.ArrayList([]const u8).empty;
+    for (proveKey(al, pairs, false, origin[0..])) |x| proof.append(al, x) catch unreachable; // exclusion left edge
+    for (proveKey(al, pairs, false, keys[hi][0..])) |x| proof.append(al, x) catch unreachable; // right edge
+    try testing.expect(try verifyRangeProof(al, root, origin, keys[lo .. hi + 1], vals[lo .. hi + 1], proof.items));
 }
 
 test "proof verifies for included and excluded secured keys" {
