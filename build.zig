@@ -11,6 +11,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Dev-only RPC (evm_mine / anvil_mine + the instamine bundle builder). Off by
+    // default: a production binary literally cannot build blocks over RPC, because
+    // the code is compiled out. Build with `-Ddev=true` for the dev tool / demo.
+    const dev = b.option(bool, "dev", "Compile in dev-only RPC: evm_mine/anvil_mine + instamine") orelse false;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "dev", dev);
+    mod.addOptions("build_options", build_options);
+
     // CLI: `zig build run -- <hex-bytecode> [gas]`
     const exe = b.addExecutable(.{
         .name = "zeth",
@@ -46,6 +54,18 @@ pub fn build(b: *std.Build) void {
     const run_enc = b.addRunArtifact(enc_demo);
     b.step("enc-demo", "Run the EIP-8105 encrypted-mempool demo").dependOn(&run_enc.step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = enc_mod })).step);
+
+    // EIP-8184 (LUCID) sealed-transaction demo: `zig build lucid-demo` (run) + tests.
+    const lucid_mod = b.createModule(.{
+        .root_source_file = b.path("examples/eip8184_lucid.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zeth", .module = mod }},
+    });
+    const lucid_demo = b.addExecutable(.{ .name = "lucid-demo", .root_module = lucid_mod });
+    const run_lucid = b.addRunArtifact(lucid_demo);
+    b.step("lucid-demo", "Run the EIP-8184 (LUCID) sealed-transaction demo").dependOn(&run_lucid.step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = lucid_mod })).step);
 
     // Benchmark: `zig build bench -Doptimize=ReleaseFast`
     const bench = b.addExecutable(.{

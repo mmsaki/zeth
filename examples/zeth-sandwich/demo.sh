@@ -1,101 +1,77 @@
 #!/usr/bin/env bash
-# Sandwich vs encrypted mempool, end-to-end against zeth's own RPC.
+# Sandwich vs encrypted mempool against zeth. `zeth node --dev --trace` prints the
+# verbose RPC trace (method(params) ← result); this script just drives the user
+# and searcher with cast.
 #
-# Stage 1 (unencrypted): the victim broadcasts a swap to zeth's public mempool;
-# the searcher listens (eth_newPendingTransactionFilter), pulls the raw signed tx
-# (eth_getRawTransactionByHash), wraps [front, victim, back] into an eth_sendBundle,
-# and zeth's dev builder includes it in order -> MEV extracted, victim sandwiched.
-#
-# Stage 2 (encrypted/private): the victim sends the swap as a private bundle, so it
-# never hits the public mempool; the searcher's filter sees nothing -> fair fill.
+# Stage 1 (unencrypted): user broadcasts a swap to zeth's public mempool; the
+# searcher listens (eth_newPendingTransactionFilter), pulls the signed tx
+# (eth_getRawTransactionByHash), bundles [front, user, back] (eth_sendBundle),
+# and zeth's --dev builder includes it -> user sandwiched.
+# Stage 2 (encrypted/private): the user sends the swap as a private bundle, never
+# entering the public mempool; the searcher's filter sees nothing -> fair fill.
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=../..
 RPC=http://127.0.0.1:8545
+B=$'\033[1m'; X=$'\033[0m'; [ -n "${NO_COLOR:-}" ] && { B=; X=; }
 
-DEPLOYER=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-VICTIM_PK=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
-ATTACKER_PK=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
-VICTIM=$(cast wallet address $VICTIM_PK)
-ATTACKER=$(cast wallet address $ATTACKER_PK)
+D=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+VPK=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+APK=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
+V=$(cast wallet address $VPK)
+A=$(cast wallet address $APK)
+TRACE=/tmp/zeth-sandwich.trace
 
-(cd "$ROOT" && zig build -Doptimize=ReleaseFast) >/dev/null   # build zeth
+(cd "$ROOT" && zig build -Doptimize=ReleaseFast -Ddev=true) >/dev/null   # build zeth (dev RPC on)
 forge build >/dev/null                                        # build the AMM
-"$ROOT/zig-out/bin/zeth" node --dev genesis.json --http.addr=127.0.0.1:8545 >/tmp/zeth-dev.log 2>&1 &
+"$ROOT/zig-out/bin/zeth" node --dev -v genesis.json --http.addr=127.0.0.1:8545 >"$TRACE" 2>&1 &
 ZETH=$!
 trap 'kill $ZETH 2>/dev/null' EXIT
 for _ in $(seq 1 400); do cast block-number --rpc-url $RPC >/dev/null 2>&1 && break; done
-echo "zeth dev node up (chain $(cast chain-id --rpc-url $RPC))"
 
-rpc()  { cast rpc "$@" --rpc-url $RPC; }
-mine() { rpc evm_mine >/dev/null; }
-num()  { cast call "$1" "$2" "${@:3}" --rpc-url $RPC | awk '{print $1}'; }   # uint256 -> decimal
-send() { rpc eth_sendRawTransaction "$1" | tr -d '"'; }                       # -> tx hash (no wait)
+R=1000000000000000000000
+BYTE=$(forge inspect src/MiniAMM.sol:MiniAMM bytecode)
+mine()    { cast rpc evm_mine --rpc-url $RPC >/dev/null; }
+num()     { cast call "$1" "$2" "${@:3}" --rpc-url $RPC | awk '{print $1}'; }
+rawsend() { cast rpc eth_sendRawTransaction "$1" --rpc-url $RPC | tr -d '"'; }
+deploy()  { local h; h=$(rawsend "$(cast mktx --private-key $D --rpc-url $RPC --gas-limit 3000000 --create "$BYTE" "constructor(uint256,uint256)" $R $R)"); mine; cast rpc eth_getTransactionReceipt "$h" --rpc-url $RPC | jq -r .contractAddress; }
+fund()    { rawsend "$(cast mktx --private-key $D --rpc-url $RPC --gas-limit 300000 "$1" "fund0(address,uint256)" "$2" "$3")" >/dev/null; mine; }
+mk()      { cast mktx --rpc-url $RPC --gas-limit 300000 "$@"; }   # signed raw tx (no send)
+VIN=100000000000000000000
+AIN=300000000000000000000
 
-# verbose JSON-RPC: print the real request + response, keep the response in $LAST.
-LAST=""
-jrpc() { # $1 method  $2 params(JSON)
-  local req="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}"
-  echo "  → ${req:0:200}$([ ${#req} -gt 200 ] && echo " …(${#req}b)")"
-  LAST=$(curl -s -H 'content-type: application/json' -d "$req" "$RPC")
-  echo "  ← ${LAST:0:200}$([ ${#LAST} -gt 200 ] && echo " …(${#LAST}b)")"
-}
-res() { printf '%s' "$LAST" | jq -r "$1"; }
-
-BYTECODE=$(forge inspect src/MiniAMM.sol:MiniAMM bytecode)
-R=1000000000000000000000   # 1000e18 reserves
-deploy() { # -> deployed address
-  local raw hash
-  raw=$(cast mktx --private-key $DEPLOYER --rpc-url $RPC --gas-limit 3000000 --create "$BYTECODE" "constructor(uint256,uint256)" $R $R)
-  hash=$(send "$raw"); mine
-  rpc eth_getTransactionReceipt "$hash" | jq -r .contractAddress
-}
-fund() { # $1 amm $2 who $3 amount
-  local raw; raw=$(cast mktx --private-key $DEPLOYER --rpc-url $RPC --gas-limit 300000 "$1" "fund0(address,uint256)" "$2" "$3")
-  send "$raw" >/dev/null; mine
-}
-
-echo
-echo "== Stage 1: unencrypted mempool =="
-AMM=$(deploy)
-fund "$AMM" "$VICTIM"   100000000000000000000
-fund "$AMM" "$ATTACKER" 300000000000000000000
-echo "  MiniAMM @ $AMM  (reserves 1000/1000)"
-
-echo "  searcher starts listening:"
-jrpc eth_newPendingTransactionFilter "[]"; FID=$(res .result)
-VRAW=$(cast mktx --private-key $VICTIM_PK --rpc-url $RPC --gas-limit 300000 "$AMM" "swap0for1(uint256)" 100000000000000000000)
-echo "  victim broadcasts the swap to the public mempool:"
-jrpc eth_sendRawTransaction "[\"$VRAW\"]"
-echo "  searcher sees it on the filter and pulls the signed tx:"
-jrpc eth_getFilterChanges "[\"$FID\"]"; VHASH=$(res '.result[0]')
-jrpc eth_getRawTransactionByHash "[\"$VHASH\"]"; VSIG=$(res .result)
+# Part 1 — plaintext mempool: user to the public pool, searcher sandwiches it.
+AMM=$(deploy); fund "$AMM" "$V" $VIN; fund "$AMM" "$A" $AIN
+S1=$(wc -c <"$TRACE")
+FID=$(cast rpc eth_newPendingTransactionFilter --rpc-url $RPC | tr -d '"')
+rawsend "$(mk --private-key $VPK "$AMM" "swap0for1(uint256)" $VIN)" >/dev/null
+VHASH=$(cast rpc eth_getFilterChanges "$FID" --rpc-url $RPC | jq -r '.[0]')
+VSIG=$(cast rpc eth_getRawTransactionByHash "$VHASH" --rpc-url $RPC | tr -d '"')
 r0=$(num "$AMM" "r0()(uint256)"); r1=$(num "$AMM" "r1()(uint256)")
-ATK1=$(python3 -c "print($r1-($r0*$r1)//($r0+300*10**18))")                   # simulate the front-run output
-FRONT=$(cast mktx --private-key $ATTACKER_PK --nonce 0 --rpc-url $RPC --gas-limit 300000 "$AMM" "swap0for1(uint256)" 300000000000000000000)
-BACK=$(cast mktx --private-key $ATTACKER_PK --nonce 1 --rpc-url $RPC --gas-limit 300000 "$AMM" "swap1for0(uint256)" "$ATK1")
-echo "  searcher bundles [front, victim, back] -> the builder includes it:"
-jrpc eth_sendBundle "[{\"txs\":[\"$FRONT\",\"$VSIG\",\"$BACK\"]}]"
+ATK1=$(python3 -c "print($r1-($r0*$r1)//($r0+$AIN))")
+FRONT=$(mk --private-key $APK --nonce 0 "$AMM" "swap0for1(uint256)" $AIN)
+BACK=$(mk --private-key $APK --nonce 1 "$AMM" "swap1for0(uint256)" "$ATK1")
+cast rpc eth_sendBundle "{\"txs\":[\"$FRONT\",\"$VSIG\",\"$BACK\"]}" --rpc-url $RPC >/dev/null
+E1=$(wc -c <"$TRACE")
+V_CLEAR=$(num "$AMM" "bal1(address)(uint256)" "$V")
+A_PROFIT=$(python3 -c "print($(num "$AMM" "bal0(address)(uint256)" "$A")-$AIN)")
 
-V_CLEAR=$(num "$AMM" "bal1(address)(uint256)" "$VICTIM")
-A_PROFIT=$(python3 -c "print($(num "$AMM" "bal0(address)(uint256)" "$ATTACKER")-300*10**18)")
+# Part 2 — encrypted mempool: user sends a private bundle; the searcher is blind.
+AMM2=$(deploy); fund "$AMM2" "$V" $VIN
+S2=$(wc -c <"$TRACE")
+cast rpc eth_newPendingTransactionFilter --rpc-url $RPC >/dev/null
+cast rpc eth_sendBundle "{\"txs\":[\"$(mk --private-key $VPK "$AMM2" "swap0for1(uint256)" $VIN)\"]}" --rpc-url $RPC >/dev/null
+E2=$(wc -c <"$TRACE")
+V_ENC=$(num "$AMM2" "bal1(address)(uint256)" "$V")
 
+# print the trace slice [from,to) of $TRACE — zeth's -v already filters to
+# orderflow methods + the [builder] line, so no extra filtering here.
+slice() { tail -c "+$(($1 + 1))" "$TRACE" | head -c "$(($2 - $1))"; }
+
+echo "${B}Part 1 — plaintext mempool${X}"
+slice "$S1" "$E1"
+echo "  user got $(cast from-wei "$V_CLEAR") token1 (sandwiched); attacker MEV $(cast from-wei "$A_PROFIT") token0"
 echo
-echo "== Stage 2: encrypted/private mempool =="
-AMM2=$(deploy)
-fund "$AMM2" "$VICTIM" 100000000000000000000
-jrpc eth_newPendingTransactionFilter "[]"; FID2=$(res .result)
-VRAW2=$(cast mktx --private-key $VICTIM_PK --rpc-url $RPC --gas-limit 300000 "$AMM2" "swap0for1(uint256)" 100000000000000000000)
-echo "  victim sends the swap PRIVATELY (eth_sendBundle, never hits the public pool):"
-jrpc eth_sendBundle "[{\"txs\":[\"$VRAW2\"]}]"
-echo "  searcher polls its filter:"
-jrpc eth_getFilterChanges "[\"$FID2\"]"; SAW=$(res '.result | length')
-echo "  -> filter saw $SAW pending txs (nothing to sandwich)"
-V_ENC=$(num "$AMM2" "bal1(address)(uint256)" "$VICTIM")
-
-fromwei() { cast from-wei "$1"; }
-echo
-echo "results (token1 out to the victim):"
-echo "  fair / encrypted      : $(fromwei "$V_ENC")"
-echo "  unencrypted (sandwiched): $(fromwei "$V_CLEAR")"
-echo "  attacker MEV profit   : $(fromwei "$A_PROFIT") token0"
+echo "${B}Part 2 — encrypted mempool (EIP-8105)${X}"
+slice "$S2" "$E2"
+echo "  user got $(cast from-wei "$V_ENC") token1 (fair — the searcher had nothing to wrap)"
