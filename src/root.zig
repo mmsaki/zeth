@@ -31,6 +31,7 @@ pub const forkid = @import("forkid.zig");
 pub const log = @import("log.zig");
 pub const discv4 = @import("discv4.zig");
 pub const snap_proto = @import("snap_proto.zig");
+pub const bal = @import("bal.zig");
 pub const snap_state = @import("snap_state.zig");
 pub const mempool = @import("mempool.zig");
 
